@@ -1,0 +1,111 @@
+package auth
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
+	"secure-im/backend/internal/httpx"
+)
+
+type User struct {
+	ID          string    `json:"id"`
+	Username    string    `json:"username"`
+	DisplayName string    `json:"display_name"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+type Tokens struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+}
+type Result struct {
+	User   User   `json:"user"`
+	Tokens Tokens `json:"tokens"`
+}
+type Service struct {
+	db        *sql.DB
+	tokens    *TokenManager
+	dummyHash string
+}
+
+var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,32}$`)
+
+func NewService(db *sql.DB, tokens *TokenManager) *Service {
+	dummy, _ := HashPassword("not-a-real-user-password", DefaultArgonParams)
+	return &Service{db: db, tokens: tokens, dummyHash: dummy}
+}
+func validateRegistration(username, displayName, password string) error {
+	if !usernamePattern.MatchString(username) {
+		return httpx.Error(400, "invalid_username", "username must be 3-32 characters using letters, numbers, dot, underscore or dash")
+	}
+	if strings.TrimSpace(displayName) == "" || len(displayName) > 64 {
+		return httpx.Error(400, "invalid_display_name", "display name is required and must not exceed 64 bytes")
+	}
+	if len(password) < 6 || len(password) > 128 {
+		return httpx.Error(400, "invalid_password", "password must be 6 to 128 bytes")
+	}
+	return nil
+}
+func (s *Service) Register(ctx context.Context, username, displayName, password string) (Result, error) {
+	username = strings.ToUpper(username)
+	if err := validateRegistration(username, displayName, password); err != nil {
+		return Result{}, err
+	}
+	hash, err := HashPassword(password, DefaultArgonParams)
+	if err != nil {
+		return Result{}, err
+	}
+	user := User{ID: uuid.NewString(), Username: username, DisplayName: strings.TrimSpace(displayName), CreatedAt: time.Now().UTC()}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO users(id,username,display_name,password_hash,created_at) VALUES(?,?,?,?,?)`, user.ID, user.Username, user.DisplayName, hash, user.CreatedAt)
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		return Result{}, httpx.Error(409, "username_taken", "username is already registered")
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	return s.result(ctx, user)
+}
+func (s *Service) Login(ctx context.Context, username, password string) (Result, error) {
+	username = strings.ToUpper(username)
+	if len(password) > 128 {
+		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
+	}
+	var user User
+	var hash string
+	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,password_hash,created_at FROM users WHERE username=?`, username).Scan(&user.ID, &user.Username, &user.DisplayName, &hash, &user.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, _ = VerifyPassword(s.dummyHash, password)
+		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	user.Username = strings.ToUpper(user.Username)
+	valid, verifyErr := VerifyPassword(hash, password)
+	if verifyErr != nil || !valid {
+		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
+	}
+	return s.result(ctx, user)
+}
+func (s *Service) result(ctx context.Context, user User) (Result, error) {
+	access, err := s.tokens.AccessToken(user.ID)
+	if err != nil {
+		return Result{}, err
+	}
+	refresh, hash, expires, err := s.tokens.RefreshToken()
+	if err != nil {
+		return Result{}, err
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO refresh_tokens(id,user_id,token_hash,expires_at) VALUES(?,?,?,?)`, uuid.NewString(), user.ID, hash, expires); err != nil {
+		return Result{}, err
+	}
+	return Result{User: user, Tokens: Tokens{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer", ExpiresIn: int64(s.tokens.accessTTL.Seconds())}}, nil
+}

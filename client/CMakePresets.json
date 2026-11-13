@@ -1,0 +1,46 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "qt-windows",
+      "displayName": "Qt 6.11.2 llvm-mingw (Windows)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/qt-windows",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_PREFIX_PATH": "D:/software/Qt/6.11.2/llvm-mingw_64",
+        "CMAKE_CXX_COMPILER": "D:/software/Qt/Tools/llvm-mingw1706_64/bin/clang++.exe",
+        "CLIENT_PROTOC_EXECUTABLE": "${sourceDir}/.tools/protoc/bin/protoc.exe",
+        "BUILD_TESTING": "ON"
+      },
+      "environment": {
+        "PATH": "D:/software/Qt/6.11.2/llvm-mingw_64/bin;D:/software/Qt/Tools/llvm-mingw1706_64/bin;$penv{PATH}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "qt-windows",
+      "configurePreset": "qt-windows",
+      "configuration": "RelWithDebInfo"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "qt-windows",
+      "configurePreset": "qt-windows",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "PATH": "D:/software/Qt/6.11.2/llvm-mingw_64/bin;D:/software/Qt/Tools/llvm-mingw1706_64/bin;$penv{PATH}"
+      }
+    }
+  ]
+}

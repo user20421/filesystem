@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package im.v1;
+
+option go_package = "secure-im/backend/internal/proto/impb;impb";
+
+// Envelope is the only binary WebSocket frame accepted by the server.
+message Envelope {
+  uint32 version = 1;
+  Type type = 2;
+  string message_id = 3;
+  string conversation_id = 4;
+  string sender_id = 5;
+  string recipient_id = 6;
+  string device_id = 7;
+  int64 timestamp = 8;
+  bytes payload = 9;
+  uint64 cursor = 10;
+  int64 read_at = 11; // Unix milliseconds; zero means unread.
+
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    MESSAGE = 1;
+    ACK = 2;
+    ERROR = 3;
+    PING = 4;
+    PONG = 5;
+    READ = 6;
+  }
+}

@@ -1,0 +1,5 @@
+.cache/
+.tools/
+.env
+server
+server.exe
