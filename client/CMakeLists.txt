@@ -67,8 +67,10 @@ add_library(client_ui STATIC
     src/ui/SessionContext.cpp src/ui/SessionContext.h
     src/ui/SessionPage.cpp src/ui/SessionPage.h
     src/ui/SimulatorWindow.cpp src/ui/SimulatorWindow.h
+    src/ui/StressRunController.cpp src/ui/StressRunController.h
     src/ui/SystemTestPage.cpp src/ui/SystemTestPage.h
     src/ui/Theme.cpp src/ui/Theme.h
+    src/ui/TransferTaskCard.cpp src/ui/TransferTaskCard.h
 )
 target_include_directories(client_ui PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src/ui")
 target_link_libraries(client_ui PUBLIC client_core Qt6::Widgets)
@@ -119,4 +121,14 @@ if(BUILD_TESTING)
     add_test(NAME session_tabs COMMAND test_session_tabs)
     set_tests_properties(session_tabs PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_FONTDIR=C:/Windows/Fonts;SECURE_IM_PREVIEW_PATH=${CMAKE_BINARY_DIR}/session-tabs-preview.png")
+
+    qt_add_executable(fake_stress_runner tests/fake_stress_runner.cpp)
+    target_link_libraries(fake_stress_runner PRIVATE Qt6::Core)
+
+    qt_add_executable(test_stress_run tests/test_stress_run.cpp)
+    target_link_libraries(test_stress_run PRIVATE client_ui Qt6::Test)
+    add_dependencies(test_stress_run fake_stress_runner)
+    add_test(NAME stress_run COMMAND test_stress_run)
+    set_tests_properties(stress_run PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_FONTDIR=C:/Windows/Fonts")
 endif()

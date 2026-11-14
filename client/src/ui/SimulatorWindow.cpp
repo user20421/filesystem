@@ -63,7 +63,8 @@ SimulatorWindow::SimulatorWindow(const QString &dataRoot, const QUrl &serverUrl,
             m_tabs->setCurrentIndex((m_tabs->currentIndex() - 1 + m_tabs->count()) % m_tabs->count());
     });
 
-    m_tabs->addTab(new SystemTestPage(m_tabs), QStringLiteral("系统测试"));
+    m_systemTest = new SystemTestPage(m_tabs);
+    m_tabs->addTab(m_systemTest, QStringLiteral("系统测试"));
     m_tabs->addTab(createWelcomePage(), QStringLiteral("欢迎"));
     for (int index = 0; index < 2; ++index)
         m_tabs->tabBar()->setTabButton(index, QTabBar::RightSide, nullptr);
@@ -308,6 +309,8 @@ bool SimulatorWindow::savePreview(const QString &path)
 
 void SimulatorWindow::closeEvent(QCloseEvent *event)
 {
+    if (m_systemTest)
+        m_systemTest->shutdown();
     for (int index = 0; index < sessionCount(); ++index) {
         if (SessionPage *page = sessionAt(index))
             page->shutdown();

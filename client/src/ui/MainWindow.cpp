@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "LocalStore.h"
+#include "TransferTaskCard.h"
 
 #include <QDateTime>
 #include <QDesktopServices>
@@ -9,6 +10,7 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QHeaderView>
+#include <QAbstractItemView>
 #include <QHBoxLayout>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -19,6 +21,7 @@
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStackedWidget>
@@ -293,51 +296,64 @@ void MainWindow::buildUi()
     m_chat->setObjectName(QStringLiteral("chatTranscript"));
     m_chat->setOpenExternalLinks(false);
     chatLayout->addWidget(m_chat, 1);
-    auto *composer = new QFrame(chatView);
-    composer->setObjectName(QStringLiteral("composer"));
-    auto *composerLayout = new QHBoxLayout(composer);
+    m_composer = new QFrame(chatView);
+    m_composer->setObjectName(QStringLiteral("composer"));
+    m_composer->setVisible(false); // No message can be sent until a peer is selected.
+    auto *composerLayout = new QHBoxLayout(m_composer);
     composerLayout->setContentsMargins(8, 6, 8, 6);
-    m_input = new QLineEdit(composer);
+    m_input = new QLineEdit(m_composer);
     m_input->setPlaceholderText(QStringLiteral("选择用户后输入消息，按 Enter 发送"));
-    auto *send = new QPushButton(QStringLiteral("发送"), composer);
+    auto *send = new QPushButton(QStringLiteral("发送"), m_composer);
     send->setProperty("primary", true);
-    auto *attach = new QPushButton(QStringLiteral("添加文件"), composer);
+    auto *attach = new QPushButton(QStringLiteral("添加文件"), m_composer);
     composerLayout->addWidget(m_input, 1);
     composerLayout->addWidget(attach);
     composerLayout->addWidget(send);
-    chatLayout->addWidget(composer);
+    chatLayout->addWidget(m_composer);
     m_views->addWidget(chatView);
 
     auto *transferView = new QWidget(m_views);
     auto *transferLayout = new QVBoxLayout(transferView);
     transferLayout->setContentsMargins(0, 0, 0, 0);
     transferLayout->setSpacing(10);
+    auto *transferHeadingRow = new QHBoxLayout;
     auto *transferHeading = new QLabel(QStringLiteral("传输任务"), transferView);
     transferHeading->setObjectName(QStringLiteral("sectionTitle"));
-    transferLayout->addWidget(transferHeading);
+    transferHeadingRow->addWidget(transferHeading);
+    transferHeadingRow->addStretch(1);
+    m_transferStats = new QLabel(transferView);
+    m_transferStats->setObjectName(QStringLiteral("transferStats"));
+    transferHeadingRow->addWidget(m_transferStats);
+    transferLayout->addLayout(transferHeadingRow);
+
+    m_transferEmpty = new QLabel(QStringLiteral(
+        "还没有传输任务\n在消息页选择联系人并点击“添加文件”，或等待接收文件"), transferView);
+    m_transferEmpty->setObjectName(QStringLiteral("transferEmptyState"));
+    m_transferEmpty->setAlignment(Qt::AlignCenter);
+    transferLayout->addWidget(m_transferEmpty, 1);
+
     m_transferList = new QTreeWidget(transferView);
     m_transferList->setObjectName(QStringLiteral("transferTable"));
-    m_transferList->setColumnCount(7);
-    m_transferList->setHeaderLabels({QStringLiteral("方向"), QStringLiteral("文件"),
-        QStringLiteral("进度"), QStringLiteral("状态"), QStringLiteral("对方"),
-        QStringLiteral("本地路径"), QStringLiteral("错误")});
-    m_transferList->header()->setSectionResizeMode(QHeaderView::Interactive);
-    m_transferList->header()->setStretchLastSection(true);
-    m_transferList->setColumnWidth(0, 58);
-    m_transferList->setColumnWidth(1, 150);
-    m_transferList->setColumnWidth(2, 150);
-    m_transferList->setColumnWidth(3, 76);
-    m_transferList->setColumnWidth(4, 100);
-    m_transferList->setColumnWidth(5, 190);
+    m_transferList->setColumnCount(1);
+    m_transferList->setHeaderHidden(true);
+    m_transferList->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_transferList->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_transferList->setAlternatingRowColors(true);
-    m_transferList->setUniformRowHeights(true);
-    connect(m_transferList, &QTreeWidget::itemClicked, this,
-            [this](QTreeWidgetItem *item, int column) {
-        if (!m_closing && item && (column == 1 || column == 5))
-            openTransferDirectory(item->data(0, Qt::UserRole + 1).toString());
+    m_transferList->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_transferList->setRootIsDecorated(false);
+    m_transferList->setIndentation(0);
+    m_transferList->setUniformRowHeights(false);
+    m_transferList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_transferList->setFocusPolicy(Qt::StrongFocus);
+    connect(m_transferList, &QTreeWidget::currentItemChanged, this,
+            [this](QTreeWidgetItem *current, QTreeWidgetItem *) {
+        for (int index = 0; index < m_transferList->topLevelItemCount(); ++index) {
+            QTreeWidgetItem *item = m_transferList->topLevelItem(index);
+            if (auto *widget = qobject_cast<TransferTaskCard *>(m_transferList->itemWidget(item, 0)))
+                widget->setSelected(item == current);
+        }
     });
     transferLayout->addWidget(m_transferList, 1);
+    updateTransferSummary();
 
     auto *controls = new QHBoxLayout;
     controls->addWidget(new QLabel(QStringLiteral("并发"), transferView));
@@ -363,6 +379,8 @@ void MainWindow::buildUi()
         {QStringLiteral("取消"), QStringLiteral("cancel")}};
     for (const auto &action : actions) {
         auto *button = new QPushButton(action.first, transferView);
+        button->setObjectName(QStringLiteral("transfer%1Button").arg(
+            action.second.at(0).toUpper() + action.second.mid(1)));
         controls->addWidget(button);
         connect(button, &QPushButton::clicked, this, [this, action]() {
             if (m_closing)
@@ -470,6 +488,7 @@ void MainWindow::requestAccountDeletion()
             return;
         }
         m_store->clearSession();
+        m_store->forgetAccount(m_session.user.id);
         emit exitRequested(); // Only a 204 response reaches this point.
     });
 }
@@ -555,11 +574,15 @@ void MainWindow::applyUsers(const QList<User> &users)
     m_userNames.clear();
     m_contacts.clear();
     QListWidgetItem *select = nullptr;
+    const QSet<QString> knownAccountIds = m_store->knownAccountIds();
     for (User user : users) {
-        // Qt live-integration accounts are infrastructure artifacts, not real
-        // contacts. Keep them out of the local demo even when tests share 8080.
-        if (user.id == m_session.user.id
-            || user.username.startsWith(QStringLiteral("QTIT_"), Qt::CaseInsensitive))
+        // Keep simulator accounts and accounts authenticated on this workstation.
+        // Unknown integration fixtures and arbitrary historical accounts stay hidden.
+        static const QRegularExpression visibleUserPattern(QStringLiteral("^USER_[0-9]+$"));
+        const bool currentAccount = user.id == m_session.user.id;
+        const bool eligible = currentAccount || knownAccountIds.contains(user.id)
+            || visibleUserPattern.match(user.username.toUpper()).hasMatch();
+        if (!eligible || currentAccount)
             continue;
         user.presenceKnown = m_presenceKnown;
         user.online = m_presenceKnown && m_onlineUserIds.contains(user.id);
@@ -579,6 +602,7 @@ void MainWindow::applyUsers(const QList<User> &users)
         selectPeer();
     else if (!m_peerId.isEmpty()) {
         m_peerId.clear();
+        m_composer->setVisible(false);
         m_chat->clear();
     }
     updateConversationLabel();
@@ -653,6 +677,7 @@ void MainWindow::selectPeer()
         return;
     auto *item = m_users->currentItem();
     m_peerId = item ? item->data(Qt::UserRole).toString() : QString{};
+    m_composer->setVisible(!m_peerId.isEmpty());
     m_chat->clear();
     if (m_peerId.isEmpty())
         return;
@@ -938,33 +963,24 @@ void MainWindow::renderMessage(const ChatMessage &message)
         .arg(color, sender.toHtmlEscaped(), time, body));
 }
 
-QProgressBar *MainWindow::progressForTask(QTreeWidgetItem *item, TransferTask *task)
-{
-    auto *progress = qobject_cast<QProgressBar *>(m_transferList->itemWidget(item, 2));
-    if (!progress) {
-        progress = new QProgressBar(m_transferList);
-        progress->setRange(0, 100);
-        progress->setTextVisible(true);
-        m_transferList->setItemWidget(item, 2, progress);
-    }
-    const int percent = task->size() > 0
-        ? static_cast<int>(task->transferredBytes() * 100 / task->size()) : 0;
-    progress->setValue(qBound(0, percent, 100));
-    progress->setFormat(QStringLiteral("%1%  ·  %2").arg(percent).arg(formatBytes(task->transferredBytes())));
-    progress->setToolTip(QStringLiteral("%1 / %2").arg(formatBytes(task->transferredBytes()),
-                                                       formatBytes(task->size())));
-    return progress;
-}
-
 void MainWindow::addTransferRow(TransferTask *task)
 {
     if (m_closing)
         return;
     auto *item = new QTreeWidgetItem(m_transferList);
-    item->setSizeHint(0, QSize(-1, 40));
     item->setData(0, Qt::UserRole, task->id());
     item->setData(0, Qt::UserRole + 1, QDir::cleanPath(task->localPath()));
+    auto *widget = new TransferTaskCard(m_transferList);
+    m_transferList->setItemWidget(item, 0, widget);
+    connect(widget, &TransferTaskCard::clicked, this, [this, item] {
+        if (!m_closing)
+            m_transferList->setCurrentItem(item);
+    });
+    connect(widget, &TransferTaskCard::openDirectoryRequested,
+            this, &MainWindow::openTransferDirectory);
     updateTransferRow(task);
+    if (!m_transferList->currentItem())
+        m_transferList->setCurrentItem(item);
 }
 
 void MainWindow::updateTransferRow(TransferTask *task)
@@ -981,22 +997,57 @@ void MainWindow::updateTransferRow(TransferTask *task)
     }
     if (!found)
         return;
-    const bool upload = task->direction() == TransferTask::Direction::Upload;
-    found->setText(0, upload ? QStringLiteral("上传") : QStringLiteral("下载"));
-    found->setText(1, task->fileName());
-    progressForTask(found, task);
-    found->setText(3, task->stateText());
-    found->setText(4, m_userNames.value(task->peerId(), task->peerId().toUpper()));
+    auto *widget = qobject_cast<TransferTaskCard *>(m_transferList->itemWidget(found, 0));
+    if (!widget)
+        return;
+    const QString peerName = m_userNames.value(task->peerId(), task->peerId().toUpper());
+    widget->setTask(*task, peerName);
     found->setData(0, Qt::UserRole + 1, QDir::cleanPath(task->localPath()));
-    found->setText(5, QDir::toNativeSeparators(QDir::cleanPath(task->localPath())));
-    found->setText(6, task->error());
-    found->setToolTip(5, task->localPath());
-    found->setToolTip(6, task->error());
+    found->setData(0, Qt::UserRole + 2, widget->property("stateKey"));
+    found->setText(0, QStringLiteral("%1 · %2 · %3").arg(task->fileName(), peerName, task->stateText()));
+    found->setToolTip(0, QDir::toNativeSeparators(task->localPath()));
+    found->setSizeHint(0, widget->sizeHint());
+    updateTransferSummary();
+}
+
+void MainWindow::updateTransferSummary()
+{
+    if (!m_transferStats || !m_transferList || !m_transferEmpty)
+        return;
+    int active = 0;
+    int completed = 0;
+    int failed = 0;
+    int paused = 0;
+    const int count = m_transferList->topLevelItemCount();
+    for (int index = 0; index < count; ++index) {
+        const QString state = m_transferList->topLevelItem(index)
+            ->data(0, Qt::UserRole + 2).toString();
+        if (state == QLatin1String("completed"))
+            ++completed;
+        else if (state == QLatin1String("failed"))
+            ++failed;
+        else if (state == QLatin1String("paused"))
+            ++paused;
+        else if (state != QLatin1String("cancelled"))
+            ++active;
+    }
+    QStringList parts{QStringLiteral("共 %1 项").arg(count)};
+    if (active > 0)
+        parts.append(QStringLiteral("%1 进行中").arg(active));
+    if (paused > 0)
+        parts.append(QStringLiteral("%1 已暂停").arg(paused));
+    if (completed > 0)
+        parts.append(QStringLiteral("%1 已完成").arg(completed));
+    if (failed > 0)
+        parts.append(QStringLiteral("%1 失败").arg(failed));
+    m_transferStats->setText(parts.join(QStringLiteral("  ·  ")));
+    m_transferList->setVisible(count > 0);
+    m_transferEmpty->setVisible(count == 0);
 }
 
 void MainWindow::openTransferDirectory(const QString &localPath)
 {
-    if (localPath.trimmed().isEmpty())
+    if (m_closing || localPath.trimmed().isEmpty())
         return;
     const QString normalized = QDir::cleanPath(QFileInfo(localPath).absoluteFilePath());
     const QString directory = QDir::cleanPath(QFileInfo(normalized).absolutePath());
@@ -1041,23 +1092,61 @@ void MainWindow::populateDemoData()
     incoming.timestamp = QDateTime::currentMSecsSinceEpoch() - 8000;
     renderMessage(incoming);
 
-    const QList<QStringList> rows{
-        {QStringLiteral("上传"), QStringLiteral("设计评审.pdf"), QString{}, QStringLiteral("上传"),
-         peer.label(), QStringLiteral("C:/Users/demo/outbox/设计评审.pdf"), QString{}},
-        {QStringLiteral("下载"), QStringLiteral("产品原型.zip"), QString{}, QStringLiteral("下载"),
-         peer.label(), QStringLiteral("C:/Users/demo/downloads/产品原型.zip"), QString{}}};
-    const QList<int> progresses{72, 38};
-    for (int index = 0; index < rows.size(); ++index) {
-        auto *row = new QTreeWidgetItem(m_transferList, rows[index]);
-        row->setSizeHint(0, QSize(-1, 40));
-        row->setData(0, Qt::UserRole + 1, QDir::cleanPath(rows[index][5]));
-        auto *progress = new QProgressBar(m_transferList);
-        progress->setRange(0, 100);
-        progress->setValue(progresses[index]);
-        progress->setFormat(QStringLiteral("%1%  ·  3.6 MiB").arg(progresses[index]));
-        progress->setToolTip(QStringLiteral("3.6 MiB / 5.0 MiB"));
-        m_transferList->setItemWidget(row, 2, progress);
+    QList<TransferCardData> rows;
+    TransferCardData uploading;
+    uploading.upload = true;
+    uploading.fileName = QStringLiteral("设计评审.pdf");
+    uploading.peerName = peer.label();
+    uploading.localPath = QStringLiteral("C:/Users/demo/outbox/设计评审.pdf");
+    uploading.stateText = QStringLiteral("上传中");
+    uploading.stateKey = QStringLiteral("active");
+    uploading.size = 5 * 1024 * 1024;
+    uploading.transferred = 3774874; // 72%, displayed independently from the bar.
+    rows.append(uploading);
+
+    TransferCardData completed;
+    completed.upload = false;
+    completed.fileName = QStringLiteral("产品使用手册.pdf");
+    completed.peerName = peer.label();
+    completed.localPath = QStringLiteral("C:/Users/demo/downloads/产品使用手册.pdf");
+    completed.stateText = QStringLiteral("已完成");
+    completed.stateKey = QStringLiteral("completed");
+    completed.size = 2465792;
+    completed.transferred = completed.size;
+    rows.append(completed);
+
+    TransferCardData failed;
+    failed.upload = true;
+    failed.fileName = QStringLiteral("季度财务汇总-final-v12.xlsx");
+    failed.peerName = peer.label();
+    failed.localPath = QStringLiteral(
+        "C:/Users/demo/OneDrive/Documents/公司资料/跨区域联合项目/2026/第四季度/区域销售与财务对账/最终确认版本/管理层审阅/已审批归档文件/季度财务汇总-final-v12.xlsx");
+    failed.stateText = QStringLiteral("失败");
+    failed.stateKey = QStringLiteral("failed");
+    failed.size = 19293798;
+    failed.transferred = 4823450; // 25%.
+    failed.error = QStringLiteral("网络连接中断，请检查网络后重试");
+    rows.append(failed);
+
+    for (const TransferCardData &data : rows) {
+        auto *row = new QTreeWidgetItem(m_transferList);
+        row->setData(0, Qt::UserRole + 1, QDir::cleanPath(data.localPath));
+        row->setData(0, Qt::UserRole + 2, data.stateKey);
+        row->setText(0, QStringLiteral("%1 · %2 · %3").arg(data.fileName, data.peerName, data.stateText));
+        auto *widget = new TransferTaskCard(m_transferList);
+        m_transferList->setItemWidget(row, 0, widget);
+        widget->setData(data);
+        row->setSizeHint(0, widget->sizeHint());
+        row->setToolTip(0, QDir::toNativeSeparators(data.localPath));
+        connect(widget, &TransferTaskCard::clicked, this, [this, row] {
+            if (!m_closing)
+                m_transferList->setCurrentItem(row);
+        });
+        connect(widget, &TransferTaskCard::openDirectoryRequested,
+                this, &MainWindow::openTransferDirectory);
     }
+    m_transferList->setCurrentItem(m_transferList->topLevelItem(0));
+    updateTransferSummary();
     showTransfersView();
     setPeerUnread(peer.id, 1);
 }

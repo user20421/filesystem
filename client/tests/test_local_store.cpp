@@ -11,6 +11,7 @@ private slots:
     void sanitizesUntrustedNames();
     void storesAndDeduplicatesHistory();
     void persistsConcurrency();
+    void persistsKnownAccountsWithoutCredentials();
     void mergesCursorAndReadReceiptAcrossDuplicateHistory();
 };
 
@@ -77,6 +78,36 @@ void LocalStoreTest::persistsConcurrency()
     QCOMPARE(store.concurrency(), 5);
     store.setConcurrency(1);
     QCOMPARE(store.concurrency(), 3);
+}
+
+void LocalStoreTest::persistsKnownAccountsWithoutCredentials()
+{
+    QTemporaryDir root;
+    LocalStore first(root.filePath(QStringLiteral("user_1")));
+    LocalStore second(root.filePath(QStringLiteral("user_2")));
+    QVERIFY(first.initialize());
+    QVERIFY(second.initialize());
+
+    User good;
+    good.id = QStringLiteral("good-id");
+    good.username = QStringLiteral("GOOD");
+    good.displayName = QStringLiteral("Custom display name");
+    QVERIFY(first.rememberAccount(good));
+    QVERIFY(second.knownAccountIds().contains(good.id));
+    QVERIFY(second.rememberAccount(good)); // Reauthentication is idempotent.
+
+    QFile registry(root.filePath(QStringLiteral("known_accounts.json")));
+    QVERIFY(registry.open(QIODevice::ReadOnly));
+    const QByteArray json = registry.readAll();
+    QVERIFY(json.contains("good-id"));
+    QVERIFY(json.contains("GOOD"));
+    QVERIFY(!json.contains("Custom display name"));
+    QVERIFY(!json.contains("token"));
+    QVERIFY(!json.contains("password"));
+    registry.close();
+
+    QVERIFY(second.forgetAccount(good.id));
+    QVERIFY(first.knownAccountIds().isEmpty());
 }
 
 void LocalStoreTest::mergesCursorAndReadReceiptAcrossDuplicateHistory()

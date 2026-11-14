@@ -22,12 +22,21 @@ type Service struct {
 	maxActive         int
 	maxChunk, maxFile int64
 	sem               chan struct{}
+	memory            *memoryBudget
 	lockMu            sync.Mutex
 	locks             map[string]*lockEntry
 }
 
 func NewService(db *sql.DB, objects ObjectStore, kek []byte, maxActive int, maxChunk, maxFile int64, concurrency int) *Service {
-	return &Service{db: db, objects: objects, kek: kek, maxActive: maxActive, maxChunk: maxChunk, maxFile: maxFile, sem: make(chan struct{}, concurrency), locks: make(map[string]*lockEntry)}
+	return NewServiceWithMemoryBudget(db, objects, kek, maxActive, maxChunk, maxFile, concurrency, 500<<20)
+}
+
+func NewServiceWithMemoryBudget(db *sql.DB, objects ObjectStore, kek []byte, maxActive int, maxChunk, maxFile int64, concurrency int, fileMemoryBudget int64) *Service {
+	return &Service{db: db, objects: objects, kek: kek, maxActive: maxActive, maxChunk: maxChunk, maxFile: maxFile, sem: make(chan struct{}, concurrency), memory: newMemoryBudget(fileMemoryBudget), locks: make(map[string]*lockEntry)}
+}
+
+func (s *Service) MemoryStats() (used, limit int64) {
+	return s.memory.stats()
 }
 func (s *Service) lock(key string) func() {
 	s.lockMu.Lock()

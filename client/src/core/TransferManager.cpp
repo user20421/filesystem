@@ -40,6 +40,7 @@ void TransferManager::shutdown()
     m_closing = true;
     const QList<TransferTask *> tasks = m_tasks;
     for (TransferTask *task : tasks) {
+        task->m_resumePending = false;
         if (task->m_reply) {
             QNetworkReply *reply = task->m_reply.data();
             task->m_reply.clear();
@@ -422,15 +423,15 @@ void TransferManager::pause(const QString &id)
         || task->m_state == TransferTask::State::Failed
         || task->m_state == TransferTask::State::Cancelled)
         return;
+    task->m_resumePending = false;
     task->m_state = TransferTask::State::Paused;
-    if (task->direction() == TransferTask::Direction::Download) {
+    if (task->direction() == TransferTask::Direction::Download)
         discardWriter(task);
-        if (task->m_reply)
-            task->m_reply->abort();
-        else if (m_active.contains(id))
-            release(task);
-    }
+    if (task->m_reply)
+        task->m_reply->abort();
     notify(task);
+    // Hash/read workers have no QNetworkReply to abort. Their completion
+    // callbacks release the active slot after observing Paused.
     if (!m_active.contains(id))
         pump();
 }
@@ -440,6 +441,12 @@ void TransferManager::resume(const QString &id)
     TransferTask *task = this->task(id);
     if (!task || task->m_state != TransferTask::State::Paused)
         return;
+    if (m_active.contains(id) || task->m_reply) {
+        // The aborted reply (or a preparing worker) still owns the active slot.
+        // Let its callback observe Paused so OperationCanceled is not a failure.
+        task->m_resumePending = true;
+        return;
+    }
     task->m_state = TransferTask::State::Queued;
     notify(task);
     pump();
@@ -452,6 +459,7 @@ void TransferManager::retry(const QString &id)
                   && task->m_state != TransferTask::State::Cancelled))
         return;
     const bool wasCancelled = task->m_state == TransferTask::State::Cancelled;
+    task->m_resumePending = false;
     task->m_error.clear();
     task->m_state = TransferTask::State::Queued;
     if (wasCancelled && task->direction() == TransferTask::Direction::Upload) {
@@ -478,6 +486,7 @@ void TransferManager::cancel(const QString &id)
     if (!task || task->m_state == TransferTask::State::Completed
         || task->m_state == TransferTask::State::Cancelled)
         return;
+    task->m_resumePending = false;
     task->m_state = TransferTask::State::Cancelled;
     if (task->direction() == TransferTask::Direction::Download)
         discardWriter(task);
@@ -491,6 +500,7 @@ void TransferManager::cancel(const QString &id)
 
 void TransferManager::fail(TransferTask *task, const QString &error)
 {
+    task->m_resumePending = false;
     discardWriter(task);
     task->m_error = error.isEmpty() ? QStringLiteral("未知传输错误") : error;
     task->m_state = TransferTask::State::Failed;
@@ -513,6 +523,12 @@ void TransferManager::release(TransferTask *task)
 {
     task->m_reply.clear();
     m_active.remove(task->id());
+    if (!m_closing && task->m_state == TransferTask::State::Paused
+        && task->m_resumePending) {
+        task->m_resumePending = false;
+        task->m_state = TransferTask::State::Queued;
+        notify(task);
+    }
     if (!m_closing)
         pump();
 }

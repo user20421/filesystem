@@ -1,0 +1,6 @@
+# Offline/local build: uses the host-built Linux binary and the cached MinIO image.
+FROM pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+USER root
+COPY docker/secure-im-server /usr/local/bin/secure-im-server
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/secure-im-server"]

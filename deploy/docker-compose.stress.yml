@@ -1,0 +1,53 @@
+name: secure-im-stress
+
+services:
+  backend:
+    container_name: secure-im-stress-backend
+    image: secure-im-backend-stress:local
+    build:
+      context: ../backend
+      dockerfile: Dockerfile.offline
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
+    restart: unless-stopped
+    cpus: 6
+    mem_limit: 3g
+    environment:
+      LISTEN_ADDR: 0.0.0.0:8080
+      MYSQL_ADDR: mysql:3306
+      MYSQL_DATABASE: secure_im_stress
+      MYSQL_USER: ${STRESS_MYSQL_USER:-secure_im_stress}
+      MYSQL_PASSWORD: ${STRESS_MYSQL_PASSWORD:?Set STRESS_MYSQL_PASSWORD in .env.stress}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      MINIO_BUCKET: secure-im-stress-files
+      MINIO_USE_SSL: "false"
+      JWT_SECRET: ${STRESS_JWT_SECRET:?Set STRESS_JWT_SECRET in .env.stress}
+      FILE_KEK: ${STRESS_FILE_KEK:?Set STRESS_FILE_KEK in .env.stress}
+      MAX_ACTIVE_FILES: 5
+      MAX_CHUNK_SIZE: 1048576
+      MAX_FILE_SIZE: 5368709120
+      UPLOAD_CONCURRENCY: 64
+      FILE_MEMORY_BUDGET: 524288000
+      ENABLE_DEBUG_STATS: "true"
+      WS_MAX_CONNECTIONS: 50000
+      GOMAXPROCS: 6
+      # Go rejects decimal quantities; this is 2.4 GiB rounded up to bytes.
+      GOMEMLIMIT: 2576980378
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:18080:8080"
+    networks:
+      - secure-im-net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+networks:
+  secure-im-net:
+    name: secure-im-net
+    external: true

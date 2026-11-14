@@ -25,6 +25,9 @@ type Config struct {
 	MaxChunkSize      int64
 	MaxFileSize       int64
 	UploadConcurrency int
+	FileMemoryBudget  int64
+	EnableDebugStats  bool
+	WSMaxConnections  int
 }
 
 func Load() (Config, error) {
@@ -44,6 +47,9 @@ func Load() (Config, error) {
 		MaxChunkSize:      int64(integer("MAX_CHUNK_SIZE", 4<<20)),
 		MaxFileSize:       int64(integer("MAX_FILE_SIZE", 5<<30)),
 		UploadConcurrency: integer("UPLOAD_CONCURRENCY", 4),
+		FileMemoryBudget:  int64(integer("FILE_MEMORY_BUDGET", 500<<20)),
+		EnableDebugStats:  boolean("ENABLE_DEBUG_STATS", false),
+		WSMaxConnections:  integer("WS_MAX_CONNECTIONS", 1000),
 	}
 	if c.MySQLDSN == "" {
 		c.MySQLDSN = fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s",
@@ -63,8 +69,14 @@ func Load() (Config, error) {
 	if c.MaxChunkSize < 64<<10 || c.MaxChunkSize > 16<<20 {
 		return c, fmt.Errorf("MAX_CHUNK_SIZE must be between 64KiB and 16MiB")
 	}
-	if c.MaxFileSize < c.MaxChunkSize || c.UploadConcurrency < 1 || c.UploadConcurrency > 32 {
+	if c.MaxFileSize < c.MaxChunkSize || c.UploadConcurrency < 1 || c.UploadConcurrency > 64 {
 		return c, fmt.Errorf("invalid file size or upload concurrency")
+	}
+	if c.FileMemoryBudget <= 0 {
+		return c, fmt.Errorf("FILE_MEMORY_BUDGET must be positive")
+	}
+	if c.WSMaxConnections < 1 || c.WSMaxConnections > 100000 {
+		return c, fmt.Errorf("WS_MAX_CONNECTIONS must be between 1 and 100000")
 	}
 	if c.AccessTTL <= 0 || c.RefreshTTL <= 0 || c.WSTicketTTL <= 0 {
 		return c, fmt.Errorf("token TTLs must be positive")

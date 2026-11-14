@@ -49,6 +49,7 @@ private:
     QString m_error;
     QPointer<QNetworkReply> m_reply;
     Workers::AsyncFileWriter *m_writer = nullptr;
+    bool m_resumePending = false;
 };
 
 class TransferManager final : public QObject {

@@ -40,6 +40,11 @@ func (s *Service) UploadChunk(ctx context.Context, id, user string, index int, e
 	if err != nil {
 		return err
 	}
+	releaseMemory, err := s.memory.acquire(ctx, chunkMemoryWeight(expectedSize))
+	if err != nil {
+		return err
+	}
+	defer releaseMemory()
 	plain, err := io.ReadAll(io.LimitReader(body, expectedSize+1))
 	if err != nil {
 		return err
@@ -113,27 +118,38 @@ func (s *Service) chunks(ctx context.Context, id string) ([]Chunk, error) {
 	}
 	return chunks, rows.Err()
 }
-func (s *Service) readChunk(ctx context.Context, dek []byte, c Chunk) ([]byte, error) {
+func (s *Service) readChunk(ctx context.Context, dek []byte, c Chunk) (plain []byte, releaseMemory func(), err error) {
+	releaseMemory, err = s.memory.acquire(ctx, chunkMemoryWeight(c.PlaintextSize))
+	if err != nil {
+		return nil, nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			releaseMemory()
+		}
+	}()
 	object, err := s.objects.Get(ctx, c.ObjectKey)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer object.Close()
 	ciphertext, err := io.ReadAll(io.LimitReader(object, c.PlaintextSize+17))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if int64(len(ciphertext)) != c.PlaintextSize+16 {
-		return nil, fmt.Errorf("ciphertext size mismatch for chunk %d", c.Index)
+	if int64(len(ciphertext)) != c.PlaintextSize+chunkCiphertextOverhead {
+		return nil, nil, fmt.Errorf("ciphertext size mismatch for chunk %d", c.Index)
 	}
-	plain, err := DecryptChunk(dek, ciphertext, c.Nonce)
+	plain, err = DecryptChunk(dek, ciphertext, c.Nonce)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if int64(len(plain)) != c.PlaintextSize || !hashesEqual(SHA256(plain), c.SHA256) {
-		return nil, fmt.Errorf("plaintext checksum mismatch for chunk %d", c.Index)
+		return nil, nil, fmt.Errorf("plaintext checksum mismatch for chunk %d", c.Index)
 	}
-	return plain, nil
+	success = true
+	return plain, releaseMemory, nil
 }
 func (s *Service) Complete(ctx context.Context, id, user string) (File, error) {
 	if err := s.acquire(ctx); err != nil {
@@ -172,11 +188,13 @@ func (s *Service) Complete(ctx context.Context, id, user string) (File, error) {
 		if c.PlaintextSize != expected {
 			return f, fmt.Errorf("stored chunk size mismatch")
 		}
-		plain, err := s.readChunk(ctx, dek, c)
+		plain, releaseMemory, err := s.readChunk(ctx, dek, c)
 		if err != nil {
 			return f, err
 		}
-		if _, err := hash.Write(plain); err != nil {
+		_, err = hash.Write(plain)
+		releaseMemory()
+		if err != nil {
 			return f, err
 		}
 	}

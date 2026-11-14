@@ -1,0 +1,14 @@
+.cache/
+.tools/
+.env
+.env.*
+.git/
+.gitignore
+Dockerfile
+.dockerignore
+bin/
+coverage.out
+server
+server.exe
+*.log
+*.tmp

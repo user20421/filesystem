@@ -116,8 +116,10 @@ function Invoke-MinioClient {
     param([Parameter(Mandatory = $true)][string]$Command)
 
     # Compose expands these local-only credentials before creating the ephemeral client.
-    $clientCommand = 'export MC_CONFIG_DIR=/tmp/secure-im-mc; mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && ' + $Command
-    $runArguments = @('run', '--rm', '--no-deps', '--entrypoint', '/bin/sh', 'minio-init', '-c', $clientCommand)
+    # Use the client bundled in the already-running MinIO image, avoiding a
+    # separate minio/mc image pull when the registry is unavailable.
+    $clientCommand = 'export MC_CONFIG_DIR=/tmp/secure-im-mc; /usr/bin/mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD >/dev/null && ' + $Command
+    $runArguments = @('run', '--rm', '--no-deps', '--entrypoint', '/bin/sh', 'minio', '-c', $clientCommand)
     $dockerArguments = Get-DockerComposeArguments -AdditionalArguments $runArguments
     & docker @dockerArguments | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -170,5 +172,50 @@ function Test-MinioAnonymousAccessDenied {
             return
         }
         throw "Anonymous MinIO bucket access was not denied with HTTP 403: $($_.Exception.Message)"
+    }
+}
+
+function Get-StressEnvironmentFile {
+    return (Join-Path $script:DeployDirectory '.env.stress')
+}
+
+function Get-StressEnvironmentValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DefaultValue
+    )
+    $envFile = Get-StressEnvironmentFile
+    if (Test-Path -LiteralPath $envFile -PathType Leaf) {
+        foreach ($line in [System.IO.File]::ReadLines($envFile)) {
+            if ($line -match ('^\s*' + [regex]::Escape($Name) + '=(.*)$')) {
+                return $matches[1].Trim()
+            }
+        }
+    }
+    return $DefaultValue
+}
+
+function Get-StressDockerComposeArguments {
+    param([string[]]$AdditionalArguments)
+
+    $envFile = Get-EnvironmentFile
+    if (-not $envFile) {
+        throw 'No base .env file was found. Run scripts/dev-up.ps1 first.'
+    }
+    $stressEnv = Get-StressEnvironmentFile
+    if (-not (Test-Path -LiteralPath $stressEnv -PathType Leaf)) {
+        throw 'No stress environment file was found. Run scripts/stress-up.ps1 first.'
+    }
+    $composeFile = Join-Path $script:DeployDirectory 'docker-compose.stress.yml'
+    return @('compose', '--env-file', $envFile, '--env-file', $stressEnv, '-f', $composeFile, '-p', 'secure-im-stress') + $AdditionalArguments
+}
+
+function Invoke-StressDockerCompose {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ComposeArguments)
+
+    $dockerArguments = Get-StressDockerComposeArguments -AdditionalArguments $ComposeArguments
+    & docker @dockerArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker compose $($ComposeArguments -join ' ') failed with exit code $LASTEXITCODE."
     }
 }

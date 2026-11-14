@@ -10,6 +10,7 @@
 #include <QUrl>
 #include <functional>
 
+class QFrame;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -77,11 +78,11 @@ private:
     void markLatestIncomingRead(const QString &peerId);
     void addTransferRow(TransferTask *task);
     void updateTransferRow(TransferTask *task);
+    void updateTransferSummary();
     QString selectedTransferId() const;
     void updateSessionLabel();
     void setConnectionState(const QString &state);
     void showNotice(const QString &notice);
-    QProgressBar *progressForTask(QTreeWidgetItem *item, TransferTask *task);
     void openTransferDirectory(const QString &localPath);
     void requestExit();
     void requestAccountDeletion();
@@ -100,12 +101,15 @@ private:
     QLineEdit *m_search = nullptr;
     QListWidget *m_users = nullptr;
     QTextBrowser *m_chat = nullptr;
+    QFrame *m_composer = nullptr;
     QLineEdit *m_input = nullptr;
     QStackedWidget *m_views = nullptr;
     QPushButton *m_chatNav = nullptr;
     QPushButton *m_transferNav = nullptr;
     QPushButton *m_deleteAccountButton = nullptr;
     QTreeWidget *m_transferList = nullptr;
+    QLabel *m_transferStats = nullptr;
+    QLabel *m_transferEmpty = nullptr;
     QSpinBox *m_concurrency = nullptr;
     QTimer *m_usersTimer = nullptr;
     QTimer *m_historyTimer = nullptr;

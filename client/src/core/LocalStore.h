@@ -3,7 +3,9 @@
 #include "ApiTypes.h"
 
 #include <QDir>
+#include <QJsonArray>
 #include <QObject>
+#include <QSet>
 
 class LocalStore final : public QObject {
     Q_OBJECT
@@ -21,6 +23,11 @@ public:
     AuthSession loadSession() const;
     void clearSession();
 
+    // Shared by sibling per-user data directories; contains only IDs/usernames.
+    QSet<QString> knownAccountIds() const;
+    bool rememberAccount(const User &user, QString *error = nullptr) const;
+    bool forgetAccount(const QString &userId, QString *error = nullptr) const;
+
     // Returns true when a new message or new server metadata was persisted.
     bool appendMessage(const QString &peerId, const ChatMessage &message);
     bool markMessagesRead(const QString &peerId, const QString &senderId,
@@ -32,6 +39,9 @@ public:
 
 private:
     QString messagesPath() const;
+    QString knownAccountsPath() const;
+    QJsonArray readKnownAccounts() const;
+    bool writeKnownAccounts(const QJsonArray &accounts, QString *error = nullptr) const;
     QJsonObject readMessageDocument() const;
     bool writeJson(const QString &path, const QJsonObject &object, QString *error = nullptr) const;
 

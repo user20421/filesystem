@@ -24,8 +24,12 @@ type Handler struct {
 	slots    chan struct{}
 }
 
-func NewHandler(service *Service, tickets *TicketStore, hub *Hub, log *slog.Logger) *Handler {
-	h := &Handler{service: service, tickets: tickets, hub: hub, log: log, slots: make(chan struct{}, 1000)}
+func NewHandler(service *Service, tickets *TicketStore, hub *Hub, log *slog.Logger, maxConnections ...int) *Handler {
+	limit := 1000
+	if len(maxConnections) > 0 && maxConnections[0] > 0 {
+		limit = maxConnections[0]
+	}
+	h := &Handler{service: service, tickets: tickets, hub: hub, log: log, slots: make(chan struct{}, limit)}
 	h.upgrader = websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
 		if origin == "" {

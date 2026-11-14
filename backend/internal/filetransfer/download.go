@@ -39,11 +39,13 @@ func (s *Service) Download(ctx context.Context, id, user string, output io.Write
 	}
 	onMetadata(f)
 	for _, c := range chunks {
-		plain, err := s.readChunk(ctx, dek, c)
+		plain, releaseMemory, err := s.readChunk(ctx, dek, c)
 		if err != nil {
 			return err
 		}
-		if _, err := output.Write(plain); err != nil {
+		_, err = output.Write(plain)
+		releaseMemory()
+		if err != nil {
 			return err
 		}
 	}

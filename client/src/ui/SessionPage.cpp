@@ -38,6 +38,10 @@ void SessionPage::startSession(const AuthSession &session, bool online)
     if (m_closing || m_chat)
         return;
     m_context->setSession(session);
+    // Both fresh authentication and restored sessions make custom usernames
+    // eligible contacts. Demo sessions never enter the persistent registry.
+    if (online)
+        m_context->store()->rememberAccount(session.user);
     m_chat = new MainWindow(m_context->api(), m_context->store(), m_context->codec(),
                             session, online, m_stack);
     m_stack->addWidget(m_chat);

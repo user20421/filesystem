@@ -7,6 +7,7 @@
 class QLabel;
 class QLineEdit;
 class SessionPage;
+class SystemTestPage;
 class QTabWidget;
 class QToolButton;
 
@@ -36,6 +37,7 @@ private:
     QUrl serverUrl() const;
 
     QTabWidget *m_tabs;
+    SystemTestPage *m_systemTest = nullptr;
     QLineEdit *m_root;
     QLineEdit *m_server;
     QToolButton *m_add;

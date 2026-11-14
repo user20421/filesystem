@@ -5,19 +5,23 @@
 #include "SimulatorWindow.h"
 #include "SystemTestPage.h"
 #include "Theme.h"
+#include "TransferTaskCard.h"
 
 #include <QApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFrame>
+#include <QHeaderView>
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPointer>
+#include <QProgressBar>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTcpServer>
@@ -129,7 +133,10 @@ private slots:
     void generatesOffscreenPreview();
     void fixedDataRootAndUppercaseLogin();
     void transferDirectoryUsesFakeOpenerOnce();
+    void transferCardsPresentReadableDetails();
+    void transferCardActionsRemainAvailable();
     void contactUnreadDotsAreIndependentAndClearOnView();
+    void contactFilterAllowsRegisteredCustomUsers();
     void readReceiptsRespectVisibilityAndPersist();
 };
 
@@ -208,6 +215,9 @@ void SessionTabsTest::closingOneTabDoesNotAffectAnother()
     QCOMPARE(tabs->tabText(1), QStringLiteral("欢迎"));
     QVERIFY(qobject_cast<SystemTestPage *>(tabs->widget(0)));
     QVERIFY(!window.findChild<QPushButton *>(QStringLiteral("systemTestLauncher")));
+    auto *systemTest = qobject_cast<SystemTestPage *>(tabs->widget(0));
+    QVERIFY(systemTest && systemTest->controller());
+    QVERIFY(!systemTest->controller()->isRunning());
     for (int index = 0; index < 2; ++index) {
         QVERIFY(!tabs->tabBar()->tabButton(index, QTabBar::LeftSide));
         QVERIFY(!tabs->tabBar()->tabButton(index, QTabBar::RightSide));
@@ -523,7 +533,16 @@ void SessionTabsTest::generatesOffscreenPreview()
     QVERIFY(testPage);
     auto *testButton = testPage->findChild<QPushButton *>(QStringLiteral("stressTestButton"));
     QVERIFY(testButton);
-    QVERIFY(!testButton->isEnabled());
+    QCOMPARE(testButton->text(), QStringLiteral("开始测试"));
+    QVERIFY(testButton->isEnabled());
+    auto *stopButton = testPage->findChild<QPushButton *>(QStringLiteral("stressStopButton"));
+    auto *target = testPage->findChild<QSpinBox *>(QStringLiteral("stressTargetSpinBox"));
+    auto *history = testPage->findChild<QTreeWidget *>(QStringLiteral("stressHistoryList"));
+    QVERIFY(stopButton && target && history);
+    QVERIFY(!stopButton->isEnabled());
+    QCOMPARE(target->value(), 1000);
+    QVERIFY(testPage->findChild<QLabel *>(QStringLiteral("stressResourceLabel"))->text()
+        .contains(QStringLiteral("500 MiB")));
     window.show();
     QTest::qWait(80);
     const QString testPath = QFileInfo(path).absoluteDir().filePath(
@@ -551,8 +570,7 @@ void SessionTabsTest::generatesOffscreenPreview()
     QVERIFY(output.size() > 1000);
     QImage image(path);
     QVERIFY(!image.isNull());
-    QVERIFY(image.width() >= 1000);
-    QVERIFY(image.height() >= 650);
+    QCOMPARE(image.size(), QSize(1280, 820));
 
     tabs->setCurrentIndex(3);
     QTest::qWait(60);
@@ -613,18 +631,154 @@ void SessionTabsTest::transferDirectoryUsesFakeOpenerOnce()
     });
     QTreeWidgetItem *row = chat->m_transferList->topLevelItem(0);
     QVERIFY(row);
-    emit chat->m_transferList->itemClicked(row, 1);
-    emit chat->m_transferList->itemDoubleClicked(row, 1);
+    auto *card = qobject_cast<TransferTaskCard *>(chat->m_transferList->itemWidget(row, 0));
+    QVERIFY(card);
+    chat->m_transferList->setCurrentItem(nullptr);
+    QTest::mouseClick(card, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+    QCOMPARE(chat->m_transferList->currentItem(), row);
+    QCOMPARE(opened.size(), 0); // Clicking the card itself only selects it.
+
+    auto *fileName = card->findChild<QLabel *>(QStringLiteral("transferFileName"));
+    QVERIFY(fileName);
+    QTest::mouseClick(fileName, Qt::LeftButton);
     QCOMPARE(opened.size(), 1);
     QCOMPARE(opened.first().toLocalFile(), QDir::cleanPath(QStringLiteral("C:/Users/demo/outbox")));
-    chat->m_transferList->setCurrentItem(row);
     auto *button = chat->findChild<QPushButton *>(QStringLiteral("openTransferDirectoryButton"));
     QVERIFY(button);
     button->click();
     QCOMPARE(opened.size(), 2);
-    emit chat->m_transferList->itemClicked(row, 5);
+    auto *path = card->findChild<QLabel *>(QStringLiteral("transferPath"));
+    QVERIFY(path);
+    QTest::mouseClick(path, Qt::LeftButton);
     QCOMPARE(opened.size(), 3);
+    auto *cardButton = card->findChild<QPushButton *>(QStringLiteral("openTransferCardDirectoryButton"));
+    QVERIFY(cardButton);
+    cardButton->click();
+    QCOMPARE(opened.size(), 4);
     MainWindow::setDirectoryOpenerForTests({});
+}
+
+void SessionTabsTest::transferCardsPresentReadableDetails()
+{
+    QTemporaryDir root;
+    ScopedCurrentDirectory cwd(root.path());
+    QVERIFY(cwd.isValid());
+    SimulatorWindow window({}, QUrl(QStringLiteral("http://127.0.0.1:1")));
+    SessionPage *page = window.addSession(true);
+    QVERIFY(page);
+    window.show();
+    MainWindow *chat = page->chatPage();
+    chat->showTransfersView();
+    QCOMPARE(chat->m_transferList->columnCount(), 1);
+    QVERIFY(chat->m_transferList->header()->isHidden());
+    QCOMPARE(chat->m_transferList->topLevelItemCount(), 3);
+    QVERIFY(!chat->m_transferEmpty->isVisible());
+    QVERIFY(chat->m_transferStats->text().contains(QStringLiteral("共 3 项")));
+    QVERIFY(chat->m_transferStats->text().contains(QStringLiteral("1 进行中")));
+    QVERIFY(chat->m_transferStats->text().contains(QStringLiteral("1 已完成")));
+    QVERIFY(chat->m_transferStats->text().contains(QStringLiteral("1 失败")));
+
+    const QStringList states{QStringLiteral("active"), QStringLiteral("completed"),
+                             QStringLiteral("failed")};
+    for (int index = 0; index < 3; ++index) {
+        QTreeWidgetItem *item = chat->m_transferList->topLevelItem(index);
+        auto *card = qobject_cast<TransferTaskCard *>(chat->m_transferList->itemWidget(item, 0));
+        QVERIFY(card);
+        auto *direction = card->findChild<QLabel *>(QStringLiteral("transferDirection"));
+        auto *name = card->findChild<QLabel *>(QStringLiteral("transferFileName"));
+        auto *peer = card->findChild<QLabel *>(QStringLiteral("transferPeer"));
+        auto *percent = card->findChild<QLabel *>(QStringLiteral("transferPercent"));
+        auto *bytes = card->findChild<QLabel *>(QStringLiteral("transferBytes"));
+        auto *state = card->findChild<QLabel *>(QStringLiteral("transferState"));
+        auto *path = card->findChild<QLabel *>(QStringLiteral("transferPath"));
+        auto *progress = card->findChild<QProgressBar *>(QStringLiteral("transferProgress"));
+        QVERIFY(direction && name && peer && percent && bytes && state && path && progress);
+        QVERIFY(direction->text().contains(index == 1
+            ? QStringLiteral("下载") : QStringLiteral("上传")));
+        QVERIFY(!name->text().isEmpty());
+        QVERIFY(peer->text().contains(QStringLiteral("Bob Chen"), Qt::CaseInsensitive));
+        QVERIFY(percent->text().endsWith(QLatin1Char('%')));
+        QVERIFY(bytes->text().contains(QLatin1Char('/')));
+        QCOMPARE(state->property("state").toString(), states[index]);
+        QVERIFY(!progress->isTextVisible());
+        QVERIFY(progress->height() <= 8);
+        QVERIFY(path->toolTip().contains(QDir::toNativeSeparators(
+            item->data(0, Qt::UserRole + 1).toString())));
+        QVERIFY(item->sizeHint(0).height() >= 110);
+    }
+    auto *firstCard = qobject_cast<TransferTaskCard *>(
+        chat->m_transferList->itemWidget(chat->m_transferList->topLevelItem(0), 0));
+    QCOMPARE(firstCard->findChild<QLabel *>(QStringLiteral("transferPercent"))->text(),
+             QStringLiteral("72%"));
+    auto *lastCard = qobject_cast<TransferTaskCard *>(
+        chat->m_transferList->itemWidget(chat->m_transferList->topLevelItem(2), 0));
+    auto *error = lastCard->findChild<QLabel *>(QStringLiteral("transferError"));
+    QVERIFY(error && error->isVisible());
+    QVERIFY(error->text().contains(QStringLiteral("网络连接中断")));
+    auto *longPath = lastCard->findChild<QLabel *>(QStringLiteral("transferPath"));
+    QVERIFY(longPath->text().contains(QStringLiteral("…")));
+    QVERIFY(longPath->toolTip().contains(QStringLiteral("第四季度")));
+
+    QTest::mouseClick(lastCard, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+    QCOMPARE(chat->m_transferList->currentItem(), chat->m_transferList->topLevelItem(2));
+    QVERIFY(lastCard->property("selected").toBool());
+    QVERIFY(!firstCard->property("selected").toBool());
+}
+
+void SessionTabsTest::transferCardActionsRemainAvailable()
+{
+    HoldingServer server;
+    QVERIFY(server.start());
+    QTemporaryDir root;
+    SessionContext context(root.filePath(QStringLiteral("user")), server.url());
+    QVERIFY(context.open());
+    const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
+    context.setSession(auth);
+    MainWindow window(context.api(), context.store(), context.codec(), auth, false);
+    window.showTransfersView();
+    window.show();
+    QVERIFY(window.m_transferEmpty->isVisible());
+    QVERIFY(!window.m_transferList->isVisible());
+    QCOMPARE(window.m_transferStats->text(), QStringLiteral("共 0 项"));
+
+    TransferTask *task = window.transferManager()->addDownload(
+        QStringLiteral("peer"), QStringLiteral("held-file"), QStringLiteral("report.pdf"),
+        4 * 1024 * 1024);
+    QVERIFY(task);
+    QCOMPARE(task->state(), TransferTask::State::Downloading);
+    QCOMPARE(window.m_transferList->topLevelItemCount(), 1);
+    QVERIFY(!window.m_transferEmpty->isVisible());
+    QVERIFY(window.m_transferList->isVisible());
+    auto *card = qobject_cast<TransferTaskCard *>(
+        window.m_transferList->itemWidget(window.m_transferList->topLevelItem(0), 0));
+    QVERIFY(card);
+    QCOMPARE(card->findChild<QLabel *>(QStringLiteral("transferFileName"))->text(),
+             QStringLiteral("report.pdf"));
+    QVERIFY(card->findChild<QLabel *>(QStringLiteral("transferPeer"))->text()
+        .contains(QStringLiteral("PEER")));
+    QCOMPARE(card->findChild<QLabel *>(QStringLiteral("transferState"))->text(),
+             QStringLiteral("下载"));
+
+    auto *pause = window.findChild<QPushButton *>(QStringLiteral("transferPauseButton"));
+    auto *resume = window.findChild<QPushButton *>(QStringLiteral("transferResumeButton"));
+    auto *retry = window.findChild<QPushButton *>(QStringLiteral("transferRetryButton"));
+    auto *cancel = window.findChild<QPushButton *>(QStringLiteral("transferCancelButton"));
+    QVERIFY(pause && resume && retry && cancel);
+    pause->click();
+    QCOMPARE(task->state(), TransferTask::State::Paused);
+    QCOMPARE(card->findChild<QLabel *>(QStringLiteral("transferState"))->text(),
+             QStringLiteral("已暂停"));
+    QCoreApplication::processEvents();
+    resume->click();
+    QCOMPARE(task->state(), TransferTask::State::Downloading);
+    cancel->click();
+    QCOMPARE(task->state(), TransferTask::State::Cancelled);
+    QCoreApplication::processEvents();
+    retry->click();
+    QCOMPARE(task->state(), TransferTask::State::Downloading);
+    QVERIFY(window.m_transferStats->text().contains(QStringLiteral("共 1 项")));
+    window.shutdown();
+    context.shutdown();
 }
 
 void SessionTabsTest::contactUnreadDotsAreIndependentAndClearOnView()
@@ -637,11 +791,11 @@ void SessionTabsTest::contactUnreadDotsAreIndependentAndClearOnView()
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
     User first;
     first.id = QStringLiteral("first-peer-uuid");
-    first.username = QStringLiteral("bob");
+    first.username = QStringLiteral("USER_2");
     first.displayName = QStringLiteral("Bob Chen");
     User second;
     second.id = QStringLiteral("second-peer-uuid");
-    second.username = QStringLiteral("carol");
+    second.username = QStringLiteral("USER_3");
     second.displayName = QStringLiteral("Carol Li");
     window.m_presenceKnown = true;
     window.m_onlineUserIds = {first.id};
@@ -737,6 +891,72 @@ void SessionTabsTest::contactUnreadDotsAreIndependentAndClearOnView()
     context.shutdown();
 }
 
+void SessionTabsTest::contactFilterAllowsRegisteredCustomUsers()
+{
+    QTemporaryDir root;
+    const QUrl serverUrl(QStringLiteral("http://127.0.0.1:1"));
+    const AuthSession good = session(QStringLiteral("GOOD"), QStringLiteral("good-secret"));
+    const QString registryPath = root.filePath(QStringLiteral("known_accounts.json"));
+
+    {
+        auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("user_1")), serverUrl);
+        QVERIFY(context->open());
+        SessionPage page(std::move(context));
+        page.startSession(good);
+        QVERIFY(page.context()->store()->knownAccountIds().contains(good.user.id));
+        QVERIFY(page.context()->store()->saveSession(good));
+    }
+
+    // A saved custom account is registered again when its session is restored.
+    QVERIFY(QFile::remove(registryPath));
+    {
+        auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("user_1")), serverUrl);
+        QVERIFY(context->open());
+        SessionPage restored(std::move(context));
+        QVERIFY(restored.isAuthenticated());
+        QVERIFY(restored.context()->store()->knownAccountIds().contains(good.user.id));
+    }
+
+    auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("user_2")), serverUrl);
+    QVERIFY(context->open());
+    SessionPage observer(std::move(context));
+    observer.startSession(session(QStringLiteral("CURRENT"), QStringLiteral("current-secret")));
+    MainWindow *window = observer.chatPage();
+    QVERIFY(window);
+
+    User simulator;
+    simulator.id = QStringLiteral("simulator-id");
+    simulator.username = QStringLiteral("USER_2");
+    User unknownAlice;
+    unknownAlice.id = QStringLiteral("unknown-alice-id");
+    unknownAlice.username = QStringLiteral("ALICE");
+    User unknownIntegration;
+    unknownIntegration.id = QStringLiteral("unknown-qtit-id");
+    unknownIntegration.username = QStringLiteral("QTIT_RANDOM_123");
+    User unknownOther;
+    unknownOther.id = QStringLiteral("unknown-other-id");
+    unknownOther.username = QStringLiteral("OTHER");
+    window->applyUsers({good.user, unknownAlice, unknownIntegration, unknownOther, simulator});
+
+    QCOMPARE(window->m_users->count(), 2);
+    QSet<QString> visibleIds;
+    for (int index = 0; index < window->m_users->count(); ++index)
+        visibleIds.insert(window->m_users->item(index)->data(Qt::UserRole).toString());
+    QVERIFY(visibleIds.contains(good.user.id));
+    QVERIFY(visibleIds.contains(simulator.id));
+    QVERIFY(!visibleIds.contains(unknownAlice.id));
+    QVERIFY(!visibleIds.contains(unknownIntegration.id));
+    QVERIFY(!visibleIds.contains(unknownOther.id));
+
+    QFile registry(registryPath);
+    QVERIFY(registry.open(QIODevice::ReadOnly));
+    const QByteArray json = registry.readAll();
+    QVERIFY(!json.contains("good-secret"));
+    QVERIFY(!json.contains("current-secret"));
+    QVERIFY(!json.contains("token"));
+    observer.shutdown();
+}
+
 void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
 {
     HoldingServer server;
@@ -747,26 +967,32 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
     context.setSession(auth);
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
+    window.show();
+    QVERIFY(!window.m_composer->isVisible());
     User peer;
     peer.id = QStringLiteral("peer-id");
-    peer.username = QStringLiteral("bob");
+    peer.username = QStringLiteral("USER_2");
     window.m_presenceKnown = true;
     window.m_onlineUserIds.insert(peer.id);
     User integrationUser;
     integrationUser.id = QStringLiteral("qt-integration-id");
     integrationUser.username = QStringLiteral("QTIT_PEER_ABC123");
-    window.applyUsers({peer, integrationUser});
-    QCOMPARE(window.m_users->count(), 1); // Automated test users stay hidden.
+    User legacyUser;
+    legacyUser.id = QStringLiteral("legacy-test-id");
+    legacyUser.username = QStringLiteral("ALICE");
+    window.applyUsers({peer, integrationUser, legacyUser});
+    QCOMPARE(window.m_users->count(), 1); // Only USER_<number> demo accounts appear.
     window.m_users->setCurrentItem(window.m_users->item(0));
     window.m_peerId = peer.id;
     window.updateConversationLabel();
     window.m_online = true;
     window.show();
+    QVERIFY(window.m_composer->isVisible());
     auto *contactName = window.m_users->itemWidget(window.m_users->item(0))
         ->findChild<QLabel *>(QStringLiteral("contactNameLabel"));
     auto *contactPresence = window.m_users->itemWidget(window.m_users->item(0))
         ->findChild<QLabel *>(QStringLiteral("contactPresenceLabel"));
-    QVERIFY(contactName && contactName->text().contains(QStringLiteral("BOB")));
+    QVERIFY(contactName && contactName->text().contains(QStringLiteral("USER_2")));
     QVERIFY(contactPresence && contactPresence->text().contains(QStringLiteral("在线")));
     QVERIFY(!contactPresence->text().contains(peer.id));
     QVERIFY(window.m_conversationLabel->text().contains(QStringLiteral("在线")));

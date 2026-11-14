@@ -11,15 +11,34 @@ $cmake = 'D:\software\Qt\Tools\CMake_64\bin\cmake.exe'
 $executable = Join-Path $PSScriptRoot 'build/qt-windows/bin/secure-im-simulator.exe'
 
 if (-not $SkipBuild) {
-    $protoc = Join-Path $PSScriptRoot '.tools/protoc/bin/protoc.exe'
-    if (-not (Test-Path -LiteralPath $protoc)) {
-        & (Join-Path $PSScriptRoot 'tools/fetch_protoc.ps1')
-        if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare local protoc.' }
+    Push-Location $PSScriptRoot
+    try {
+        $protoc = Join-Path $PSScriptRoot '.tools/protoc/bin/protoc.exe'
+        if (-not (Test-Path -LiteralPath $protoc)) {
+            & (Join-Path $PSScriptRoot 'tools/fetch_protoc.ps1')
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare local protoc.' }
+        }
+        & $cmake --preset qt-windows
+        if ($LASTEXITCODE -ne 0) { throw 'Client CMake configuration failed.' }
+        & $cmake --build --preset qt-windows -j 4
+        if ($LASTEXITCODE -ne 0) { throw 'Client build failed.' }
+
+        $stressSource = Join-Path $PSScriptRoot '../backend/cmd/stress-runner'
+        if (Test-Path -LiteralPath $stressSource) {
+            $stressRunner = Join-Path $PSScriptRoot 'build/qt-windows/bin/secure-im-stress-runner.exe'
+            Push-Location (Join-Path $PSScriptRoot '../backend')
+            try {
+                & go build -o $stressRunner ./cmd/stress-runner
+                if ($LASTEXITCODE -ne 0) { throw 'Stress runner build failed.' }
+            } finally {
+                Pop-Location
+            }
+        } else {
+            Write-Warning 'Stress runner source is not ready; system-test UI will use the existing executable when available.'
+        }
+    } finally {
+        Pop-Location
     }
-    & $cmake --preset qt-windows
-    if ($LASTEXITCODE -ne 0) { throw 'Client CMake configuration failed.' }
-    & $cmake --build --preset qt-windows -j 4
-    if ($LASTEXITCODE -ne 0) { throw 'Client build failed.' }
 }
 
 if (-not (Test-Path -LiteralPath $executable)) {

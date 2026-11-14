@@ -144,6 +144,83 @@ void LocalStore::clearSession()
     QFile::remove(path(QStringLiteral("config/session.json")));
 }
 
+QString LocalStore::knownAccountsPath() const
+{
+    return QDir::cleanPath(m_root.absoluteFilePath(QStringLiteral("../known_accounts.json")));
+}
+
+QJsonArray LocalStore::readKnownAccounts() const
+{
+    QFile file(knownAccountsPath());
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
+    return document.isArray() ? document.array() : QJsonArray{};
+}
+
+bool LocalStore::writeKnownAccounts(const QJsonArray &accounts, QString *error) const
+{
+    QSaveFile file(knownAccountsPath());
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    if (file.write(QJsonDocument(accounts).toJson(QJsonDocument::Compact)) < 0 || !file.commit()) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    QFile::setPermissions(knownAccountsPath(), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    return true;
+}
+
+QSet<QString> LocalStore::knownAccountIds() const
+{
+    QSet<QString> result;
+    const QJsonArray accounts = readKnownAccounts();
+    for (const QJsonValue &value : accounts) {
+        const QString id = value.toObject().value(QStringLiteral("id")).toString();
+        if (!id.isEmpty())
+            result.insert(id);
+    }
+    return result;
+}
+
+bool LocalStore::rememberAccount(const User &user, QString *error) const
+{
+    if (user.id.isEmpty() || user.username.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("已知账号必须包含用户 ID 和用户名");
+        return false;
+    }
+    QJsonArray accounts = readKnownAccounts();
+    const QJsonObject account{{QStringLiteral("id"), user.id},
+                              {QStringLiteral("username"), user.username}};
+    for (int index = 0; index < accounts.size(); ++index) {
+        if (accounts.at(index).toObject().value(QStringLiteral("id")).toString() != user.id)
+            continue;
+        if (accounts.at(index).toObject() == account)
+            return true;
+        accounts.replace(index, account);
+        return writeKnownAccounts(accounts, error);
+    }
+    accounts.append(account);
+    return writeKnownAccounts(accounts, error);
+}
+
+bool LocalStore::forgetAccount(const QString &userId, QString *error) const
+{
+    QJsonArray accounts = readKnownAccounts();
+    for (int index = 0; index < accounts.size(); ++index) {
+        if (accounts.at(index).toObject().value(QStringLiteral("id")).toString() != userId)
+            continue;
+        accounts.removeAt(index);
+        return writeKnownAccounts(accounts, error);
+    }
+    return true;
+}
+
 QString LocalStore::messagesPath() const
 {
     return path(QStringLiteral("config/messages.json"));

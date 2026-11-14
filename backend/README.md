@@ -130,11 +130,13 @@ Status places `uploaded_chunks` beside `file`:
 
 Completion downloads and decrypts each ciphertext chunk, verifies each chunk hash and the assembled whole-file SHA256, then changes status to `completed`. Only completed files can be downloaded. Download headers include `Content-Length` and RFC 5987 `Content-Disposition`.
 
-Each file has a random 32-byte DEK. Every chunk uses AES-256-GCM with an independent random nonce. The DEK is AES-256-GCM-wrapped using `FILE_KEK`; only wrapped keys and nonces are stored in MySQL, and only ciphertext is sent to MinIO. Plaintext chunks are bounded in memory, completion/download process one chunk at a time, and a context-aware semaphore bounds concurrent file operations. The default active-upload limit is three per user (configurable from three to five).
+Each file has a random 32-byte DEK. Every chunk uses AES-256-GCM with an independent random nonce. The DEK is AES-256-GCM-wrapped using `FILE_KEK`; only wrapped keys and nonces are stored in MySQL, and only ciphertext is sent to MinIO. Plaintext chunks are bounded in memory, completion/download process one chunk at a time, and a context-aware semaphore bounds concurrent file operations. `FILE_MEMORY_BUDGET` (default 500 MiB, configured in bytes) additionally reserves weighted plaintext, ciphertext, and per-chunk overhead across upload, completion, and download. When full, operations wait on their request context without exceeding the reservation limit. `UPLOAD_CONCURRENCY` retains its existing default of four and accepts up to 64 operations. The default active-upload limit is three per user (configurable from three to five).
+
+Set `ENABLE_DEBUG_STATS=true` to expose unauthenticated `GET /debug/stats`, containing Go heap/runtime statistics, goroutine count, GOMAXPROCS, and file-budget `used`/`limit` bytes. Only enable it with a loopback-only host port mapping.
 
 ## Tests
 
-Unit tests cover Argon2id, access/refresh tokens, deleted-user access rejection, one-time and per-user WebSocket ticket revocation, targeted hub closure, account deletion ordering/retry, AES key wrapping/chunk encryption, permissions, and chunk boundaries:
+Unit tests cover Argon2id, access/refresh tokens, deleted-user access rejection, one-time and per-user WebSocket ticket revocation, targeted hub closure, account deletion ordering/retry, AES key wrapping/chunk encryption, permissions, chunk boundaries, and concurrent file-memory reservation/release/timeout:
 
 ```powershell
 go test ./...
@@ -156,3 +158,7 @@ go test -run 'TestReal(APIIntegration|AccountDeletionIntegration)' -v .
 They create unique users on every run and verify mixed-case registration/login (including the six-byte password `123456`), uppercase user listings, refresh rotation, multi-device presence, bidirectional Protobuf messaging, ACK and idempotency, batched READ delivery to both users' devices, repeat idempotency, third-party denial, persisted offline `read_at` with later messages left unread, multi-chunk transfer and SHA256, ciphertext in MinIO, and the active-file limit. The account test additionally verifies permanent deletion in MySQL and MinIO for sent and received files, bidirectional conversation cleanup, old access/refresh token rejection, WebSocket closure and ticket revocation, while preserving another conversation, its users, and an unrelated downloadable file.
 
 To keep Go artifacts local, set `GOMODCACHE`, `GOCACHE`, and `GOPATH` under `backend/.cache`. The source of truth for the wire protocol is `proto/im/v1/envelope.proto`; its generated Go file is committed so normal builds do not need a global `protoc`.
+
+## Isolated stress backend
+
+With the normal MySQL and MinIO containers healthy, run `scripts/stress-up.ps1`. It securely creates ignored `deploy/.env.stress` credentials, idempotently creates/grants only `secure_im_stress`, builds the backend image, and starts the independent `secure-im-stress` Compose project. The backend uses bucket `secure-im-stress-files`, 1 MiB chunks, 64 concurrent file operations, six CPU threads, a 3 GiB container limit, and is available only at `http://127.0.0.1:18080`. `scripts/stress-down.ps1` removes only that backend project; it does not stop base containers or delete any volumes or stress data.
