@@ -27,6 +27,12 @@ func NewMinIOStore(endpoint, accessKey, secretKey, bucket string, useSSL bool) (
 	}
 	return &MinIOStore{client: client, bucket: bucket}, nil
 }
+
+// NewMinIOStoreFromClient adapts an existing client to the file object store.
+func NewMinIOStoreFromClient(client *minio.Client, bucket string) *MinIOStore {
+	return &MinIOStore{client: client, bucket: bucket}
+}
+
 func (s *MinIOStore) Ensure(ctx context.Context) error {
 	exists, err := s.client.BucketExists(ctx, s.bucket)
 	if err != nil {

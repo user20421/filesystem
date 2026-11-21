@@ -14,6 +14,7 @@ class LoginPage final : public QWidget {
 public:
     LoginPage(ApiClient *api, LocalStore *store, QWidget *parent = nullptr);
     void setUsername(const QString &username);
+    void showError(const QString &error);
     void shutdown();
 
 signals:

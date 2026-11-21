@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package im.v1;
+
+option go_package = "secure-im/backend/internal/proto/impb;impb";
+
+// MessagePayload is the only payload carried by a MESSAGE envelope.
+message MessagePayload {
+  oneof content {
+    string text = 1;
+    FileNotification file = 2;
+  }
+}
+
+// FileNotification references a file transferred through the file API.
+message FileNotification {
+  string file_id = 1;
+  string filename = 2;
+  int64 size = 3;
+}
+
+message AckPayload {
+  uint64 cursor = 1;
+}
+
+message ErrorPayload {
+  string code = 1;
+  string message = 2;
+}

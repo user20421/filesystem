@@ -28,6 +28,7 @@ type fileInfo struct {
 	ChunkSize  int64  `json:"chunk_size"`
 	ChunkCount int    `json:"chunk_count"`
 	Status     string `json:"status"`
+	Instant    bool   `json:"instant"`
 }
 
 type FilePool struct {
@@ -136,25 +137,27 @@ func (p *FilePool) transfer(ctx context.Context, job fileJob) (result error) {
 			_ = p.api.JSON(cleanupCtx, http.MethodDelete, "/api/v1/files/"+info.ID, job.sender.Token, nil, nil, http.StatusNoContent)
 		}
 	}()
-	for index := 0; index < info.ChunkCount; index++ {
-		size := p.cfg.ChunkSize
-		if index == info.ChunkCount-1 {
-			size = p.cfg.FileSize - int64(index)*p.cfg.ChunkSize
+	if !info.Instant && info.Status != "completed" {
+		for index := 0; index < info.ChunkCount; index++ {
+			size := info.ChunkSize
+			if index == info.ChunkCount-1 {
+				size = info.Size - int64(index)*info.ChunkSize
+			}
+			if err = p.budget.Acquire(ctx, size); err != nil {
+				return err
+			}
+			chunk := make([]byte, int(size))
+			fillSynthetic(chunk, int64(index)*info.ChunkSize, job.id)
+			sum := sha256.Sum256(chunk)
+			err = p.uploadChunk(ctx, job.sender.Token, info.ID, index, chunk, hex.EncodeToString(sum[:]))
+			p.budget.Release(size)
+			if err != nil {
+				return err
+			}
 		}
-		if err = p.budget.Acquire(ctx, size); err != nil {
+		if err = p.api.JSON(ctx, http.MethodPost, "/api/v1/files/"+info.ID+"/complete", job.sender.Token, nil, &info, http.StatusOK); err != nil {
 			return err
 		}
-		chunk := make([]byte, int(size))
-		fillSynthetic(chunk, int64(index)*p.cfg.ChunkSize, job.id)
-		sum := sha256.Sum256(chunk)
-		err = p.uploadChunk(ctx, job.sender.Token, info.ID, index, chunk, hex.EncodeToString(sum[:]))
-		p.budget.Release(size)
-		if err != nil {
-			return err
-		}
-	}
-	if err = p.api.JSON(ctx, http.MethodPost, "/api/v1/files/"+info.ID+"/complete", job.sender.Token, nil, &info, http.StatusOK); err != nil {
-		return err
 	}
 	downloaded, err := p.downloadHash(ctx, job.recipient.Token, info.ID, job.id)
 	if err != nil {

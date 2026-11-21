@@ -10,7 +10,6 @@ private slots:
     void createsIsolatedLayout();
     void sanitizesUntrustedNames();
     void storesAndDeduplicatesHistory();
-    void persistsConcurrency();
     void persistsKnownAccountsWithoutCredentials();
     void mergesCursorAndReadReceiptAcrossDuplicateHistory();
 };
@@ -66,25 +65,11 @@ void LocalStoreTest::storesAndDeduplicatesHistory()
     QVERIFY(store.messages(QStringLiteral("other")).isEmpty());
 }
 
-void LocalStoreTest::persistsConcurrency()
-{
-    QTemporaryDir dir;
-    LocalStore store(dir.path());
-    QVERIFY(store.initialize());
-    QCOMPARE(store.concurrency(), 3);
-    store.setConcurrency(5);
-    QCOMPARE(store.concurrency(), 5);
-    store.setConcurrency(99);
-    QCOMPARE(store.concurrency(), 5);
-    store.setConcurrency(1);
-    QCOMPARE(store.concurrency(), 3);
-}
-
 void LocalStoreTest::persistsKnownAccountsWithoutCredentials()
 {
     QTemporaryDir root;
-    LocalStore first(root.filePath(QStringLiteral("user_1")));
-    LocalStore second(root.filePath(QStringLiteral("user_2")));
+    LocalStore first(root.filePath(QStringLiteral("alice")));
+    LocalStore second(root.filePath(QStringLiteral("bob")));
     QVERIFY(first.initialize());
     QVERIFY(second.initialize());
 
@@ -93,10 +78,18 @@ void LocalStoreTest::persistsKnownAccountsWithoutCredentials()
     good.username = QStringLiteral("GOOD");
     good.displayName = QStringLiteral("Custom display name");
     QVERIFY(first.rememberAccount(good));
-    QVERIFY(second.knownAccountIds().contains(good.id));
-    QVERIFY(second.rememberAccount(good)); // Reauthentication is idempotent.
+    QVERIFY(first.rememberAccount(good)); // Reauthentication is idempotent.
+    QVERIFY(first.knownAccountIds().contains(good.id));
+    QVERIFY(!second.knownAccountIds().contains(good.id));
+    QVERIFY(second.rememberAccount(good));
 
-    QFile registry(root.filePath(QStringLiteral("known_accounts.json")));
+    const QString firstPath = first.path(QStringLiteral("config/known_accounts.json"));
+    const QString secondPath = second.path(QStringLiteral("config/known_accounts.json"));
+    QVERIFY(firstPath != secondPath);
+    QVERIFY(QFileInfo::exists(firstPath));
+    QVERIFY(QFileInfo::exists(secondPath));
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("known_accounts.json"))));
+    QFile registry(firstPath);
     QVERIFY(registry.open(QIODevice::ReadOnly));
     const QByteArray json = registry.readAll();
     QVERIFY(json.contains("good-id"));
@@ -106,8 +99,9 @@ void LocalStoreTest::persistsKnownAccountsWithoutCredentials()
     QVERIFY(!json.contains("password"));
     registry.close();
 
-    QVERIFY(second.forgetAccount(good.id));
+    QVERIFY(first.forgetAccount(good.id));
     QVERIFY(first.knownAccountIds().isEmpty());
+    QVERIFY(second.knownAccountIds().contains(good.id));
 }
 
 void LocalStoreTest::mergesCursorAndReadReceiptAcrossDuplicateHistory()

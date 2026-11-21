@@ -76,7 +76,7 @@ SystemTestPage::SystemTestPage(const StressRunConfig &config, QWidget *parent)
         m_countdownLabel->setText(QStringLiteral("稳定阶段倒计时：等待进入稳定阶段"));
         m_conclusion->setText(QStringLiteral("测试进行中"));
         m_conclusion->setProperty("state", QStringLiteral("running"));
-        m_advice->setText(QStringLiteral("正在准备环境并启动 runner；切换标签不会中断测试。"));
+        m_advice->setText(QStringLiteral("正在准备环境并启动 runner；关闭窗口会停止测试。"));
         refreshHistory();
         if (!m_controller->start(m_target->value()))
             setRunning(m_controller->isRunning());
@@ -175,8 +175,8 @@ void SystemTestPage::buildUi()
     m_distribution->setObjectName(QStringLiteral("stressDistributionLabel"));
     configLayout->addWidget(m_distribution);
     auto *resources = new QLabel(QStringLiteral(
-        "固定资源：后端 6 线程 / 3 GiB ｜ 文件预算 500 MiB ｜ 分块 1 MiB ｜ "
-        "64 个文件任务 ｜ 单文件 100 MiB ｜ 稳定运行 5 分钟"), configuration);
+        "固定资源：后端 6 CPU / 3 GiB ｜ 文件预算 500 MiB ｜ 分块 5 MiB ｜ "
+        "96 个文件任务 ｜ 单文件 100 MiB ｜ 稳定运行 5 分钟"), configuration);
     resources->setObjectName(QStringLiteral("stressResourceLabel"));
     resources->setWordWrap(true);
     configLayout->addWidget(resources);
@@ -447,7 +447,7 @@ QString SystemTestPage::bottleneckAdvice() const
     if (m_lastProgress.ackP99Ms >= 2000.0)
         return QStringLiteral("瓶颈建议：ACK P99 偏高，检查后端 CPU、Go 堆和 goroutine 是否持续增长。");
     if (m_lastProgress.backendCpuPercent >= 85.0 || m_lastProgress.backendRssMib >= 3584.0)
-        return QStringLiteral("瓶颈建议：后端资源接近 6 线程 / 3 GiB 边界，降低人数并对比资源峰值。");
+        return QStringLiteral("瓶颈建议：后端资源接近 6 CPU / 3 GiB 边界，降低人数并对比资源峰值。");
     if (m_lastProgress.messagesDelivered < m_lastProgress.messagesSent)
         return QStringLiteral("瓶颈建议：消息存在未送达，检查 WebSocket 稳定性、ACK 延迟和错误日志。");
     if (m_conclusion->text() == QStringLiteral("波动"))

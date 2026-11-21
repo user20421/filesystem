@@ -18,21 +18,20 @@ type lockEntry struct {
 type Service struct {
 	db                *sql.DB
 	objects           ObjectStore
-	kek               []byte
 	maxActive         int
 	maxChunk, maxFile int64
-	sem               chan struct{}
+	scheduler         *chunkScheduler
 	memory            *memoryBudget
 	lockMu            sync.Mutex
 	locks             map[string]*lockEntry
 }
 
-func NewService(db *sql.DB, objects ObjectStore, kek []byte, maxActive int, maxChunk, maxFile int64, concurrency int) *Service {
-	return NewServiceWithMemoryBudget(db, objects, kek, maxActive, maxChunk, maxFile, concurrency, 500<<20)
+func NewService(db *sql.DB, objects ObjectStore, maxActive int, maxChunk, maxFile int64, concurrency int) *Service {
+	return NewServiceWithMemoryBudget(db, objects, maxActive, maxChunk, maxFile, concurrency, 500<<20)
 }
 
-func NewServiceWithMemoryBudget(db *sql.DB, objects ObjectStore, kek []byte, maxActive int, maxChunk, maxFile int64, concurrency int, fileMemoryBudget int64) *Service {
-	return &Service{db: db, objects: objects, kek: kek, maxActive: maxActive, maxChunk: maxChunk, maxFile: maxFile, sem: make(chan struct{}, concurrency), memory: newMemoryBudget(fileMemoryBudget), locks: make(map[string]*lockEntry)}
+func NewServiceWithMemoryBudget(db *sql.DB, objects ObjectStore, maxActive int, maxChunk, maxFile int64, concurrency int, fileMemoryBudget int64) *Service {
+	return &Service{db: db, objects: objects, maxActive: maxActive, maxChunk: maxChunk, maxFile: maxFile, scheduler: newChunkScheduler(concurrency), memory: newMemoryBudget(fileMemoryBudget), locks: make(map[string]*lockEntry)}
 }
 
 func (s *Service) MemoryStats() (used, limit int64) {
@@ -58,15 +57,6 @@ func (s *Service) lock(key string) func() {
 		s.lockMu.Unlock()
 	}
 }
-func (s *Service) acquire(ctx context.Context) error {
-	select {
-	case s.sem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-func (s *Service) release() { <-s.sem }
 
 type InitInput struct {
 	Name        string
@@ -90,19 +80,10 @@ func (s *Service) Init(ctx context.Context, owner string, in InitInput) (File, e
 		return File{}, httpx.Error(400, "invalid_recipient", "recipient must be another user ID")
 	}
 	if in.ChunkSize == 0 {
-		in.ChunkSize = min(int64(1<<20), s.maxChunk)
+		in.ChunkSize = min(int64(5<<20), s.maxChunk)
 	}
 	if in.ChunkSize < 64<<10 || in.ChunkSize > s.maxChunk {
 		return File{}, httpx.Error(400, "invalid_chunk_size", fmt.Sprintf("chunk_size must be between 64KiB and %d bytes", s.maxChunk))
-	}
-	unlock := s.lock("init:" + owner)
-	defer unlock()
-	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM files WHERE owner_id=? AND status='uploading'`, owner).Scan(&count); err != nil {
-		return File{}, err
-	}
-	if count >= s.maxActive {
-		return File{}, httpx.Error(429, "active_file_limit", fmt.Sprintf("at most %d active files are allowed", s.maxActive))
 	}
 	var exists int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM users WHERE id=?`, in.RecipientID).Scan(&exists); err != nil {
@@ -111,20 +92,57 @@ func (s *Service) Init(ctx context.Context, owner string, in InitInput) (File, e
 	if exists != 1 {
 		return File{}, httpx.Error(404, "recipient_not_found", "recipient not found")
 	}
-	dek, wrapped, nonce, err := GenerateWrappedDEK(s.kek)
+	unlock := s.lock("init:" + owner)
+	defer unlock()
+
+	in.SHA256 = strings.ToLower(in.SHA256)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return File{}, err
 	}
-	for i := range dek {
-		dek[i] = 0
-	}
-	f := File{ID: uuid.NewString(), OwnerID: owner, RecipientID: in.RecipientID, OriginalName: in.Name, Size: in.Size, SHA256: strings.ToLower(in.SHA256), ChunkSize: in.ChunkSize, ChunkCount: int((in.Size + in.ChunkSize - 1) / in.ChunkSize), WrappedDEK: wrapped, DEKNonce: nonce, Status: "uploading"}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO files(id,owner_id,recipient_id,original_name,size,sha256,chunk_size,chunk_count,wrapped_dek,dek_nonce,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, f.ID, f.OwnerID, f.RecipientID, f.OriginalName, f.Size, f.SHA256, f.ChunkSize, f.ChunkCount, f.WrappedDEK, f.DEKNonce, f.Status)
+	defer tx.Rollback()
+	contentID := uuid.NewString()
+	_, err = tx.ExecContext(ctx, `INSERT INTO file_contents(id,size,sha256,chunk_size,chunk_count) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, contentID, in.Size, in.SHA256, in.ChunkSize, int((in.Size+in.ChunkSize-1)/in.ChunkSize))
 	if err != nil {
 		return File{}, err
 	}
-	return s.getFile(ctx, f.ID)
+	var status string
+	var storedChunkSize int64
+	var storedChunkCount int
+	err = tx.QueryRowContext(ctx, `SELECT id,status,chunk_size,chunk_count FROM file_contents WHERE size=? AND sha256=? FOR UPDATE`, in.Size, in.SHA256).Scan(&contentID, &status, &storedChunkSize, &storedChunkCount)
+	if err != nil {
+		return File{}, err
+	}
+	if status == "deleting" {
+		return File{}, httpx.Error(409, "content_cleanup_pending", "the previous content reference is still being deleted; retry shortly")
+	}
+	if status == "uploading" {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM files f JOIN file_contents c ON c.id=f.content_id WHERE f.owner_id=? AND f.status='active' AND c.status='uploading'`, owner).Scan(&count); err != nil {
+			return File{}, err
+		}
+		if count >= s.maxActive {
+			return File{}, httpx.Error(429, "active_file_limit", fmt.Sprintf("at most %d active files are allowed", s.maxActive))
+		}
+	}
+	fileID := uuid.NewString()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO files(id,content_id,owner_id,recipient_id,original_name) VALUES(?,?,?,?,?)`, fileID, contentID, owner, in.RecipientID, in.Name); err != nil {
+		return File{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE file_contents SET ref_count=ref_count+1 WHERE id=?`, contentID); err != nil {
+		return File{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return File{}, err
+	}
+	f, err := s.getFile(ctx, fileID)
+	if err != nil {
+		return f, err
+	}
+	f.Instant = f.Status == "completed"
+	return f, nil
 }
+
 func (s *Service) Status(ctx context.Context, id, user string) (File, []int, error) {
 	f, err := s.getFile(ctx, id)
 	if err != nil {
@@ -133,7 +151,7 @@ func (s *Service) Status(ctx context.Context, id, user string) (File, []int, err
 	if err := Authorize(f, user, false); err != nil {
 		return f, nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT chunk_index FROM file_chunks WHERE file_id=? ORDER BY chunk_index`, id)
+	rows, err := s.db.QueryContext(ctx, `SELECT chunk_index FROM file_chunks WHERE content_id=? ORDER BY chunk_index`, f.ContentID)
 	if err != nil {
 		return f, nil, err
 	}

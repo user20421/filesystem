@@ -5,14 +5,16 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/proto"
 	"secure-im/backend/internal/httpx"
 	"secure-im/backend/internal/proto/impb"
 )
+
+const protocolVersion = 2
 
 type Service struct{ db *sql.DB }
 
@@ -64,8 +66,8 @@ func (s *Service) directConversation(ctx context.Context, sender, recipient stri
 	return id, tx.Commit()
 }
 func validateMessage(e *impb.Envelope, sender string) error {
-	if e.Version != 1 || e.Type != impb.Envelope_MESSAGE {
-		return httpx.Error(400, "invalid_envelope", "only version 1 MESSAGE envelopes are accepted")
+	if e.Version != protocolVersion || e.Type != impb.Envelope_MESSAGE {
+		return httpx.Error(400, "invalid_envelope", "only version 2 MESSAGE envelopes are accepted")
 	}
 	if len(e.MessageId) < 1 || len(e.MessageId) > 64 {
 		return httpx.Error(400, "invalid_message_id", "message_id must contain 1-64 characters")
@@ -78,6 +80,22 @@ func validateMessage(e *impb.Envelope, sender string) error {
 	}
 	if len(e.Payload) == 0 || len(e.Payload) > 256<<10 {
 		return httpx.Error(400, "invalid_payload", "payload must contain 1 byte to 256KiB")
+	}
+	var payload impb.MessagePayload
+	if err := proto.Unmarshal(e.Payload, &payload); err != nil {
+		return httpx.Error(400, "invalid_payload", "payload must be a valid MessagePayload")
+	}
+	switch content := payload.Content.(type) {
+	case *impb.MessagePayload_Text:
+		if content.Text == "" {
+			return httpx.Error(400, "invalid_payload", "text payload must not be empty")
+		}
+	case *impb.MessagePayload_File:
+		if content.File == nil || content.File.FileId == "" || content.File.Filename == "" || content.File.Size < 0 {
+			return httpx.Error(400, "invalid_payload", "file payload requires file_id, filename and a non-negative size")
+		}
+	default:
+		return httpx.Error(400, "invalid_payload", "payload must contain text or a file notification")
 	}
 	return nil
 }
@@ -93,7 +111,7 @@ func (s *Service) SaveMessage(ctx context.Context, sender string, input *impb.En
 	result, err := s.db.ExecContext(ctx, `INSERT INTO messages(message_id,conversation_id,sender_id,recipient_id,device_id,payload,created_at) VALUES(?,?,?,?,?,?,?)`, input.MessageId, conversation, sender, input.RecipientId, input.DeviceId, input.Payload, now)
 	if err == nil {
 		cursor, _ := result.LastInsertId()
-		return Saved{Envelope: &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: input.MessageId, ConversationId: conversation, SenderId: sender, RecipientId: input.RecipientId, DeviceId: input.DeviceId, Timestamp: now.UnixMilli(), Payload: input.Payload}, Cursor: uint64(cursor)}, nil
+		return Saved{Envelope: &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_MESSAGE, MessageId: input.MessageId, ConversationId: conversation, SenderId: sender, RecipientId: input.RecipientId, DeviceId: input.DeviceId, Timestamp: now.UnixMilli(), Payload: input.Payload}, Cursor: uint64(cursor)}, nil
 	}
 	var mysqlErr *mysql.MySQLError
 	if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1062 {
@@ -111,7 +129,7 @@ func (s *Service) SaveMessage(ctx context.Context, sender string, input *impb.En
 	if e.ConversationId != conversation || e.RecipientId != input.RecipientId || e.DeviceId != input.DeviceId || !bytes.Equal(e.Payload, input.Payload) {
 		return Saved{}, httpx.Error(409, "message_id_conflict", "message_id was already used with different content")
 	}
-	e.Version = 1
+	e.Version = protocolVersion
 	e.Type = impb.Envelope_MESSAGE
 	e.MessageId = input.MessageId
 	e.SenderId = sender
@@ -119,5 +137,6 @@ func (s *Service) SaveMessage(ctx context.Context, sender string, input *impb.En
 	return saved, nil
 }
 func Ack(saved Saved) *impb.Envelope {
-	return &impb.Envelope{Version: 1, Type: impb.Envelope_ACK, MessageId: saved.Envelope.MessageId, ConversationId: saved.Envelope.ConversationId, SenderId: saved.Envelope.SenderId, RecipientId: saved.Envelope.RecipientId, Timestamp: time.Now().UnixMilli(), Payload: []byte(fmt.Sprintf("%d", saved.Cursor))}
+	payload, _ := proto.Marshal(&impb.AckPayload{Cursor: saved.Cursor})
+	return &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_ACK, MessageId: saved.Envelope.MessageId, ConversationId: saved.Envelope.ConversationId, SenderId: saved.Envelope.SenderId, RecipientId: saved.Envelope.RecipientId, Timestamp: time.Now().UnixMilli(), Payload: payload}
 }

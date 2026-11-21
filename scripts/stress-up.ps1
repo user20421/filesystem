@@ -39,14 +39,68 @@ function Initialize-StressEnvironmentFile {
         $secret = [Convert]::ToBase64String((New-StressRandomBytes -Size 48))
         $append += "STRESS_JWT_SECRET=$secret"
     }
-    if (-not (Get-StressEnvironmentValue -Name 'STRESS_FILE_KEK' -DefaultValue '')) {
-        $kek = [Convert]::ToBase64String((New-StressRandomBytes -Size 32))
-        $append += "STRESS_FILE_KEK=$kek"
-    }
     if ($append.Count -gt 0) {
         [System.IO.File]::AppendAllLines($path, [string[]]$append, (New-Object System.Text.UTF8Encoding($false)))
     }
-    Write-Host "Using stress-only credentials and keys: $path"
+    Write-Host "Using stress-only credentials: $path"
+}
+
+function Invoke-StressRootAuthRequest {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $uri = "http://127.0.0.1:18080$Path"
+    $payload = @{ username = 'ROOT'; password = '123456' }
+    if ($Path -eq '/api/v1/auth/register') {
+        $payload.display_name = 'ROOT'
+    }
+    $body = $payload | ConvertTo-Json -Compress
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $uri -Method Post `
+            -ContentType 'application/json' -Body $body -TimeoutSec 10
+        return [pscustomobject]@{
+            StatusCode = [int]$response.StatusCode
+            Content = [string]$response.Content
+        }
+    }
+    catch {
+        if ($_.Exception.Response) {
+            return [pscustomobject]@{
+                StatusCode = [int]$_.Exception.Response.StatusCode
+                Content = ''
+            }
+        }
+        throw "ROOT authentication request failed: $($_.Exception.Message)"
+    }
+}
+
+function Assert-StressRootCredentials {
+    $registration = Invoke-StressRootAuthRequest -Path '/api/v1/auth/register'
+    $alreadyExists = $registration.StatusCode -eq 409
+    if (-not $alreadyExists -and ($registration.StatusCode -lt 200 -or $registration.StatusCode -ge 300)) {
+        throw "ROOT registration failed with HTTP $($registration.StatusCode)."
+    }
+
+    # Always perform a real login, including after HTTP 409, so an existing ROOT
+    # account with another password cannot silently break subsequent stress runs.
+    $login = Invoke-StressRootAuthRequest -Path '/api/v1/auth/login'
+    if ($login.StatusCode -lt 200 -or $login.StatusCode -ge 300) {
+        if ($alreadyExists -and ($login.StatusCode -eq 401 -or $login.StatusCode -eq 403)) {
+            throw "ROOT already exists with a different password; ROOT/123456 login verification returned HTTP $($login.StatusCode)."
+        }
+        throw "ROOT/123456 login verification failed with HTTP $($login.StatusCode)."
+    }
+    try {
+        $auth = $login.Content | ConvertFrom-Json
+        $data = if ($auth.data) { $auth.data } else { $auth }
+        $accessToken = [string]$data.tokens.access_token
+    }
+    catch {
+        throw 'ROOT login succeeded but returned an invalid authentication response.'
+    }
+    if ([string]::IsNullOrWhiteSpace($accessToken)) {
+        throw 'ROOT login succeeded but the response did not contain an access token.'
+    }
+    Write-Host 'ROOT registration/login verified for the stress backend.'
 }
 
 function Initialize-StressDatabase {
@@ -104,17 +158,22 @@ try {
     Invoke-StressDockerCompose -ComposeArguments @('up', '--detach', '--build', 'backend')
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
+        $ready = $false
         try {
             $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:18080/ready' -TimeoutSec 3
-            if ($response.StatusCode -eq 200) {
-                Write-Host 'Stress backend is ready: http://127.0.0.1:18080/ready'
-                Write-Host 'Debug stats: http://127.0.0.1:18080/debug/stats'
-                return
-            }
+            $ready = $response.StatusCode -eq 200
         }
         catch {
-            Start-Sleep -Seconds 2
+            $ready = $false
         }
+        if ($ready) {
+            # Authentication failures are actionable and must not be hidden by the readiness retry loop.
+            Assert-StressRootCredentials
+            Write-Host 'Stress backend is ready: http://127.0.0.1:18080/ready'
+            Write-Host 'Debug stats: http://127.0.0.1:18080/debug/stats'
+            return
+        }
+        Start-Sleep -Seconds 2
     }
     throw "Timed out after $TimeoutSeconds seconds waiting for the stress backend."
 }

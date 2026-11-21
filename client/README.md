@@ -1,57 +1,50 @@
 # Secure IM Qt 客户端
 
-Qt 6 Widgets / C++17 桌面客户端。`secure-im-client` 保留单用户入口；`secure-im-simulator` 是现代浅色主题的单窗口多用户工作台，每个可切换标签承载一个完全独立的用户会话，不再启动 `QProcess` 子进程。
+Qt 6 Widgets / C++17 桌面客户端。正式程序 `secure-im-client` 采用**一个进程一个用户**模型，需要多用户时多开进程并为每个用户指定独立数据目录。`secure-im-simulator` 是单独的 ROOT 本地系统压测工具，不是多用户正式客户端。
 
 ## 功能与结构
 
-- 顶部标签顺序固定为“系统测试”“欢迎”和各用户标签；前两个固定标签不显示关闭按钮，用户标签支持新建、关闭和拖动。系统测试内嵌大量用户消息与文件压力测试：支持 1k/5k/10k/30k 快捷人数、80/18/2 自动分配、实时指标、结论与瓶颈建议，以及按时间倒序的历史 HTML 报告；切换标签不会中断运行，关闭主窗口会停止 runner。欢迎页仅提供“新增用户”，并支持右上角 `+`、`Ctrl+T`、`Ctrl+W`、`Ctrl+Tab`；数据目录与服务器地址均只读固定展示。
-- 每个标签独立持有 `SessionContext`（`LocalStore`、`QLockFile`、`ApiClient`、WireCodec、`AuthSession`），隐藏标签继续保持连接、同步和传输；后台新消息按联系人累计未读数。
-- 已登录页右上角连接状态旁提供“退出”和“注销”。“退出”经确认后仅清除该标签的 `config/session.json`，复用幂等 `shutdown` 和 `closePage` 停止连接/传输并关闭标签，随后回到欢迎页，不删除服务器账号；其他标签和历史文件不受影响。“注销”默认选择“否”，明确警示永久删除服务器账号及关联消息/文件且不可恢复；仅 `DELETE /api/v1/users/me` 返回 204 后才清会话并关闭标签，失败则显示错误、保留页面和会话以便重试。单用户程序在两者成功后均关闭窗口。
-- 注册、登录（用户名输入自动转大写，密码 6~128 个 UTF-8 字节）、联系人搜索、用户列表与 presence 同周期刷新、单聊历史轮询、WebSocket 实时收发。未选择联系人时隐藏消息和文件发送区，选择后才允许发送，避免误发给自己。联系人窗口显示 `USER_数字` 格式的既有仿真账号，以及本机成功注册/登录过（含恢复已保存会话）的任意自定义用户名；未知自动化集成账号及其他历史测试账号不会显示。
-- 未查看的来信在对应联系人姓名旁显示红色圆点；进入该联系人的可见聊天视图后仅清除此联系人的未读，标签总未读为各联系人之和。切换联系人、搜索或定时刷新用户列表不会丢失其他联系人的未读。
-- 联系人和当前会话顶部显示在线/离线；界面不直接显示 UUID，用户 ID 保留在内部数据、搜索和 tooltip 中。presence 请求失败保留上次状态。自己的消息区分未读/已读并显示已读时间，ACK 不代表已读。
-- 仅当前活动标签的可见聊天会话发送最新 incoming cursor 的已读回执；切换回会话会补发。服务端 READ 只合并本地 `read_at`，不会生成气泡、未读或下载任务。
-- 聊天与文件传输通过导航切换；传输区使用单列任务卡片，不用多列表格塞入信息。每张卡片清晰显示上传/下载方向、文件名、对方、独立百分比与已传/总大小、无压字进度条、彩色状态、省略长路径（tooltip 保留完整路径）及错误；顶部显示任务统计，无任务时显示操作提示。支持暂停、继续、取消和失败/取消后重试；单击卡片仅选择，卡片和底部均有“打开目录”，单击文件名/本地路径也会打开文件父目录。
-- 集中式 `Theme` 提供浅色 QSS、圆角卡片、主色、字体、间距及 hover/pressed/disabled 状态，无 QML 或第三方主题。
-- 文件级并发队列可设为 **3~5**，默认 3；上传默认 4 MiB 分块（也接受服务端返回的 `chunk_size`），逐块 SHA-256，并通过文件状态中的 `uploaded_chunks` 跳过服务端已有分块。
-- HTTP 与 WebSocket 均为异步。文件哈希和分块读取在 `QThreadPool` 执行；下载通过 `readyRead` 分块送入顺序 writer 线程，以 `QSaveFile` 原子提交并校验大小，不在内存中累积整个文件。上传和下载暂停都会立即中止当前网络请求；若在旧请求回调前点击继续，会保持暂停并在活动请求/准备工作释放后自动重新入队，避免取消错误被记为失败。失败、暂停和取消会清理未提交数据；小量 JSON 配置读写仅发生在 UI 的本地元数据路径。
-- `MessageSyncState` 统一处理历史 cursor 与 optimistic 去重：重复消息仍先推进 cursor，实时消息不会用 UUID 覆盖数字 cursor，旧 history 不会使 cursor 倒退。
-- `LocalStore` 持久化并合并重复消息的 cursor/readAt；重复 history 不会清除已读状态，READ 与 presence 也不参与聊天 cursor 同步。
-- 每个 `--data-dir` 下独立创建 `inbox/`、`outbox/`、`downloads/`、`temp/`、`keys/`、`logs/`、`config/`。历史消息和配置不跨目录共享。同级用户目录共享 `known_accounts.json`（simulator 即 `runtime/users/known_accounts.json`），通过 `QSaveFile` 原子写入且只保存用户 ID/用户名，不保存 token、密码或显示名；离线 demo 不写入，账号永久注销成功后移除对应记录。令牌不会写入日志，会话文件尽量设置为仅所有者可读写；生产环境可在 `LocalStore` 替换为系统钥匙串。
-- 下载文件名经净化并去除路径部分，阻止路径穿越及 Windows 保留设备名，重名文件自动改名。
+- 正式客户端启动后显示注册/登录页；已有有效本地会话时恢复聊天页。用户名输入自动转大写，密码为 6～128 个 UTF-8 字节。注册和登录分别受后端限流，触发时返回 HTTP 429、`rate_limited` 和 `Retry-After`。
+- 访问令牌到期前自动调用 refresh，保存轮换后的访问/刷新令牌；刷新失败后回到登录状态，不继续复用已轮换或已撤销的 Refresh Token。退出会使旧 refresh 及等待请求失效，迟到回调不能覆盖后续登录；如需轮换，退出请求会撤销轮换后的当前 Refresh Token。
+- 已登录页提供“退出”和“注销”。“退出”经确认后调用 `POST /api/v1/auth/logout` 撤销当前 Refresh Token，再清除本地会话并关闭窗口；不删除服务器账号，也不撤销其他登录会话。“注销”明确警示永久删除账号及关联消息/文件，仅在 `DELETE /api/v1/users/me` 返回 204 后清理本地会话。
+- 联系人搜索、用户列表与 presence 周期刷新、单聊历史增量拉取、WebSocket 实时收发。联系人及会话顶部显示在线状态；自己的消息区分未读/已读并显示已读时间，ACK 不代表已读。
+- 仅当前可见聊天会话发送最新 incoming cursor 的已读回执。未查看来信按联系人显示红点，历史消息和配置不跨用户目录共享。
+- 聊天与文件传输分视图；任务卡片显示方向、文件名、对方、进度、大小、状态、路径及错误，支持暂停、继续、取消、失败/取消后重试和打开目录。
+- 上传固定使用 **3 条分块通道**，下载固定使用 **3 条文件通道**，二者独立。上传按分块动态调度：就绪新文件按 FIFO 优先开始，其余通道分配给剩余量最大的文件；单文件不同 index 可同时在途，全局 PUT 不超过 3。
+- 正常客户端请求/回退 **5 MiB** 分块，并接受服务端返回的 `chunk_size`；逐块 SHA-256，通过 `uploaded_chunks` 跳过服务端已有分块。全系统按 **size + 整文件 SHA-256** 复用已完成内容，`instant=true` 时跳过上传和 complete。
+- 文件哈希和分块读取在进程级默认 **4 线程**的公共 `QThreadPool` 执行。下载通过 `readyRead` 交给该文件的顺序 writer 线程，以 `QSaveFile` 原子提交并校验大小；writer 使用 **1 MiB** 有界字节队列，达到上限后通过 reply 读缓冲实施网络背压，消费后自动恢复，不并行写同一文件，也不在内存中累积整个文件。
+- 上传和下载暂停会中止当前网络请求；上传暂停后继续会查询已确认分块并续传。下载暂停后继续会重新获取完整文件，因为当前接口未实现 Range。
+- 下载文件名经净化并去除路径部分，阻止路径穿越及 Windows 保留设备名，重名文件自动改名；Windows 上的并发下载路径预留不区分大小写。
 
 ```text
-src/core/ApiClient.*          REST 路径、请求和响应 JSON 的唯一适配层
+src/core/ApiClient.*          REST 路径、请求和响应 JSON 的适配层
 src/core/WebSocketClient.*   异步 QWebSocket
-src/core/WireCodec.*         可替换的二进制帧接口
-src/core/ProtobufWireCodec.* qtprotobufgen 生成类的 Envelope 编解码
-src/core/TransferManager.*   文件级队列、分块续传及传输状态机
+src/core/WireCodec.*         二进制帧接口
+src/core/ProtobufWireCodec.* Protobuf v2 Envelope 与 typed payload 编解码
+src/core/MessagePayloadCodec.* 文本/文件通知 MessagePayload 编解码
+src/core/TransferManager.*   固定独立通道、分块动态调度及传输状态机
 src/core/LocalStore.*        每用户目录、会话、配置和历史
-src/core/Workers.*           工作线程哈希、文件 I/O 与流式原子写入
-src/core/MessageSyncState.h  可测试的消息去重及数字 cursor 状态
-src/ui/SessionContext.*    每标签独立对象、目录锁及幂等 shutdown
-src/ui/SessionPage.*       可嵌入登录页与聊天页，切换登录状态
-src/ui/MainWindow.*        可嵌入 QWidget 聊天/传输业务界面
-src/ui/SimulatorWindow.*   QMainWindow + QTabWidget 多用户工作台
-src/ui/StressRunController.*  stress-up、runner 生命周期及增量 NDJSON 解析
-src/ui/SystemTestPage.*    压力测试配置、实时指标、结论与历史报告
-src/ui/Theme.*             集中的浅色 Qt Widgets 主题
-src/ui/TransferTaskCard.*  传输任务卡片、进度与路径省略展示
-src/apps/                  单用户入口与多用户 simulator
-tests/                     QtTest/CTest 核心及多标签生命周期测试
-
-`client_ui` 静态库复用上述全部 UI，由单用户程序、simulator 和 UI 测试共同链接。
+src/core/Workers.*           哈希、文件 I/O 与流式原子写入
+src/core/MessageSyncState.h  消息去重及数字 cursor 状态
+src/ui/SessionContext.*    每进程独立对象、目录锁及幂等 shutdown
+src/ui/SessionPage.*       登录页与聊天页切换
+src/ui/MainWindow.*        聊天/传输业务界面
+src/ui/SimulatorWindow.*   ROOT 登录及单一系统压测窗口
+src/ui/StressRunController.* stress-up、runner 生命周期及 NDJSON 解析
+src/ui/SystemTestPage.*    压测配置、实时指标、结论与历史报告
+src/apps/                  正式单用户入口与 ROOT 压测工具入口
+tests/                     QtTest/CTest 核心及集成测试
 ```
 
 ## 构建依赖
 
 - 支持 C++17 的编译器及 CMake 3.16+
-- Qt 6 开发包：`Widgets`、`Network`、`WebSockets`、`Test`、`Protobuf`、`ProtobufTools`（qmake 不是构建依赖）
-- 宿主机 `protoc`，**仅用于调用 Qt 的 `qtprotobufgen`**；客户端链接 Qt6 Protobuf，不链接 Google Protobuf 运行库
+- Qt 6 开发包：`Widgets`、`Network`、`WebSockets`、`Test`、`Protobuf`、`ProtobufTools`
+- 宿主机 `protoc`，仅用于调用 Qt 的 `qtprotobufgen`；客户端链接 Qt6 Protobuf，不链接 Google Protobuf 运行库
 
-工程从 `../proto/im/v1/envelope.proto` 通过 `qt_add_protobuf` 生成 Qt Protobuf 源码，不手写二进制协议。实时 Protobuf 是必需功能：缺少 Qt Protobuf 或生成工具时 CMake 会明确失败，不会静默禁用 WebSocket 编解码。
+工程从 `../proto/im/v1/envelope.proto` 和 `messages.proto` 生成 Qt Protobuf 源码。实时 Protobuf v2 是必需功能：缺少 Qt Protobuf 或生成工具时 CMake 会明确失败。
 
-本机 Qt 6.11.2 Preset 已固定用户提供的编译器和 Qt 前缀。Qt 安装不含独立 protoc，以下脚本将官方 protoc 29.3 下载到 `client/.tools/`，不进行全局安装：
+本机 Qt 6.11.2 Preset 已固定编译器和 Qt 前缀。Qt 安装不含独立 protoc，以下脚本将官方 protoc 29.3 下载到 `client/.tools/`，不进行全局安装：
 
 ```powershell
 Set-Location client
@@ -61,83 +54,68 @@ Set-Location client
 & "D:/software/Qt/Tools/CMake_64/bin/ctest.exe" --preset qt-windows
 ```
 
-其他环境可在 PATH 提供 protoc，或配置时设置：
+其他环境可在 PATH 提供 protoc，或配置时设置 `CLIENT_PROTOC_EXECUTABLE` 和 `CMAKE_PREFIX_PATH`。
 
-```sh
-cmake -S client -B client/build -G Ninja \
-  -DCMAKE_PREFIX_PATH=/opt/Qt/6.11.2/gcc_64 \
-  -DCLIENT_PROTOC_EXECUTABLE=/opt/protobuf/bin/protoc
-cmake --build client/build
-ctest --test-dir client/build --output-on-failure
-```
+## 运行正式客户端
 
-## 运行
+在两个终端分别运行，例如：
 
 ```powershell
 $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
 client/build/qt-windows/bin/secure-im-client.exe `
   --data-dir D:/im-data/alice --server-url http://127.0.0.1:8080 --username alice
+```
+
+```powershell
+$env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
 client/build/qt-windows/bin/secure-im-client.exe `
   --data-dir D:/im-data/bob --server-url http://127.0.0.1:8080 --username bob
 ```
 
-`--data-dir` 必填且必须不是文件系统根目录；两个用户切勿共用，客户端会通过 `config/client.lock` 拒绝并发使用同一目录。`--username` 只预填内嵌登录页，可省略；已有有效会话文件时直接恢复聊天页。
+`--data-dir` 必填且不能是文件系统根目录；两个用户不得共用，客户端通过 `config/client.lock` 拒绝并发使用同一目录。`--username` 只预填登录用户名，可省略。每个目录独立创建 `inbox/`、`outbox/`、`downloads/`、`temp/`、`keys/`、`logs/`、`config/`。令牌不会写入日志，会话文件尽量设置为仅所有者可读写。
 
-多用户工作台：
+## ROOT 本地系统压测
 
 ```powershell
-client/start-simulator.ps1 -ServerUrl http://127.0.0.1:8080
+client/start-simulator.ps1
 ```
 
-系统测试先执行仓库 `scripts/stress-up.ps1`，成功后再启动 `client/build/qt-windows/bin/secure-im-stress-runner.exe`，仅传入 `--target`、`--server`、`--env-file`、`--report-root`。默认连接隔离压测后端 `http://127.0.0.1:18080` 并使用 `deploy/.env.stress`；固定负载为 80/18/2 空闲/聊天/文件、500 MiB 文件预算、1 MiB 分块、64 个文件 worker、100 MiB 单文件和 5 分钟稳定期。报告固定写入 `runtime/stress-reports` 并读取各目录 `summary.json`。`start-simulator.ps1` 会在后端 runner 源码就绪时将其构建到上述 Qt bin 目录；`SECURE_IM_STRESS_RUNNER`、`SECURE_IM_STRESS_REPORT_ROOT` 与 `SECURE_IM_STRESS_SKIP_SETUP=1` 仅作为开发/测试覆盖。
+压测工具固定使用 **ROOT / 123456**，该凭据只用于 `http://127.0.0.1:18080` 的本地隔离压测入口，不是正式客户端的默认账号。启动测试时先执行 `scripts/stress-up.ps1`，再启动 `client/build/qt-windows/bin/secure-im-stress-runner.exe`，仅传入 `--target`、`--server`、`--env-file`、`--report-root`。
 
-simulator 固定使用仓库下的 `runtime/users/user_N`，欢迎页以只读输入框显示该路径；编号单调递增，可用 `SECURE_IM_SERVER_URL` 设置默认服务器地址。关闭标签会幂等停止该用户的定时器、WebSocket 重连、HTTP、TransferManager 和 writer，并立即释放目录锁；其他标签不受影响，之后可重新打开同一目录。“退出”需确认并额外清除本地登录会话，但不删除服务器账号或历史文件；“注销”则在服务端永久删除账号成功后才执行相同的本地清理。注销请求期间关闭标签会安全中止回调，不影响其他标签。
+固定负载为 80/18/2 空闲/聊天/文件、500 MiB 文件预算、**5 MiB** 分块、96 个文件 worker、100 MiB 单文件和 **5 分钟**稳定期。独立后端限制 **6 CPU / 3 GiB**，使用独立数据库 `secure_im_stress` 和 Bucket `secure-im-stress-files`，同时共享正常环境的 MySQL/MinIO 容器。报告写入 `runtime/stress-reports` 并读取各目录 `summary.json`。
+
+`SECURE_IM_STRESS_RUNNER`、`SECURE_IM_STRESS_REPORT_ROOT`、`SECURE_IM_STRESS_SERVER` 与 `SECURE_IM_STRESS_SKIP_SETUP=1` 仅作为开发/测试覆盖。runner 自身保留 `--chunk-size`、`--stable-duration` 等命令行覆盖。
 
 ## 后端对齐点
 
-所有 REST 响应假设均集中在 `ApiClient.cpp`，UI 不直接读取后端字段。当前适配如下：
+所有 REST 响应字段适配集中在 `ApiClient.cpp`，UI 不直接读取后端 JSON 字段。
 
 | 接口 | 当前请求/响应约定 |
 |---|---|
-| `POST /api/v1/auth/register`、`login` | JSON `username/password`，注册附带默认 `display_name=username`；读取 `data.user` 和 `data.tokens.access_token/refresh_token`；密码为 6~128 个 UTF-8 字节（`123456` 可用于本地测试） |
-| `POST /api/v1/auth/refresh` | JSON `refresh_token`；响应同登录 |
-| `GET /api/v1/users` | 数组或 `users` 数组；用户 `id`（兼容 `user_id`）、`username`、`display_name` |
-| `GET /api/v1/presence` | 读取 `data.online_user_ids`，与用户列表共用 10 秒刷新周期；失败不改变旧状态 |
-| `POST /api/v1/ws-ticket` | 读取 `ticket`（兼容 `ws_ticket`），随后连接 `ws(s)://host/ws?ticket=...` |
-| `GET /api/v1/messages?peer_id=&after_id=` | `data.messages` 中的 `cursor` 用于下次 `after_id`；`envelope` 为 base64 Protobuf Envelope，payload 为 UTF-8 JSON，MESSAGE 的 `read_at` 持久化为已读时间 |
-| `POST /api/v1/messages/read` | JSON `peer_id/cursor`；只为可见会话的最新对方消息发送，服务端随后通过 WS READ 通知发送方 |
-| `POST /api/v1/files/init` | `recipient_id/filename/size/sha256/chunk_size`；读取 `data.file.id/chunk_size` 等 |
-| `GET /api/v1/files/{id}` | 读取 `data.file` 及与其同级的 `uploaded_chunks`；完成状态为 `completed` |
-| `PUT /api/v1/files/{id}/chunks/{index}` | 原始字节及 `X-Chunk-SHA256`，索引从 0 开始 |
-| `POST /api/v1/files/{id}/complete` | 空 JSON 对象 |
-| `GET /api/v1/files/{id}/download` | `readyRead` 流式读取，writer 校验实际大小后通过 `QSaveFile` 原子提交 |
-| `DELETE /api/v1/users/me` | Bearer 认证；永久删除当前服务器账号及关联消息/文件；**仅 204 视为成功**，其他 2xx 也按失败处理 |
-| `DELETE /api/v1/files/{id}` | 取消上传时调用 |
+| `POST /api/v1/auth/register`、`login` | JSON `username/password`，注册附带 `display_name`；读取 `data.user` 和 `data.tokens.access_token/refresh_token` |
+| `POST /api/v1/auth/refresh` | JSON `refresh_token`；响应同登录，旧 Refresh Token 被轮换 |
+| `POST /api/v1/auth/logout` | Bearer + JSON `refresh_token`；204 幂等撤销当前用户的该 Refresh Token |
+| `GET /api/v1/users`、`presence` | 用户列表及 `data.online_user_ids` |
+| `POST /api/v1/ws-ticket` | 读取 `ticket`，随后连接 `ws(s)://host/ws?ticket=...` |
+| `GET /api/v1/messages?peer_id=&after_id=` | `cursor` 用于下次 `after_id`；`envelope` 为 Base64 Protobuf v2 Envelope |
+| `POST /api/v1/messages/read` | JSON `peer_id/cursor`；服务端通过 WS READ 通知双方连接 |
+| `POST /api/v1/files/init` | `recipient_id/filename/size/sha256/chunk_size`；读取 `data.file.id/chunk_size/instant` 等 |
+| `GET /api/v1/files/{id}` | 读取 `data.file` 及同级 `uploaded_chunks` |
+| `PUT /api/v1/files/{id}/chunks/{index}` | 原始明文字节及 `X-Chunk-SHA256`，索引从 0 开始 |
+| `POST /api/v1/files/{id}/complete` | 空 JSON 对象；仅非 instant 内容需要 |
+| `GET /api/v1/files/{id}/download` | `readyRead` 流式读取，顺序 writer 校验大小后原子提交 |
+| `DELETE /api/v1/files/{id}` | 取消上传或删除当前逻辑引用 |
+| `DELETE /api/v1/users/me` | Bearer 认证；仅 204 视为永久注销成功 |
 
-通用响应可包一层 `data`。`uploaded_chunks` 可为整数数组，或带 `index/uploaded/complete` 的对象数组。错误响应读取嵌套 `error.message`（兼容 `error/code/message/detail`）。若后端最终字段不同，只需调整 `ApiClient.cpp`。
+WebSocket 外层使用 `im.v1.Envelope`，`version=2`。MESSAGE payload 是 `MessagePayload`（文本或文件通知），ACK payload 是 `AckPayload`，ERROR payload 是 `ErrorPayload`；不存在旧 UTF-8 JSON payload 或十进制 cursor ACK。历史接口的 Base64 仅封装完整 Envelope 字节，不改变 payload 的 Protobuf 格式。
 
-`tests/test_api_client.cpp` 使用本地假 HTTP 服务固定上述真实响应形状，包括 presence、read 和账号注销的 Bearer/204 严格判定。`test_message_sync.cpp` 覆盖 optimistic 去重及 cursor 单调推进；`test_local_store.cpp` 覆盖重复 history 的 cursor/readAt 合并，以及共享账号注册表的持久化、删除和无凭据泄漏。`test_transfer_manager.cpp` 覆盖 8 MiB 流式下载、大小不匹配清理、下载暂停后继续，以及真实慢速多分块上传的暂停中止、进度冻结、立即/延迟继续和已确认分块去重。`test_session_tabs.cpp` 覆盖系统测试/欢迎固定标签顺序与关闭按钮、用户标签关闭和切换、目录/token/对象隔离、锁拒绝与释放、固定 `runtime/users`、大写登录和 6 位密码、退出与注销的确认/取消、`session.json` 清除、DELETE 成功/失败与重试、防重入、pending 请求关闭安全、成功后关闭标签并回到欢迎页、其他标签及历史文件保留、传输卡片内容/统计/空状态/长路径 tooltip、单击选择与全部传输操作、fake 目录 opener（不会启动 Explorer）、两个联系人独立未读红点及分联系人清除、自定义 GOOD 注册及会话恢复后可见、未知 ALICE/QTIT/OTHER 隐藏、USER_2 可见、搜索/刷新后的未读保留、UUID 隐藏、后台标签不误已读、切换补发及 READ 持久化，以及未完成 HTTP 和活动上传/下载的关闭安全。
+文件分块在 MinIO 中以明文保存，不使用 DEK/KEK 或应用层密文。文件内容按 size + SHA-256 全局复用，删除最后一个逻辑引用后才清理对象。
 
-`session_tabs` 还在 `QT_QPA_PLATFORM=offscreen` 下实际生成并校验非空 PNG；主传输预览固定校验为 **1280×820**（Windows CTest 自动设置 `QT_QPA_FONTDIR=C:/Windows/Fonts`）：
+## 测试
 
-- `build/qt-windows/system-test-preview.png`：固定在首个标签的压力测试配置、实时指标和历史报告页面。
-- `build/qt-windows/session-tabs-welcome-preview.png`：与系统测试并列的欢迎标签。
-- `build/qt-windows/session-tabs-preview.png`：1280×820 的两个用户标签、登录态及传输卡片视图，展示方向、对方、百分比/大小、彩色状态、长路径省略、错误与统计；右上角展示连接状态与“退出”“注销”，联系人姓名旁展示未读红点。
-- `build/qt-windows/session-tabs-chat-preview.png`：同一工作台的聊天视图，展示大写用户名、在线状态、右上角“退出”“注销”、隐藏 UUID 的标题和自己消息的已读时间。
+默认 CTest 覆盖 API 响应适配、logout/refresh 竞态、Protobuf v2 编解码、消息同步、LocalStore、上传动态调度与续传、取消删除后立即重试、秒传、独立下载并发、Windows 路径预留、慢 writer 背压和流式写入、ROOT 压测窗口、runner NDJSON 解析及报告历史。预览测试在 `QT_QPA_PLATFORM=offscreen` 下生成 PNG。
 
-也可手动生成传输视图预览：
-
-```powershell
-$env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
-$env:QT_QPA_PLATFORM = "offscreen"
-$env:QT_QPA_FONTDIR = "C:/Windows/Fonts"
-client/build/qt-windows/bin/secure-im-simulator.exe `
-  --preview client/build/qt-windows/session-tabs-preview.png
-```
-
-`test_stress_run` 使用 fake runner 覆盖 NDJSON 半行/粘包/CRLF/非法 JSON、结束 drain、非零退出、缺少 final、停止与析构、历史排序及 HTML/目录打开，并验证切换标签继续运行、关闭主窗口停止。
-
-`test_backend_integration` 不注册到默认 CTest，可对运行中的后端执行随机大写双用户使用 `123456` 注册、登录、users/presence、双 WebSocket 连接、文本发送、ACK、对方实时接收、READ 回执、history `read_at` 及本地持久化和 cursor 增量，并验证文件 init/status、分块上传、completed 状态、流式下载，最后通过新 DELETE 接口注销两个测试账号：
+`test_backend_integration` 不注册到默认 CTest，可对运行中的后端执行随机双用户注册/登录、WebSocket 消息、ACK、READ、history 和文件上传/下载，最后注销测试账号：
 
 ```powershell
 $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
@@ -145,6 +123,4 @@ $env:CLIENT_BACKEND_URL = "http://127.0.0.1:8080"
 client/build/qt-windows/test_backend_integration.exe
 ```
 
-WebSocket 使用仓库现有 `im.v1.Envelope`。因 `proto/im/v1/messages.proto` 尚未提供，`Envelope.payload` 暂时携带 UTF-8 JSON：文本为 `{"type":"text","text":"..."}`，文件为 `{"type":"file","file_id":"...","file_name":"...","size":123}`。这是**唯一需要随消息 proto 定稿对齐的 payload 适配点**；外层帧始终由生成的 Protobuf 代码处理。
-
-当前范围刻意不包含 QML、群聊和 E2EE。下载接口未约定 Range/分块响应，所以暂停后继续下载会重新获取完整文件；上传暂停后继续会通过 `fileStatus/uploaded_chunks` 查询并保留服务端已确认的分块，仅从首个缺失块续传，不重新初始化整文件。
+当前范围不包含 QML、群聊和 E2EE。

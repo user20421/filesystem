@@ -1,46 +1,44 @@
 #pragma once
 
-#include <QList>
+#include "StressRunController.h"
+
 #include <QMainWindow>
 #include <QUrl>
+#include <memory>
 
-class QLabel;
-class QLineEdit;
-class SessionPage;
+struct AuthSession;
+class LoginPage;
+class SessionContext;
+class QStackedWidget;
 class SystemTestPage;
-class QTabWidget;
-class QToolButton;
 
+// Single-purpose stress tool: authenticate ROOT, then show only SystemTestPage.
 class SimulatorWindow final : public QMainWindow {
     Q_OBJECT
 public:
-    explicit SimulatorWindow(const QString &dataRoot = {}, const QUrl &serverUrl = {},
+    explicit SimulatorWindow(const QString &dataDir = {}, const QUrl &serverUrl = {},
                              QWidget *parent = nullptr);
+    ~SimulatorWindow() override;
 
-    int sessionCount() const;
-    SessionPage *sessionAt(int index) const; // Zero-based among user tabs, not the welcome tab.
-    SessionPage *addSession(bool demo = false);
-    QList<SessionPage *> addSessions(int count, bool demo = false);
-    bool closeSession(int index);
+    bool isOpen() const;
+    QString startupError() const { return m_startupError; }
+    bool isAuthenticated() const { return m_systemTest != nullptr; }
+    SystemTestPage *systemTestPage() const { return m_systemTest; }
+    SessionContext *context() const { return m_context.get(); }
     bool savePreview(const QString &path);
 
 protected:
     void closeEvent(QCloseEvent *event) override;
 
 private:
-    QWidget *createWelcomePage();
-    SessionPage *createSession(bool demo);
-    bool closePage(SessionPage *page);
-    void updateTab(SessionPage *page);
-    void activateCurrentTab();
-    int nextUserNumber(const QString &root) const;
-    QUrl serverUrl() const;
+    void showSystemTest(const AuthSession &session);
+    void shutdown();
 
-    QTabWidget *m_tabs;
+    StressRunConfig m_config;
+    std::unique_ptr<SessionContext> m_context;
+    QStackedWidget *m_stack = nullptr;
+    LoginPage *m_login = nullptr;
     SystemTestPage *m_systemTest = nullptr;
-    QLineEdit *m_root;
-    QLineEdit *m_server;
-    QToolButton *m_add;
-    int m_nextNumber = 1;
-    bool m_restoringTabMove = false;
+    QString m_startupError;
+    bool m_closing = false;
 };

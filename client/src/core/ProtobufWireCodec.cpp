@@ -1,6 +1,7 @@
 #include "ProtobufWireCodec.h"
 
 #include "envelope.qpb.h"
+#include "messages.qpb.h"
 
 #include <QtProtobuf/QProtobufSerializer>
 
@@ -15,11 +16,33 @@ bool ProtobufWireCodec::encode(const WireMessage &message, QByteArray *frame, QS
     envelope.setRecipientId(message.recipientId);
     envelope.setDeviceId(message.deviceId);
     envelope.setTimestamp(message.timestamp);
-    envelope.setPayload(message.payload);
-    envelope.setCursor(message.cursor.toULongLong());
+    envelope.setCursor(message.type == WireMessage::Type::Read ? message.cursor.toULongLong() : 0);
     envelope.setReadAt(message.readAt);
 
     QProtobufSerializer serializer;
+    switch (message.type) {
+    case WireMessage::Type::Message:
+        envelope.setPayload(message.payload);
+        break;
+    case WireMessage::Type::Ack: {
+        im::v1::AckPayload payload;
+        payload.setCursor(message.cursor.toULongLong());
+        envelope.setPayload(payload.serialize(&serializer));
+        break;
+    }
+    case WireMessage::Type::Error: {
+        im::v1::ErrorPayload payload;
+        payload.setCode(message.errorCode);
+        payload.setMessage(message.errorMessage);
+        envelope.setPayload(payload.serialize(&serializer));
+        break;
+    }
+    default:
+        // READ, PING and PONG carry metadata in Envelope and have no payload.
+        envelope.setPayload({});
+        break;
+    }
+
     *frame = envelope.serialize(&serializer);
     if (serializer.lastError() != QAbstractProtobufSerializer::Error::None) {
         frame->clear();
@@ -35,9 +58,8 @@ bool ProtobufWireCodec::decode(const QByteArray &frame, WireMessage *message, QS
     im::v1::Envelope envelope;
     QProtobufSerializer serializer;
     if (!envelope.deserialize(&serializer, frame)) {
-        if (error) {
+        if (error)
             *error = QStringLiteral("无法解析 Protobuf Envelope：") + serializer.lastErrorString();
-        }
         return false;
     }
     message->version = envelope.version();
@@ -49,7 +71,36 @@ bool ProtobufWireCodec::decode(const QByteArray &frame, WireMessage *message, QS
     message->deviceId = envelope.deviceId();
     message->timestamp = static_cast<qint64>(envelope.timestamp());
     message->payload = envelope.payload();
-    message->cursor = envelope.cursor() == 0 ? QString{} : QString::number(envelope.cursor());
     message->readAt = static_cast<qint64>(envelope.readAt());
+
+    switch (message->type) {
+    case WireMessage::Type::Ack: {
+        im::v1::AckPayload payload;
+        if (!payload.deserialize(&serializer, envelope.payload())) {
+            if (error)
+                *error = QStringLiteral("无法解析 AckPayload：") + serializer.lastErrorString();
+            return false;
+        }
+        message->cursor = payload.cursor() == 0 ? QString{} : QString::number(payload.cursor());
+        break;
+    }
+    case WireMessage::Type::Error: {
+        im::v1::ErrorPayload payload;
+        if (!payload.deserialize(&serializer, envelope.payload())) {
+            if (error)
+                *error = QStringLiteral("无法解析 ErrorPayload：") + serializer.lastErrorString();
+            return false;
+        }
+        message->errorCode = payload.code();
+        message->errorMessage = payload.message();
+        break;
+    }
+    case WireMessage::Type::Read:
+        message->cursor = envelope.cursor() == 0 ? QString{} : QString::number(envelope.cursor());
+        break;
+    default:
+        message->cursor.clear();
+        break;
+    }
     return true;
 }

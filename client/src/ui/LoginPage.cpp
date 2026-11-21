@@ -67,6 +67,7 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
     m_login->setObjectName(QStringLiteral("loginButton"));
     m_login->setProperty("primary", true);
     m_register = new QPushButton(QStringLiteral("创建账号"), panel);
+    m_register->setObjectName(QStringLiteral("registerButton"));
     buttons->addWidget(m_register);
     buttons->addWidget(m_login);
     layout->addLayout(buttons);
@@ -92,6 +93,12 @@ void LoginPage::setUsername(const QString &username)
 {
     if (!username.isEmpty())
         m_username->setText(username.toUpper());
+}
+
+void LoginPage::showError(const QString &error)
+{
+    if (!m_closing)
+        m_status->setText(error);
 }
 
 void LoginPage::setBusy(bool busy)

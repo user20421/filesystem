@@ -107,3 +107,10 @@ func TestMemoryBudgetWaitHonorsContextTimeout(t *testing.T) {
 	}
 	release()
 }
+
+func TestChunkMemoryWeightUsesOnePlaintextCopy(t *testing.T) {
+	const size = int64(5 << 20)
+	if got, want := chunkMemoryWeight(size), size+chunkOperationOverhead; got != want {
+		t.Fatalf("chunkMemoryWeight = %d, want %d", got, want)
+	}
+}

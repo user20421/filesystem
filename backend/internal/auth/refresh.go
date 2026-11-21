@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,7 +34,7 @@ func (s *Service) Refresh(ctx context.Context, raw string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	user.Username = strings.ToUpper(user.Username)
+	user.Username = normalizeUsername(user.Username)
 	if rotated.Valid || revoked.Valid || !expiresAt.After(time.Now()) {
 		return Result{}, invalidRefresh()
 	}
@@ -67,7 +66,7 @@ func (s *Service) Me(ctx context.Context, id string) (User, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, httpx.Error(401, "invalid_token", "user no longer exists")
 	}
-	user.Username = strings.ToUpper(user.Username)
+	user.Username = normalizeUsername(user.Username)
 	return user, err
 }
 func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
@@ -82,7 +81,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 		if err := rows.Scan(&u.ID, &u.Username, &u.DisplayName, &u.CreatedAt); err != nil {
 			return nil, err
 		}
-		u.Username = strings.ToUpper(u.Username)
+		u.Username = normalizeUsername(u.Username)
 		users = append(users, u)
 	}
 	return users, rows.Err()

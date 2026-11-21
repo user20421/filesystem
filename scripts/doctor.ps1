@@ -42,7 +42,7 @@ if ($failures -gt 0 -or -not $envFile) {
 Invoke-DockerCompose -ComposeArguments @('ps', '-a')
 
 $serviceHealthy = @{}
-foreach ($service in @('mysql', 'redis', 'minio')) {
+foreach ($service in @('mysql', 'minio')) {
     $health = Get-ServiceHealth -ServiceName $service
     $serviceHealthy[$service] = ($health -eq 'healthy')
     Write-Check -Name "Container $service" -Passed $serviceHealthy[$service] -Detail $health
@@ -57,16 +57,6 @@ if ($serviceHealthy['mysql']) {
 }
 else {
     Write-Check -Name 'MySQL secure_im query' -Passed $false -Detail 'container is not healthy'
-}
-
-if ($serviceHealthy['redis']) {
-    $redisPassword = Get-EnvironmentValue -Name 'REDIS_PASSWORD' -DefaultValue ''
-    $redisArguments = @('exec', '-T', '-e', "REDISCLI_AUTH=$redisPassword", 'redis', 'redis-cli', '--no-auth-warning', 'ping')
-    & docker @(Get-DockerComposeArguments -AdditionalArguments $redisArguments)
-    Write-Check -Name 'Redis authenticated PING' -Passed ($LASTEXITCODE -eq 0)
-}
-else {
-    Write-Check -Name 'Redis authenticated PING' -Passed $false -Detail 'container is not healthy'
 }
 
 if ($serviceHealthy['minio']) {

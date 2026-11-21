@@ -31,7 +31,7 @@ func (s *Service) History(ctx context.Context, userID, peer string, after uint64
 		var item HistoryItem
 		var created time.Time
 		var readAt sql.NullTime
-		e := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE}
+		e := &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_MESSAGE}
 		if err := rows.Scan(&item.Cursor, &e.MessageId, &e.ConversationId, &e.SenderId, &e.RecipientId, &e.DeviceId, &e.Payload, &created, &readAt); err != nil {
 			return nil, err
 		}

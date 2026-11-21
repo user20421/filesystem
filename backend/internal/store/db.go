@@ -63,6 +63,11 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		if exists != 0 {
 			continue
 		}
+		if entry.Name() == "003_shared_plaintext_files.sql" {
+			if err := guardLegacyFileReset(ctx, conn); err != nil {
+				return err
+			}
+		}
 		body, err := migrations.ReadFile("migrations/" + entry.Name())
 		if err != nil {
 			return err
@@ -78,6 +83,24 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES(?)`, entry.Name()); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func guardLegacyFileReset(ctx context.Context, conn *sql.Conn) error {
+	var legacy int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(1) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='files' AND column_name='wrapped_dek'`).Scan(&legacy); err != nil {
+		return err
+	}
+	if legacy == 0 {
+		return nil
+	}
+	var files, chunks int
+	if err := conn.QueryRowContext(ctx, `SELECT (SELECT COUNT(1) FROM files),(SELECT COUNT(1) FROM file_chunks)`).Scan(&files, &chunks); err != nil {
+		return err
+	}
+	if files != 0 || chunks != 0 {
+		return fmt.Errorf("legacy encrypted file data is not empty (%d files, %d chunks); reset the database and object storage before applying the plaintext shared-content schema", files, chunks)
 	}
 	return nil
 }

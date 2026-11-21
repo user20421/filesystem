@@ -16,14 +16,11 @@ public:
     QDir root() const { return m_root; }
     QString path(const QString &name) const;
 
-    int concurrency() const;
-    void setConcurrency(int value);
-
     bool saveSession(const AuthSession &session, QString *error = nullptr);
     AuthSession loadSession() const;
     void clearSession();
 
-    // Shared by sibling per-user data directories; contains only IDs/usernames.
+    // Private to this user's data directory; contains only IDs/usernames.
     QSet<QString> knownAccountIds() const;
     bool rememberAccount(const User &user, QString *error = nullptr) const;
     bool forgetAccount(const QString &userId, QString *error = nullptr) const;

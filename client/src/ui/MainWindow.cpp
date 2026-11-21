@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "LocalStore.h"
+#include "MessagePayloadCodec.h"
 #include "TransferTaskCard.h"
 
 #include <QDateTime>
@@ -12,8 +13,6 @@
 #include <QHeaderView>
 #include <QAbstractItemView>
 #include <QHBoxLayout>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -22,7 +21,6 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QSpinBox>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QTextBrowser>
@@ -66,17 +64,6 @@ QString formatBytes(qint64 bytes)
     if (bytes < 1024LL * 1024 * 1024)
         return QStringLiteral("%1 MiB").arg(bytes / (1024.0 * 1024.0), 0, 'f', 1);
     return QStringLiteral("%1 GiB").arg(bytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2);
-}
-
-ChatMessage payloadMessage(const QJsonObject &payload)
-{
-    ChatMessage message;
-    message.kind = payload.value(QStringLiteral("type")).toString(QStringLiteral("text"));
-    message.content = payload.value(QStringLiteral("text")).toString();
-    message.fileId = payload.value(QStringLiteral("file_id")).toString();
-    message.fileName = payload.value(QStringLiteral("file_name")).toString();
-    message.fileSize = payload.value(QStringLiteral("size")).toVariant().toLongLong();
-    return message;
 }
 
 QFrame *card(QWidget *parent)
@@ -176,7 +163,12 @@ MainWindow::MainWindow(ApiClient *api, LocalStore *store, WireCodec *codec,
     connect(m_transfers, &TransferManager::uploadCompleted, this, [this](TransferTask *task) {
         if (m_closing)
             return;
-        if (!sendPayload(task->peerId(), filePayload(task->fileId(), task->fileName(), task->size())))
+        ChatMessage notification;
+        notification.kind = QStringLiteral("file");
+        notification.fileId = task->fileId();
+        notification.fileName = task->fileName();
+        notification.fileSize = task->size();
+        if (!sendPayload(task->peerId(), notification))
             showNotice(QStringLiteral("文件已上传，但文件消息尚未发送"));
     });
     connect(m_socket, &WebSocketClient::connected, this, [this] {
@@ -261,11 +253,11 @@ void MainWindow::buildUi()
     m_socketLabel = new QLabel(right);
     m_socketLabel->setObjectName(QStringLiteral("connectionBadge"));
     top->addWidget(m_socketLabel);
-    auto *exit = new QPushButton(QStringLiteral("退出"), right);
-    exit->setObjectName(QStringLiteral("exitButton"));
-    exit->setToolTip(QStringLiteral("退出当前账号并关闭标签，不删除服务器账号或历史文件"));
-    top->addWidget(exit);
-    connect(exit, &QPushButton::clicked, this, &MainWindow::requestExit);
+    m_exitButton = new QPushButton(QStringLiteral("退出"), right);
+    m_exitButton->setObjectName(QStringLiteral("exitButton"));
+    m_exitButton->setToolTip(QStringLiteral("撤销当前登录凭据并退出，不删除服务器账号或历史文件"));
+    top->addWidget(m_exitButton);
+    connect(m_exitButton, &QPushButton::clicked, this, &MainWindow::requestExit);
     m_deleteAccountButton = new QPushButton(QStringLiteral("注销"), right);
     m_deleteAccountButton->setObjectName(QStringLiteral("deleteAccountButton"));
     m_deleteAccountButton->setToolTip(QStringLiteral("永久删除服务器账号及关联消息和文件，不可恢复"));
@@ -356,11 +348,6 @@ void MainWindow::buildUi()
     updateTransferSummary();
 
     auto *controls = new QHBoxLayout;
-    controls->addWidget(new QLabel(QStringLiteral("并发"), transferView));
-    m_concurrency = new QSpinBox(transferView);
-    m_concurrency->setRange(3, 5);
-    m_concurrency->setValue(m_transfers->concurrency());
-    controls->addWidget(m_concurrency);
     auto *openDirectory = new QPushButton(QStringLiteral("打开目录"), transferView);
     openDirectory->setObjectName(QStringLiteral("openTransferDirectoryButton"));
     openDirectory->setToolTip(QStringLiteral("打开选中文件所在的本地目录"));
@@ -424,8 +411,6 @@ void MainWindow::buildUi()
     connect(attach, &QPushButton::clicked, this, &MainWindow::chooseFile);
     connect(m_chatNav, &QPushButton::clicked, this, &MainWindow::showChatView);
     connect(m_transferNav, &QPushButton::clicked, this, &MainWindow::showTransfersView);
-    connect(m_concurrency, qOverload<int>(&QSpinBox::valueChanged),
-            m_transfers, &TransferManager::setConcurrency);
 }
 
 void MainWindow::updateSessionLabel()
@@ -440,7 +425,7 @@ void MainWindow::requestExit()
     m_exitPending = true;
     QPointer<MainWindow> guarded(this);
     QMessageBox prompt(QMessageBox::Question, QStringLiteral("退出"),
-        QStringLiteral("确定要退出 %1 吗？将清除本地登录会话并关闭该标签页，不会删除服务器账号。")
+        QStringLiteral("确定要退出 %1 吗？将清除本地登录会话并关闭窗口，不会删除服务器账号。")
             .arg(m_session.user.username.toUpper()),
         QMessageBox::Yes | QMessageBox::No, nullptr);
     prompt.button(QMessageBox::Yes)->setText(QStringLiteral("是"));
@@ -449,11 +434,25 @@ void MainWindow::requestExit()
     const auto answer = static_cast<QMessageBox::StandardButton>(prompt.exec());
     if (!guarded)
         return;
-    m_exitPending = false;
-    if (answer != QMessageBox::Yes || m_closing)
+    if (answer != QMessageBox::Yes || m_closing) {
+        m_exitPending = false;
         return;
-    m_store->clearSession();
-    emit exitRequested(); // The receiver closes this page; do not touch members afterwards.
+    }
+    m_exitPending = true;
+    m_exitButton->setEnabled(false);
+    m_api->logout([this, guarded](bool ok, const QString &error) {
+        if (!guarded || m_closing)
+            return;
+        m_exitPending = false;
+        m_exitButton->setEnabled(true);
+        if (!ok) {
+            showNotice(QStringLiteral("退出失败：%1。服务器登录凭据可能仍有效，本地会话保留，可重试。")
+                .arg(error));
+            return;
+        }
+        m_store->clearSession();
+        emit logoutCompleted();
+    });
 }
 
 void MainWindow::requestAccountDeletion()
@@ -746,7 +745,7 @@ void MainWindow::scheduleReconnect()
         m_reconnectTimer->start();
 }
 
-bool MainWindow::sendPayload(const QString &peerId, const QJsonObject &payload)
+bool MainWindow::sendPayload(const QString &peerId, const ChatMessage &message)
 {
     if (m_closing || peerId.isEmpty())
         return false;
@@ -757,21 +756,24 @@ bool MainWindow::sendPayload(const QString &peerId, const QJsonObject &payload)
     wire.recipientId = peerId;
     wire.deviceId = QStringLiteral("desktop");
     wire.timestamp = QDateTime::currentMSecsSinceEpoch();
-    wire.payload = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     QString error;
+    if (!MessagePayloadCodec::encode(message, &wire.payload, &error)) {
+        showNotice(QStringLiteral("发送失败：") + error);
+        return false;
+    }
     if (!m_socket->send(wire, &error)) {
         if (error.isEmpty())
             error = QStringLiteral("WebSocket 未接受完整帧");
         showNotice(QStringLiteral("发送失败：") + error);
         return false;
     }
-    ChatMessage message = payloadMessage(payload);
-    message.id = wire.messageId;
-    message.conversationId = wire.conversationId;
-    message.senderId = wire.senderId;
-    message.recipientId = wire.recipientId;
-    message.timestamp = wire.timestamp;
-    appendChat(peerId, message);
+    ChatMessage sent = message;
+    sent.id = wire.messageId;
+    sent.conversationId = wire.conversationId;
+    sent.senderId = wire.senderId;
+    sent.recipientId = wire.recipientId;
+    sent.timestamp = wire.timestamp;
+    appendChat(peerId, sent);
     return true;
 }
 
@@ -784,7 +786,9 @@ void MainWindow::sendText()
     const QString text = m_input->text();
     if (text.isEmpty())
         return;
-    if (sendPayload(m_peerId, textPayload(text)))
+    ChatMessage message;
+    message.content = text;
+    if (sendPayload(m_peerId, message))
         m_input->clear();
 }
 
@@ -812,13 +816,12 @@ void MainWindow::handleWireMessage(const WireMessage &wire)
     // ACK confirms transport only; it never means that the peer has read it.
     if (wire.type != WireMessage::Type::Message)
         return;
-    QJsonObject payload;
-    const QJsonDocument document = QJsonDocument::fromJson(wire.payload);
-    if (document.isObject())
-        payload = document.object();
-    else
-        payload = textPayload(QString::fromUtf8(wire.payload));
-    ChatMessage message = payloadMessage(payload);
+    ChatMessage message;
+    QString error;
+    if (!MessagePayloadCodec::decode(wire.payload, &message, &error)) {
+        showNotice(QStringLiteral("协议错误：") + error);
+        return;
+    }
     message.id = wire.messageId;
     message.conversationId = wire.conversationId;
     message.senderId = wire.senderId;
@@ -1064,91 +1067,6 @@ QString MainWindow::selectedTransferId() const
 {
     auto *item = m_transferList->currentItem();
     return item ? item->data(0, Qt::UserRole).toString() : QString{};
-}
-
-void MainWindow::populateDemoData()
-{
-    const User peer{QStringLiteral("user-demo-bob"), QStringLiteral("bob"),
-                    QStringLiteral("Bob Chen"), true, true};
-    m_contacts.insert(peer.id, peer);
-    m_presenceKnown = true;
-    m_onlineUserIds.insert(peer.id);
-    m_userNames.insert(peer.id, peer.label());
-    auto *item = createContactItem(m_users, peer, QStringLiteral("在线"), 0);
-    m_users->setCurrentItem(item);
-    m_chat->clear();
-    ChatMessage incoming;
-    incoming.senderId = peer.id;
-    incoming.content = QStringLiteral("新的多用户工作台已经准备好了。");
-    incoming.timestamp = QDateTime::currentMSecsSinceEpoch() - 65000;
-    renderMessage(incoming);
-    ChatMessage own;
-    own.senderId = m_session.user.id;
-    own.content = QStringLiteral("很好，聊天和文件传输现在都能独立切换。");
-    own.timestamp = QDateTime::currentMSecsSinceEpoch() - 35000;
-    own.readAt = QDateTime::currentMSecsSinceEpoch() - 30000;
-    renderMessage(own);
-    incoming.content = QStringLiteral("设计评审.pdf 已上传，请查看传输进度。");
-    incoming.timestamp = QDateTime::currentMSecsSinceEpoch() - 8000;
-    renderMessage(incoming);
-
-    QList<TransferCardData> rows;
-    TransferCardData uploading;
-    uploading.upload = true;
-    uploading.fileName = QStringLiteral("设计评审.pdf");
-    uploading.peerName = peer.label();
-    uploading.localPath = QStringLiteral("C:/Users/demo/outbox/设计评审.pdf");
-    uploading.stateText = QStringLiteral("上传中");
-    uploading.stateKey = QStringLiteral("active");
-    uploading.size = 5 * 1024 * 1024;
-    uploading.transferred = 3774874; // 72%, displayed independently from the bar.
-    rows.append(uploading);
-
-    TransferCardData completed;
-    completed.upload = false;
-    completed.fileName = QStringLiteral("产品使用手册.pdf");
-    completed.peerName = peer.label();
-    completed.localPath = QStringLiteral("C:/Users/demo/downloads/产品使用手册.pdf");
-    completed.stateText = QStringLiteral("已完成");
-    completed.stateKey = QStringLiteral("completed");
-    completed.size = 2465792;
-    completed.transferred = completed.size;
-    rows.append(completed);
-
-    TransferCardData failed;
-    failed.upload = true;
-    failed.fileName = QStringLiteral("季度财务汇总-final-v12.xlsx");
-    failed.peerName = peer.label();
-    failed.localPath = QStringLiteral(
-        "C:/Users/demo/OneDrive/Documents/公司资料/跨区域联合项目/2026/第四季度/区域销售与财务对账/最终确认版本/管理层审阅/已审批归档文件/季度财务汇总-final-v12.xlsx");
-    failed.stateText = QStringLiteral("失败");
-    failed.stateKey = QStringLiteral("failed");
-    failed.size = 19293798;
-    failed.transferred = 4823450; // 25%.
-    failed.error = QStringLiteral("网络连接中断，请检查网络后重试");
-    rows.append(failed);
-
-    for (const TransferCardData &data : rows) {
-        auto *row = new QTreeWidgetItem(m_transferList);
-        row->setData(0, Qt::UserRole + 1, QDir::cleanPath(data.localPath));
-        row->setData(0, Qt::UserRole + 2, data.stateKey);
-        row->setText(0, QStringLiteral("%1 · %2 · %3").arg(data.fileName, data.peerName, data.stateText));
-        auto *widget = new TransferTaskCard(m_transferList);
-        m_transferList->setItemWidget(row, 0, widget);
-        widget->setData(data);
-        row->setSizeHint(0, widget->sizeHint());
-        row->setToolTip(0, QDir::toNativeSeparators(data.localPath));
-        connect(widget, &TransferTaskCard::clicked, this, [this, row] {
-            if (!m_closing)
-                m_transferList->setCurrentItem(row);
-        });
-        connect(widget, &TransferTaskCard::openDirectoryRequested,
-                this, &MainWindow::openTransferDirectory);
-    }
-    m_transferList->setCurrentItem(m_transferList->topLevelItem(0));
-    updateTransferSummary();
-    showTransfersView();
-    setPeerUnread(peer.id, 1);
 }
 
 void MainWindow::shutdown()

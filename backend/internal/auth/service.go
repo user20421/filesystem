@@ -37,6 +37,8 @@ type Service struct {
 
 var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{3,32}$`)
 
+func normalizeUsername(username string) string { return strings.ToUpper(username) }
+
 func NewService(db *sql.DB, tokens *TokenManager) *Service {
 	dummy, _ := HashPassword("not-a-real-user-password", DefaultArgonParams)
 	return &Service{db: db, tokens: tokens, dummyHash: dummy}
@@ -54,7 +56,7 @@ func validateRegistration(username, displayName, password string) error {
 	return nil
 }
 func (s *Service) Register(ctx context.Context, username, displayName, password string) (Result, error) {
-	username = strings.ToUpper(username)
+	username = normalizeUsername(username)
 	if err := validateRegistration(username, displayName, password); err != nil {
 		return Result{}, err
 	}
@@ -74,7 +76,7 @@ func (s *Service) Register(ctx context.Context, username, displayName, password 
 	return s.result(ctx, user)
 }
 func (s *Service) Login(ctx context.Context, username, password string) (Result, error) {
-	username = strings.ToUpper(username)
+	username = normalizeUsername(username)
 	if len(password) > 128 {
 		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
 	}
@@ -88,7 +90,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (Result,
 	if err != nil {
 		return Result{}, err
 	}
-	user.Username = strings.ToUpper(user.Username)
+	user.Username = normalizeUsername(user.Username)
 	valid, verifyErr := VerifyPassword(hash, password)
 	if verifyErr != nil || !valid {
 		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")

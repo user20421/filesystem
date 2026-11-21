@@ -37,34 +37,22 @@ struct ChatMessage {
     bool isFile() const { return kind == QStringLiteral("file") || !fileId.isEmpty(); }
 };
 
+inline constexpr int DefaultFileChunkSize = 5 * 1024 * 1024;
+
 struct FileInitInfo {
     QString fileId;
-    int chunkSize = 4 * 1024 * 1024;
+    int chunkSize = DefaultFileChunkSize;
     QSet<int> uploadedChunks;
+    QString status;
+    bool complete = false;
 };
 
 struct FileStatus {
     QString fileId;
     QString fileName;
     qint64 size = 0;
-    int chunkSize = 4 * 1024 * 1024;
+    int chunkSize = DefaultFileChunkSize;
     QSet<int> uploadedChunks;
     QString status;
     bool complete = false;
 };
-
-// Payloads carried by Envelope.payload are JSON until proto/im/v1/messages.proto
-// is finalized.  Keeping this adapter here avoids UI dependencies on field names.
-inline QJsonObject textPayload(const QString &text)
-{
-    return {{QStringLiteral("type"), QStringLiteral("text")},
-            {QStringLiteral("text"), text}};
-}
-
-inline QJsonObject filePayload(const QString &fileId, const QString &name, qint64 size)
-{
-    return {{QStringLiteral("type"), QStringLiteral("file")},
-            {QStringLiteral("file_id"), fileId},
-            {QStringLiteral("file_name"), name},
-            {QStringLiteral("size"), size}};
-}

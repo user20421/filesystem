@@ -6,7 +6,6 @@
 #include <QJsonDocument>
 #include <QRegularExpression>
 #include <QSaveFile>
-#include <QSettings>
 #include <QUuid>
 
 namespace {
@@ -80,19 +79,6 @@ QString LocalStore::path(const QString &name) const
     return m_root.filePath(name);
 }
 
-int LocalStore::concurrency() const
-{
-    QSettings settings(path(QStringLiteral("config/settings.ini")), QSettings::IniFormat);
-    return qBound(3, settings.value(QStringLiteral("transfer/concurrency"), 3).toInt(), 5);
-}
-
-void LocalStore::setConcurrency(int value)
-{
-    QSettings settings(path(QStringLiteral("config/settings.ini")), QSettings::IniFormat);
-    settings.setValue(QStringLiteral("transfer/concurrency"), qBound(3, value, 5));
-    settings.sync();
-}
-
 bool LocalStore::writeJson(const QString &filePath, const QJsonObject &object, QString *error) const
 {
     QSaveFile file(filePath);
@@ -146,7 +132,7 @@ void LocalStore::clearSession()
 
 QString LocalStore::knownAccountsPath() const
 {
-    return QDir::cleanPath(m_root.absoluteFilePath(QStringLiteral("../known_accounts.json")));
+    return path(QStringLiteral("config/known_accounts.json"));
 }
 
 QJsonArray LocalStore::readKnownAccounts() const

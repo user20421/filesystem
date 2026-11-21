@@ -3,6 +3,7 @@ package backend_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,8 +12,8 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,8 @@ type integrationAuth struct {
 }
 type integrationFile struct {
 	ID          string `json:"id"`
+	ContentID   string `json:"content_id"`
+	Instant     bool   `json:"instant"`
 	OwnerID     string `json:"owner_id"`
 	RecipientID string `json:"recipient_id"`
 	Size        int64  `json:"size"`
@@ -95,7 +98,7 @@ func TestRealAPIIntegration(t *testing.T) {
 	bobWS := c.websocket(bob.Tokens.AccessToken)
 	defer bobWS.Close()
 	bobObserver := c.websocket(bob.Tokens.AccessToken)
-	first := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: bob.User.ID, DeviceId: "alice-integration-device", Timestamp: time.Now().UnixMilli(), Payload: []byte("hello Bob from Alice")}
+	first := &impb.Envelope{Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: bob.User.ID, DeviceId: "alice-integration-device", Timestamp: time.Now().UnixMilli(), Payload: textMessagePayload(t, "hello Bob from Alice")}
 	sendEnvelope(t, aliceWS, first)
 	ack := readEnvelope(t, aliceWS)
 	assertAck(t, ack, first.MessageId)
@@ -116,13 +119,13 @@ func TestRealAPIIntegration(t *testing.T) {
 	}
 	assertNoMessage(t, bobObserver)
 	_ = bobObserver.Close()
-	reply := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: alice.User.ID, DeviceId: "bob-integration-device", Payload: []byte("hello Alice from Bob")}
+	reply := &impb.Envelope{Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: alice.User.ID, DeviceId: "bob-integration-device", Payload: textMessagePayload(t, "hello Alice from Bob")}
 	sendEnvelope(t, bobWS, reply)
 	assertAck(t, readEnvelope(t, bobWS), reply.MessageId)
 	if got := readEnvelopeType(t, aliceWS, impb.Envelope_MESSAGE); got.MessageId != reply.MessageId || !bytes.Equal(got.Payload, reply.Payload) {
 		t.Fatalf("unexpected reverse message: %v", got)
 	}
-	offline := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: mallory.User.ID, DeviceId: "alice-integration-device", Payload: []byte("offline message for Mallory")}
+	offline := &impb.Envelope{Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: mallory.User.ID, DeviceId: "alice-integration-device", Payload: textMessagePayload(t, "offline message for Mallory")}
 	sendEnvelope(t, aliceWS, offline)
 	assertAck(t, readEnvelope(t, aliceWS), offline.MessageId)
 	historyBody := c.requestJSON(http.MethodGet, "/api/v1/messages?peer_id="+alice.User.ID+"&after_id=0&limit=20", mallory.Tokens.AccessToken, nil, http.StatusOK)
@@ -151,6 +154,7 @@ func TestRealAPIIntegration(t *testing.T) {
 
 	c.verifyReadReceipts(suffix)
 	c.verifyFileTransfer(alice, bob, mallory)
+	c.verifyCanceledUpload(alice, bob, suffix)
 	c.verifyActiveFileLimit(alice, bob)
 }
 
@@ -282,18 +286,27 @@ func readEnvelope(t *testing.T, conn *websocket.Conn) *impb.Envelope {
 }
 func assertAck(t *testing.T, envelope *impb.Envelope, messageID string) {
 	t.Helper()
-	if envelope.Type != impb.Envelope_ACK || envelope.MessageId != messageID {
+	if envelope.Version != 2 || envelope.Type != impb.Envelope_ACK || envelope.MessageId != messageID {
 		t.Fatalf("expected ACK for %s, got %v", messageID, envelope)
 	}
 }
 func parseCursor(t *testing.T, payload []byte) uint64 {
 	t.Helper()
-	cursor, err := strconv.ParseUint(string(payload), 10, 64)
-	if err != nil || cursor == 0 {
-		t.Fatalf("invalid ACK cursor %q: %v", payload, err)
+	var ack impb.AckPayload
+	if err := proto.Unmarshal(payload, &ack); err != nil || ack.Cursor == 0 {
+		t.Fatalf("invalid ACK cursor payload %x: %v", payload, err)
 	}
-	return cursor
+	return ack.Cursor
 }
+func textMessagePayload(t *testing.T, text string) []byte {
+	t.Helper()
+	payload, err := proto.Marshal(&impb.MessagePayload{Content: &impb.MessagePayload_Text{Text: text}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
 func assertNoMessage(t *testing.T, conn *websocket.Conn) {
 	t.Helper()
 	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
@@ -340,8 +353,8 @@ func (c *integrationClient) putChunk(token, fileID string, index int, chunk []by
 }
 func (c *integrationClient) verifyFileTransfer(alice, bob, mallory integrationAuth) {
 	plaintext := make([]byte, 150003)
-	for i := range plaintext {
-		plaintext[i] = byte((i*31 + 17) % 251)
+	if _, err := rand.Read(plaintext); err != nil {
+		c.t.Fatal(err)
 	}
 	sum := sha256.Sum256(plaintext)
 	file := c.initFile(alice, bob, "integration-payload.bin", int64(len(plaintext)), hex.EncodeToString(sum[:]), 64<<10, http.StatusCreated)
@@ -349,11 +362,17 @@ func (c *integrationClient) verifyFileTransfer(alice, bob, mallory integrationAu
 		c.t.Fatalf("expected three chunks, got %d", file.ChunkCount)
 	}
 	c.t.Logf("file init requires filename/size/sha256/recipient_id/chunk_size and returns data as file metadata; id=%s chunks=%d", file.ID, file.ChunkCount)
+	var uploads sync.WaitGroup
 	for index, offset := 0, 0; offset < len(plaintext); index++ {
 		end := min(offset+int(file.ChunkSize), len(plaintext))
-		c.putChunk(alice.Tokens.AccessToken, file.ID, index, plaintext[offset:end], http.StatusOK)
+		uploads.Add(1)
+		go func(index, offset, end int) {
+			defer uploads.Done()
+			c.putChunk(alice.Tokens.AccessToken, file.ID, index, plaintext[offset:end], http.StatusOK)
+		}(index, offset, end)
 		offset = end
 	}
+	uploads.Wait()
 	statusBody := c.requestJSON(http.MethodGet, "/api/v1/files/"+file.ID, bob.Tokens.AccessToken, nil, http.StatusOK)
 	var status struct {
 		File           integrationFile `json:"file"`
@@ -383,9 +402,24 @@ func (c *integrationClient) verifyFileTransfer(alice, bob, mallory integrationAu
 	if hex.EncodeToString(downloadSum[:]) != file.SHA256 {
 		c.t.Fatal("downloaded SHA256 differs from initialized SHA256")
 	}
-	c.verifyCiphertext(file, plaintext)
+	c.verifyPlaintext(file, plaintext)
+	objectsBefore := countObjects(c.t, "contents/"+file.ContentID+"/")
+	shared := c.initFile(bob, mallory, "instant-copy.bin", int64(len(plaintext)), file.SHA256, 64<<10, http.StatusCreated)
+	if !shared.Instant || shared.Status != "completed" || shared.ID == file.ID || shared.ContentID != file.ContentID {
+		c.t.Fatalf("cross-user instant init did not create a completed logical reference: %+v", shared)
+	}
+	if got := countObjects(c.t, "contents/"+file.ContentID+"/"); got != objectsBefore {
+		c.t.Fatalf("instant init changed object count from %d to %d", objectsBefore, got)
+	}
 	c.requestJSON(http.MethodDelete, "/api/v1/files/"+file.ID, alice.Tokens.AccessToken, nil, http.StatusNoContent)
 	c.requestJSON(http.MethodGet, "/api/v1/files/"+file.ID, bob.Tokens.AccessToken, nil, http.StatusNotFound)
+	if downloaded := c.download(mallory.Tokens.AccessToken, shared.ID, http.StatusOK); !bytes.Equal(downloaded, plaintext) {
+		c.t.Fatal("shared content changed after deleting another reference")
+	}
+	c.requestJSON(http.MethodDelete, "/api/v1/files/"+shared.ID, bob.Tokens.AccessToken, nil, http.StatusNoContent)
+	if got := countObjects(c.t, "contents/"+file.ContentID+"/"); got != 0 {
+		c.t.Fatalf("last reference deletion left %d objects", got)
+	}
 }
 func (c *integrationClient) download(token, fileID string, wantStatus int) []byte {
 	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/v1/files/"+fileID+"/download", nil)
@@ -407,13 +441,13 @@ func (c *integrationClient) download(token, fileID string, wantStatus int) []byt
 	}
 	return body
 }
-func (c *integrationClient) verifyCiphertext(file integrationFile, plaintext []byte) {
+func (c *integrationClient) verifyPlaintext(file integrationFile, plaintext []byte) {
 	endpoint := os.Getenv("INTEGRATION_MINIO_ENDPOINT")
 	accessKey := os.Getenv("INTEGRATION_MINIO_ACCESS_KEY")
 	secretKey := os.Getenv("INTEGRATION_MINIO_SECRET_KEY")
 	bucket := os.Getenv("INTEGRATION_MINIO_BUCKET")
 	if endpoint == "" || accessKey == "" || secretKey == "" || bucket == "" {
-		c.t.Fatal("INTEGRATION_MINIO_ENDPOINT/ACCESS_KEY/SECRET_KEY/BUCKET are required for ciphertext verification")
+		c.t.Fatal("INTEGRATION_MINIO_ENDPOINT/ACCESS_KEY/SECRET_KEY/BUCKET are required for plaintext verification")
 	}
 	client, err := minio.New(endpoint, &minio.Options{Creds: credentials.NewStaticV4(accessKey, secretKey, ""), Secure: false})
 	if err != nil {
@@ -421,7 +455,7 @@ func (c *integrationClient) verifyCiphertext(file integrationFile, plaintext []b
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	objects := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: "files/" + file.ID + "/", Recursive: true})
+	objects := client.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: "contents/" + file.ContentID + "/", Recursive: true})
 	count := 0
 	for info := range objects {
 		if info.Err != nil {
@@ -431,24 +465,65 @@ func (c *integrationClient) verifyCiphertext(file integrationFile, plaintext []b
 		if err != nil {
 			c.t.Fatal(err)
 		}
-		ciphertext, err := io.ReadAll(io.LimitReader(object, int64(file.ChunkSize+17)))
+		stored, err := io.ReadAll(io.LimitReader(object, int64(file.ChunkSize+1)))
 		object.Close()
 		if err != nil {
 			c.t.Fatal(err)
 		}
-		if bytes.Contains(ciphertext, plaintext[:64]) || bytes.Contains(ciphertext, plaintext[64<<10:64<<10+64]) {
-			c.t.Fatalf("MinIO object %s contains recognizable plaintext", info.Key)
-		}
-		if len(ciphertext) <= 16 {
-			c.t.Fatalf("MinIO object %s is too short", info.Key)
+		start := count * int(file.ChunkSize)
+		end := min(start+int(file.ChunkSize), len(plaintext))
+		if !bytes.Equal(stored, plaintext[start:end]) {
+			c.t.Fatalf("MinIO object %s is not the expected plaintext chunk", info.Key)
 		}
 		count++
 	}
 	if count != file.ChunkCount {
-		c.t.Fatalf("found %d encrypted objects, expected %d", count, file.ChunkCount)
+		c.t.Fatalf("found %d plaintext objects, expected %d", count, file.ChunkCount)
 	}
-	c.t.Logf("verified %d MinIO objects are ciphertext, not plaintext", count)
+	c.t.Logf("verified %d MinIO objects are plaintext", count)
 }
+func (c *integrationClient) verifyCanceledUpload(alice, bob integrationAuth, suffix string) {
+	plaintext := bytes.Repeat([]byte{0x5a}, 128<<10)
+	copy(plaintext, suffix)
+	sum := sha256.Sum256(plaintext)
+	file := c.initFile(alice, bob, "canceled.bin", int64(len(plaintext)), hex.EncodeToString(sum[:]), 64<<10, http.StatusCreated)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader, writer := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+"/api/v1/files/"+file.ID+"/chunks/0", reader)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+alice.Tokens.AccessToken)
+	chunkSum := sha256.Sum256(plaintext[:64<<10])
+	req.Header.Set("X-Chunk-SHA256", hex.EncodeToString(chunkSum[:]))
+	go func() {
+		_, _ = writer.Write(plaintext[:1024])
+		<-ctx.Done()
+		_ = writer.CloseWithError(ctx.Err())
+	}()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	resp, err := c.http.Do(req)
+	if err == nil {
+		resp.Body.Close()
+		c.t.Fatal("canceled chunk request unexpectedly succeeded")
+	}
+	body := c.requestJSON(http.MethodGet, "/api/v1/files/"+file.ID, alice.Tokens.AccessToken, nil, http.StatusOK)
+	var status struct {
+		UploadedChunks []int `json:"uploaded_chunks"`
+	}
+	decodeData(c.t, body, &status)
+	if len(status.UploadedChunks) != 0 {
+		c.t.Fatalf("canceled upload committed chunks: %v", status.UploadedChunks)
+	}
+	if got := countObjects(c.t, "contents/"+file.ContentID+"/"); got != 0 {
+		c.t.Fatalf("canceled upload left %d objects", got)
+	}
+	c.requestJSON(http.MethodDelete, "/api/v1/files/"+file.ID, alice.Tokens.AccessToken, nil, http.StatusNoContent)
+}
+
 func (c *integrationClient) verifyActiveFileLimit(alice, bob integrationAuth) {
 	sum := sha256.Sum256([]byte{1})
 	files := make([]integrationFile, 0, 3)
@@ -458,7 +533,14 @@ func (c *integrationClient) verifyActiveFileLimit(alice, bob integrationAuth) {
 		}
 	}()
 	for i := 0; i < 3; i++ {
-		files = append(files, c.initFile(alice, bob, fmt.Sprintf("active-%d.bin", i), 1, hex.EncodeToString(sum[:]), 64<<10, http.StatusCreated))
+		chunkSize := int64(64 << 10)
+		if i == 0 {
+			chunkSize = 0
+		}
+		files = append(files, c.initFile(alice, bob, fmt.Sprintf("active-%d.bin", i), 1, hex.EncodeToString(sum[:]), chunkSize, http.StatusCreated))
+	}
+	if files[0].ChunkSize != 5<<20 {
+		c.t.Fatalf("default chunk size = %d, want 5 MiB", files[0].ChunkSize)
 	}
 	c.initFile(alice, bob, "active-overflow.bin", 1, hex.EncodeToString(sum[:]), 64<<10, http.StatusTooManyRequests)
 	c.t.Log("verified default active file limit: three accepted, fourth rejected with HTTP 429")

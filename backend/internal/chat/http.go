@@ -68,7 +68,7 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	event := &impb.Envelope{
-		Version:        1,
+		Version:        protocolVersion,
 		Type:           impb.Envelope_READ,
 		ConversationId: receipt.ConversationID,
 		SenderId:       readerID,
@@ -139,24 +139,24 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if kind != websocket.BinaryMessage {
-			h.sendError(c, "binary protobuf frames required")
+			h.sendError(c, "invalid_frame", "binary protobuf frames required")
 			continue
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(75 * time.Second))
 		e := &impb.Envelope{}
 		if err := proto.Unmarshal(data, e); err != nil {
-			h.sendError(c, "invalid protobuf envelope")
+			h.sendError(c, "invalid_envelope", "invalid protobuf envelope")
 			continue
 		}
 		if e.Type == impb.Envelope_PING {
-			c.enqueue(&impb.Envelope{Version: 1, Type: impb.Envelope_PONG, Timestamp: time.Now().UnixMilli()})
+			c.enqueue(&impb.Envelope{Version: protocolVersion, Type: impb.Envelope_PONG, Timestamp: time.Now().UnixMilli()})
 			continue
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		saved, err := h.service.SaveMessage(ctx, userID, e)
 		cancel()
 		if err != nil {
-			h.sendError(c, "message rejected")
+			h.sendError(c, "message_rejected", "message rejected")
 			h.log.Warn("message rejected", "user_id", userID, "error", err)
 			continue
 		}
@@ -168,6 +168,7 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
-func (h *Handler) sendError(c *client, message string) {
-	c.enqueue(&impb.Envelope{Version: 1, Type: impb.Envelope_ERROR, Timestamp: time.Now().UnixMilli(), Payload: []byte(message)})
+func (h *Handler) sendError(c *client, code, message string) {
+	payload, _ := proto.Marshal(&impb.ErrorPayload{Code: code, Message: message})
+	c.enqueue(&impb.Envelope{Version: protocolVersion, Type: impb.Envelope_ERROR, Timestamp: time.Now().UnixMilli(), Payload: payload})
 }

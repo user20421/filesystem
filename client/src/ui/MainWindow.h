@@ -16,7 +16,6 @@ class QLineEdit;
 class QListWidget;
 class QProgressBar;
 class QPushButton;
-class QSpinBox;
 class QStackedWidget;
 class QTextBrowser;
 class QTreeWidget;
@@ -40,7 +39,6 @@ public:
     TransferManager *transferManager() const { return m_transfers; }
     void showTransfersView();
     void showChatView();
-    void populateDemoData();
 
     using DirectoryOpener = std::function<bool(const QUrl &)>;
     static void setDirectoryOpenerForTests(DirectoryOpener opener);
@@ -49,6 +47,7 @@ signals:
     void connectionStateChanged(const QString &state);
     void unreadCountChanged(int count);
     void noticeChanged(const QString &notice);
+    void logoutCompleted();
     void exitRequested();
 
 private:
@@ -68,7 +67,7 @@ private:
     void scheduleReconnect();
     void sendText();
     void chooseFile();
-    bool sendPayload(const QString &peerId, const QJsonObject &payload);
+    bool sendPayload(const QString &peerId, const ChatMessage &message);
     void handleWireMessage(const WireMessage &wire);
     void appendChat(const QString &peerId, const ChatMessage &message);
     void renderMessage(const ChatMessage &message);
@@ -106,11 +105,11 @@ private:
     QStackedWidget *m_views = nullptr;
     QPushButton *m_chatNav = nullptr;
     QPushButton *m_transferNav = nullptr;
+    QPushButton *m_exitButton = nullptr;
     QPushButton *m_deleteAccountButton = nullptr;
     QTreeWidget *m_transferList = nullptr;
     QLabel *m_transferStats = nullptr;
     QLabel *m_transferEmpty = nullptr;
-    QSpinBox *m_concurrency = nullptr;
     QTimer *m_usersTimer = nullptr;
     QTimer *m_historyTimer = nullptr;
     QTimer *m_reconnectTimer = nullptr;

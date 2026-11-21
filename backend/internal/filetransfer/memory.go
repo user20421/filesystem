@@ -6,15 +6,12 @@ import (
 	"sync"
 )
 
-// AES-GCM adds a 16-byte authentication tag to every plaintext chunk.
-const chunkCiphertextOverhead = int64(16)
-
-// Account for read buffers, hashes, nonces, and object-store bookkeeping in
-// addition to the separately allocated plaintext and ciphertext buffers.
+// Account for the single plaintext buffer plus hashing and object-store
+// bookkeeping. Plain chunks are never duplicated for encryption.
 const chunkOperationOverhead = int64(64 << 10)
 
 func chunkMemoryWeight(plaintextSize int64) int64 {
-	return plaintextSize + plaintextSize + chunkCiphertextOverhead + chunkOperationOverhead
+	return plaintextSize + chunkOperationOverhead
 }
 
 type memoryBudget struct {

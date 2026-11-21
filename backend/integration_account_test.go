@@ -53,17 +53,28 @@ func TestRealAccountDeletionIntegration(t *testing.T) {
 
 	bidirectionalMessage(t, deletedWS, peerWS, deleted.User.ID, peer.User.ID, "from deleted")
 	bidirectionalMessage(t, peerWS, deletedWS, peer.User.ID, deleted.User.ID, "to deleted")
-	unrelatedMessage := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: other.User.ID, DeviceId: "peer-device", Payload: []byte("unrelated")}
+	unrelatedMessage := &impb.Envelope{Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: other.User.ID, DeviceId: "peer-device", Payload: textMessagePayload(t, "unrelated")}
 	sendEnvelope(t, peerWS, unrelatedMessage)
 	assertAck(t, readEnvelope(t, peerWS), unrelatedMessage.MessageId)
 
-	outgoing := c.integrationUploadedFile(deleted, peer, "outgoing.bin")
-	incoming := c.integrationUploadedFile(peer, deleted, "incoming.bin")
-	unrelated := c.integrationUploadedFile(peer, other, "unrelated.bin")
+	outgoingText := "outgoing-" + suffix
+	incomingText := "incoming-" + suffix
+	unrelatedText := "unrelated-" + suffix
+	sharedText := "shared-" + suffix
+	outgoing := c.integrationUploadedFile(deleted, peer, "outgoing.bin", outgoingText)
+	incoming := c.integrationUploadedFile(peer, deleted, "incoming.bin", incomingText)
+	unrelated := c.integrationUploadedFile(peer, other, "unrelated.bin", unrelatedText)
+	sharedSource := c.integrationUploadedFile(deleted, peer, "shared.bin", sharedText)
 	c.requestJSON(http.MethodPost, "/api/v1/files/"+unrelated.ID+"/complete", peer.Tokens.AccessToken, map[string]any{}, http.StatusOK)
-	for _, id := range []string{outgoing.ID, incoming.ID, unrelated.ID} {
-		if got := countObjects(t, "files/"+id+"/"); got != 1 {
-			t.Fatalf("file %s has %d objects before deletion, want 1", id, got)
+	c.requestJSON(http.MethodPost, "/api/v1/files/"+sharedSource.ID+"/complete", deleted.Tokens.AccessToken, map[string]any{}, http.StatusOK)
+	sharedSum := fmt.Sprintf("%x", sha256.Sum256([]byte(sharedText)))
+	sharedRef := c.initFile(peer, other, "shared-copy.bin", int64(len(sharedText)), sharedSum, 64<<10, http.StatusCreated)
+	if !sharedRef.Instant || sharedRef.ContentID != sharedSource.ContentID {
+		t.Fatalf("shared account reference was not instant: %+v", sharedRef)
+	}
+	for _, file := range []integrationFile{outgoing, incoming, unrelated, sharedSource} {
+		if got := countObjects(t, "contents/"+file.ContentID+"/"); got != 1 {
+			t.Fatalf("content %s has %d objects before deletion, want 1", file.ContentID, got)
 		}
 	}
 	deletedTicket := c.issueTicket(deleted.Tokens.AccessToken)
@@ -85,19 +96,30 @@ func TestRealAccountDeletionIntegration(t *testing.T) {
 	c.requestJSON(http.MethodGet, "/api/v1/files/"+outgoing.ID, peer.Tokens.AccessToken, nil, http.StatusNotFound)
 	c.requestJSON(http.MethodGet, "/api/v1/files/"+incoming.ID, peer.Tokens.AccessToken, nil, http.StatusNotFound)
 	c.requestJSON(http.MethodGet, "/api/v1/files/"+unrelated.ID, other.Tokens.AccessToken, nil, http.StatusOK)
-	if downloaded := c.download(other.Tokens.AccessToken, unrelated.ID, http.StatusOK); string(downloaded) != "unrelated" {
+	if downloaded := c.download(other.Tokens.AccessToken, unrelated.ID, http.StatusOK); string(downloaded) != unrelatedText {
 		t.Fatalf("unrelated file changed: %q", downloaded)
 	}
-	for _, id := range []string{outgoing.ID, incoming.ID} {
-		if got := countObjects(t, "files/"+id+"/"); got != 0 {
-			t.Fatalf("deleted file %s still has %d MinIO objects", id, got)
+	for _, file := range []integrationFile{outgoing, incoming} {
+		if got := countObjects(t, "contents/"+file.ContentID+"/"); got != 0 {
+			t.Fatalf("deleted content %s still has %d MinIO objects", file.ContentID, got)
 		}
 	}
-	if got := countObjects(t, "files/"+unrelated.ID+"/"); got != 1 {
-		t.Fatalf("unrelated file has %d MinIO objects after deletion, want 1", got)
+	if got := countObjects(t, "contents/"+unrelated.ContentID+"/"); got != 1 {
+		t.Fatalf("unrelated content has %d MinIO objects after deletion, want 1", got)
+	}
+	c.requestJSON(http.MethodGet, "/api/v1/files/"+sharedSource.ID, peer.Tokens.AccessToken, nil, http.StatusNotFound)
+	if downloaded := c.download(other.Tokens.AccessToken, sharedRef.ID, http.StatusOK); string(downloaded) != sharedText {
+		t.Fatalf("shared content changed after account deletion: %q", downloaded)
+	}
+	if got := countObjects(t, "contents/"+sharedRef.ContentID+"/"); got != 1 {
+		t.Fatalf("shared content has %d objects after account deletion, want 1", got)
+	}
+	c.requestJSON(http.MethodDelete, "/api/v1/files/"+sharedRef.ID, peer.Tokens.AccessToken, nil, http.StatusNoContent)
+	if got := countObjects(t, "contents/"+sharedRef.ContentID+"/"); got != 0 {
+		t.Fatalf("last shared reference left %d objects", got)
 	}
 
-	afterDelete := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: other.User.ID, DeviceId: "peer-device", Payload: []byte("peer remains active")}
+	afterDelete := &impb.Envelope{Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: other.User.ID, DeviceId: "peer-device", Payload: textMessagePayload(t, "peer remains active")}
 	sendEnvelope(t, peerWS, afterDelete)
 	assertAck(t, readEnvelope(t, peerWS), afterDelete.MessageId)
 	if got := len(c.history(other.Tokens.AccessToken, peer.User.ID)); got != 2 {
@@ -109,16 +131,16 @@ func TestRealAccountDeletionIntegration(t *testing.T) {
 	assertDBCount(t, db, `SELECT COUNT(1) FROM messages WHERE sender_id=? OR recipient_id=?`, 0, deleted.User.ID, deleted.User.ID)
 	assertDBCount(t, db, `SELECT COUNT(1) FROM conversations WHERE user_low_id=? OR user_high_id=?`, 0, deleted.User.ID, deleted.User.ID)
 	assertDBCount(t, db, `SELECT COUNT(1) FROM files WHERE owner_id=? OR recipient_id=?`, 0, deleted.User.ID, deleted.User.ID)
-	assertDBCount(t, db, `SELECT COUNT(1) FROM file_chunks c JOIN files f ON f.id=c.file_id WHERE f.owner_id=? OR f.recipient_id=?`, 0, deleted.User.ID, deleted.User.ID)
+	assertDBCount(t, db, `SELECT COUNT(1) FROM file_chunks c JOIN files f ON f.content_id=c.content_id WHERE f.owner_id=? OR f.recipient_id=?`, 0, deleted.User.ID, deleted.User.ID)
 	assertDBCount(t, db, `SELECT COUNT(1) FROM users WHERE id IN (?,?)`, 2, peer.User.ID, other.User.ID)
 	assertDBCount(t, db, `SELECT COUNT(1) FROM messages WHERE (sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)`, 2, peer.User.ID, other.User.ID, other.User.ID, peer.User.ID)
 	assertDBCount(t, db, `SELECT COUNT(1) FROM files WHERE id=?`, 1, unrelated.ID)
-	assertDBCount(t, db, `SELECT COUNT(1) FROM file_chunks WHERE file_id=?`, 1, unrelated.ID)
+	assertDBCount(t, db, `SELECT COUNT(1) FROM file_chunks WHERE content_id=?`, 1, unrelated.ContentID)
 }
 
 func bidirectionalMessage(t *testing.T, from, to *websocket.Conn, senderID, recipientID, payload string) {
 	t.Helper()
-	message := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: recipientID, DeviceId: "account-integration", Payload: []byte(payload)}
+	message := &impb.Envelope{Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(), RecipientId: recipientID, DeviceId: "account-integration", Payload: textMessagePayload(t, payload)}
 	sendEnvelope(t, from, message)
 	assertAck(t, readEnvelope(t, from), message.MessageId)
 	delivered := readEnvelope(t, to)
@@ -127,8 +149,8 @@ func bidirectionalMessage(t *testing.T, from, to *websocket.Conn, senderID, reci
 	}
 }
 
-func (c *integrationClient) integrationUploadedFile(owner, recipient integrationAuth, name string) integrationFile {
-	plaintext := []byte(strings.TrimSuffix(name, ".bin"))
+func (c *integrationClient) integrationUploadedFile(owner, recipient integrationAuth, name, content string) integrationFile {
+	plaintext := []byte(content)
 	digest := fmt.Sprintf("%x", sha256.Sum256(plaintext))
 	file := c.initFile(owner, recipient, name, int64(len(plaintext)), digest, 64<<10, http.StatusCreated)
 	c.putChunk(owner.Tokens.AccessToken, file.ID, 0, plaintext, http.StatusOK)

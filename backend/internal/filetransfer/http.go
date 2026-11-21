@@ -76,6 +76,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 	f, err := h.service.Complete(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()))
 	if err != nil {
+		h.log.Error("file completion failed", "file_id", r.PathValue("file_id"), "error", err)
 		httpx.Fail(w, r, err)
 		return
 	}

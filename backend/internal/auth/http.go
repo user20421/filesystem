@@ -13,14 +13,24 @@ type userContextKey struct{}
 func UserID(ctx context.Context) string { id, _ := ctx.Value(userContextKey{}).(string); return id }
 
 type Handler struct {
-	service    *Service
-	lookupUser func(context.Context, string) (User, error)
+	service         *Service
+	lookupUser      func(context.Context, string) (User, error)
+	registerLimiter *rateLimiter
+	loginLimiter    *rateLimiter
 }
 
-func NewHandler(service *Service) *Handler {
-	return &Handler{service: service, lookupUser: service.Me}
+func NewHandler(service *Service, registerLimit, loginLimit RateLimitConfig) *Handler {
+	return &Handler{
+		service:         service,
+		lookupUser:      service.Me,
+		registerLimiter: newRateLimiter(registerLimit),
+		loginLimiter:    newRateLimiter(loginLimit),
+	}
 }
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	if !allowRequest(w, r, h.registerLimiter, httpx.ClientIP(r)) {
+		return
+	}
 	var input struct {
 		Username    string `json:"username"`
 		DisplayName string `json:"display_name"`
@@ -46,6 +56,10 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.Fail(w, r, err)
 		return
 	}
+	key := httpx.ClientIP(r) + "\x00" + normalizeUsername(input.Username)
+	if !allowRequest(w, r, h.loginLimiter, key) {
+		return
+	}
 	result, err := h.service.Login(r.Context(), input.Username, input.Password)
 	if err != nil {
 		httpx.Fail(w, r, err)
@@ -67,6 +81,20 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.Data(w, 200, result)
+}
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := httpx.Decode(w, r, &input); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	if err := h.service.Logout(r.Context(), UserID(r.Context()), input.RefreshToken); err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	user, err := h.service.Me(r.Context(), UserID(r.Context()))

@@ -24,14 +24,16 @@ services:
       MINIO_BUCKET: secure-im-stress-files
       MINIO_USE_SSL: "false"
       JWT_SECRET: ${STRESS_JWT_SECRET:?Set STRESS_JWT_SECRET in .env.stress}
-      FILE_KEK: ${STRESS_FILE_KEK:?Set STRESS_FILE_KEK in .env.stress}
       MAX_ACTIVE_FILES: 5
-      MAX_CHUNK_SIZE: 1048576
+      MAX_CHUNK_SIZE: 5242880
       MAX_FILE_SIZE: 5368709120
-      UPLOAD_CONCURRENCY: 64
+      UPLOAD_CONCURRENCY: ${STRESS_UPLOAD_CONCURRENCY:-96}
       FILE_MEMORY_BUDGET: 524288000
       ENABLE_DEBUG_STATS: "true"
       WS_MAX_CONNECTIONS: 50000
+      # Synthetic account provisioning must not be constrained by normal auth limits.
+      AUTH_REGISTER_RATE_LIMIT: 0
+      AUTH_LOGIN_RATE_LIMIT: 0
       GOMAXPROCS: 6
       # Go rejects decimal quantities; this is 2.4 GiB rounded up to bytes.
       GOMEMLIMIT: 2576980378
@@ -41,7 +43,7 @@ services:
     networks:
       - secure-im-net
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:8080/health"]
       interval: 5s
       timeout: 3s
       retries: 24

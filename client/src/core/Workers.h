@@ -23,17 +23,29 @@ void writeFile(const QString &path, const QByteArray &data, QObject *receiver,
 
 using StreamWriteCallback = std::function<void(bool, qint64, QString)>;
 class AsyncFileWriter final : public QObject {
+    Q_OBJECT
 public:
+    static constexpr qint64 MaxQueuedBytes = 1024 * 1024;
+
     AsyncFileWriter(const QString &path, qint64 expectedSize, QObject *receiver,
-                    StreamWriteCallback callback, QObject *parent = nullptr);
+                    StreamWriteCallback callback, QObject *parent = nullptr,
+                    int writeDelayMs = 0);
     ~AsyncFileWriter() override;
-    void append(const QByteArray &data);
+    bool append(const QByteArray &data);
     void finish();
+    qint64 queuedBytes() const { return m_queuedBytes; }
+    qint64 peakQueuedBytes() const { return m_peakQueuedBytes; }
+    qint64 availableBytes() const { return MaxQueuedBytes - m_queuedBytes; }
+
+signals:
+    void queuedBytesChanged(qint64 bytes);
 
 private:
     QThread *m_thread;
     QObject *m_worker;
     QPointer<QObject> m_receiver;
     StreamWriteCallback m_callback;
+    qint64 m_queuedBytes = 0;
+    qint64 m_peakQueuedBytes = 0;
 };
 }

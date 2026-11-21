@@ -16,6 +16,8 @@ import (
 	"secure-im/backend/internal/proto/impb"
 )
 
+const protocolVersion = 2
+
 type WSClient struct {
 	user      User
 	api       *APIClient
@@ -115,13 +117,23 @@ func (c *WSClient) readLoop(ctx context.Context, conn *websocket.Conn) {
 		now := time.Now()
 		switch envelope.Type {
 		case impb.Envelope_ACK:
+			var payload impb.AckPayload
+			if err := proto.Unmarshal(envelope.Payload, &payload); err != nil || payload.Cursor == 0 {
+				c.dataError(fmt.Errorf("invalid ACK payload for %s", envelope.MessageId))
+				continue
+			}
 			c.metrics.MessageAck(envelope.MessageId, now)
 		case impb.Envelope_MESSAGE:
 			c.metrics.MessageDelivered(envelope.MessageId, now)
 		case impb.Envelope_ERROR:
-			c.dataError(fmt.Errorf("server ERROR for %s: %s", envelope.MessageId, string(envelope.Payload)))
+			var payload impb.ErrorPayload
+			if err := proto.Unmarshal(envelope.Payload, &payload); err != nil {
+				c.dataError(fmt.Errorf("invalid ERROR payload for %s", envelope.MessageId))
+				continue
+			}
+			c.dataError(fmt.Errorf("server ERROR for %s: %s: %s", envelope.MessageId, payload.Code, payload.Message))
 		case impb.Envelope_PING:
-			pong := &impb.Envelope{Version: 1, Type: impb.Envelope_PONG, MessageId: envelope.MessageId}
+			pong := &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_PONG, MessageId: envelope.MessageId}
 			_ = c.Send(pong)
 		}
 	}
@@ -152,7 +164,7 @@ func (c *WSClient) Heartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(delay):
-			_ = c.Send(&impb.Envelope{Version: 1, Type: impb.Envelope_PING, MessageId: uuid.NewString(), DeviceId: "stress-" + c.user.Username})
+			_ = c.Send(&impb.Envelope{Version: protocolVersion, Type: impb.Envelope_PING, MessageId: uuid.NewString(), DeviceId: "stress-" + c.user.Username})
 			delay = time.Duration(15+random.Intn(26)) * time.Second
 		}
 	}
@@ -170,7 +182,12 @@ func (c *WSClient) Chat(ctx context.Context, partner User, rate float64) {
 		case <-time.After(wait):
 			id := uuid.NewString()
 			now := time.Now()
-			envelope := &impb.Envelope{Version: 1, Type: impb.Envelope_MESSAGE, MessageId: id, SenderId: c.user.ID, RecipientId: partner.ID, DeviceId: "stress-" + c.user.Username, Timestamp: now.UnixMilli(), Payload: []byte(fmt.Sprintf("stress %s %d", id, now.UnixNano()))}
+			payload, err := proto.Marshal(&impb.MessagePayload{Content: &impb.MessagePayload_Text{Text: fmt.Sprintf("stress %s %d", id, now.UnixNano())}})
+			if err != nil {
+				c.dataError(err)
+				continue
+			}
+			envelope := &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_MESSAGE, MessageId: id, SenderId: c.user.ID, RecipientId: partner.ID, DeviceId: "stress-" + c.user.Username, Timestamp: now.UnixMilli(), Payload: payload}
 			// Register before writing: a fast ACK/push can arrive before WriteMessage returns.
 			c.metrics.MessageSent(id, now)
 			_ = c.Send(envelope)

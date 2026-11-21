@@ -90,7 +90,7 @@ function Get-ServiceHealth {
 function Wait-ServiceHealth {
     param([int]$TimeoutSeconds = 180)
 
-    $services = @('mysql', 'redis', 'minio')
+    $services = @('mysql', 'minio')
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -102,7 +102,7 @@ function Wait-ServiceHealth {
         }
 
         if ($allHealthy) {
-            Write-Host 'MySQL, Redis, and MinIO are healthy.'
+            Write-Host 'MySQL and MinIO are healthy.'
             return
         }
         Start-Sleep -Seconds 3

@@ -32,18 +32,13 @@ function New-RandomBase64 {
     return [Convert]::ToBase64String($bytes)
 }
 
-# Persist cryptographic keys so existing refresh tokens and encrypted files
-# remain usable across backend restarts. This file is ignored by Git.
+# Persist the JWT secret so existing access tokens remain valid across backend
+# restarts. This file is ignored by Git.
 $jwtSecret = Get-LocalSetting 'JWT_SECRET'
-$fileKek = Get-LocalSetting 'FILE_KEK'
 $append = @()
 if (-not $jwtSecret) {
     $jwtSecret = New-RandomBase64 48
     $append += "JWT_SECRET=$jwtSecret"
-}
-if (-not $fileKek) {
-    $fileKek = New-RandomBase64 32
-    $append += "FILE_KEK=$fileKek"
 }
 if ($append.Count -gt 0) {
     [System.IO.File]::AppendAllLines($envFile, [string[]]$append, (New-Object System.Text.UTF8Encoding($false)))
@@ -67,7 +62,6 @@ $env:MINIO_SECRET_KEY = $minioPassword
 $env:MINIO_BUCKET = 'secure-im-files'
 $env:MINIO_USE_SSL = 'false'
 $env:JWT_SECRET = $jwtSecret
-$env:FILE_KEK = $fileKek
 $env:GOMODCACHE = Join-Path $PSScriptRoot '.cache/gomod'
 $env:GOCACHE = Join-Path $PSScriptRoot '.cache/gobuild'
 

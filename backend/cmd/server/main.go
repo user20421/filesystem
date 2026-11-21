@@ -53,12 +53,15 @@ func run(log *slog.Logger) error {
 	}
 	tokens := auth.NewTokenManager(cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	authService := auth.NewService(db, tokens)
-	authHTTP := auth.NewHandler(authService)
+	authHTTP := auth.NewHandler(authService,
+		auth.RateLimitConfig{Limit: cfg.RegisterRateLimit, Window: cfg.AuthRateLimitWindow, MaxKeys: cfg.AuthRateLimitMaxKeys},
+		auth.RateLimitConfig{Limit: cfg.LoginRateLimit, Window: cfg.AuthRateLimitWindow, MaxKeys: cfg.AuthRateLimitMaxKeys},
+	)
 	chatService := chat.NewService(db)
 	hub := chat.NewHub()
 	tickets := chat.NewTicketStore(cfg.WSTicketTTL)
 	chatHTTP := chat.NewHandler(chatService, tickets, hub, log, cfg.WSMaxConnections)
-	files := filetransfer.NewServiceWithMemoryBudget(db, objects, cfg.FileKEK, cfg.MaxActiveFiles, cfg.MaxChunkSize, cfg.MaxFileSize, cfg.UploadConcurrency, cfg.FileMemoryBudget)
+	files := filetransfer.NewServiceWithMemoryBudget(db, objects, cfg.MaxActiveFiles, cfg.MaxChunkSize, cfg.MaxFileSize, cfg.UploadConcurrency, cfg.FileMemoryBudget)
 	accountHTTP := account.NewHandler(account.NewService(db, files, hub.CloseUser, tickets.RevokeUser))
 	audit := func(r *http.Request, action, id string) {
 		store.Audit(r.Context(), db, auth.UserID(r.Context()), action, id, httpx.ClientIP(r))
@@ -103,6 +106,7 @@ func run(log *slog.Logger) error {
 	mux.HandleFunc("POST /api/v1/auth/login", authHTTP.Login)
 	mux.HandleFunc("POST /api/v1/auth/refresh", authHTTP.Refresh)
 	protect := func(handler http.HandlerFunc) http.Handler { return authHTTP.Middleware(handler) }
+	mux.Handle("POST /api/v1/auth/logout", protect(authHTTP.Logout))
 	mux.Handle("GET /api/v1/users/me", protect(authHTTP.Me))
 	mux.Handle("DELETE /api/v1/users/me", protect(accountHTTP.DeleteMe))
 	mux.Handle("GET /api/v1/users", protect(authHTTP.Users))

@@ -1,4 +1,5 @@
 #include "ApiClient.h"
+#include "MessagePayloadCodec.h"
 #include "LocalStore.h"
 #include "ProtobufWireCodec.h"
 #include "WebSocketClient.h"
@@ -215,16 +216,20 @@ void BackendIntegrationTest::realBackendFlow()
     outgoing.recipientId = recipient.user.id;
     outgoing.deviceId = QStringLiteral("qt-integration");
     outgoing.timestamp = QDateTime::currentMSecsSinceEpoch();
-    outgoing.payload = QJsonDocument(textPayload(realtimeText)).toJson(QJsonDocument::Compact);
+    ChatMessage text;
+    text.content = realtimeText;
     QString sendError;
+    QVERIFY2(MessagePayloadCodec::encode(text, &outgoing.payload, &sendError), qPrintable(sendError));
     QVERIFY2(senderSocket.send(outgoing, &sendError), qPrintable(sendError));
     QTRY_VERIFY_WITH_TIMEOUT(ackReceived && messageReceived, 15000);
     QVERIFY(ackReceived);
     QVERIFY(messageReceived);
     QCOMPARE(receivedMessage.senderId, loggedIn.user.id);
     QCOMPARE(receivedMessage.recipientId, recipient.user.id);
-    const QJsonObject receivedPayload = QJsonDocument::fromJson(receivedMessage.payload).object();
-    QCOMPARE(receivedPayload.value(QStringLiteral("text")).toString(), realtimeText);
+    ChatMessage receivedPayload;
+    QVERIFY2(MessagePayloadCodec::decode(receivedMessage.payload, &receivedPayload, &sendError),
+             qPrintable(sendError));
+    QCOMPARE(receivedPayload.content, realtimeText);
 
     QList<ChatMessage> realtimeHistory;
     QString historyError;
@@ -316,7 +321,7 @@ void BackendIntegrationTest::realBackendFlow()
     QTRY_VERIFY_WITH_TIMEOUT(initDone, 10000);
     QVERIFY2(initOk, qPrintable(initError));
     QVERIFY(!file.fileId.isEmpty());
-    QCOMPARE(file.chunkSize, 4 * 1024 * 1024);
+    QCOMPARE(file.chunkSize, 5 * 1024 * 1024);
 
     FileStatus initialStatus;
     QString statusError;
@@ -373,15 +378,15 @@ void BackendIntegrationTest::realBackendFlow()
     bool downloadOk = false;
     bool downloadDone = false;
     QString downloadError;
-    QNetworkReply *downloadReply = api.downloadFile(file.fileId, [&](bool ok, const QString &error) {
+    ApiRequestHandle *downloadRequest = api.downloadFile(file.fileId, [&](bool ok, const QString &error) {
         downloadOk = ok;
         if (ok)
-            downloaded.append(downloadReply->readAll());
+            downloaded.append(downloadRequest->readAll());
         downloadError = error;
         downloadDone = true;
     });
-    QObject::connect(downloadReply, &QNetworkReply::readyRead, &api, [&] {
-        downloaded.append(downloadReply->readAll());
+    QObject::connect(downloadRequest, &ApiRequestHandle::readyRead, &api, [&] {
+        downloaded.append(downloadRequest->readAll());
     });
     QTRY_VERIFY_WITH_TIMEOUT(downloadDone, 10000);
     QVERIFY2(downloadOk, qPrintable(downloadError));

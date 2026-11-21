@@ -7,7 +7,7 @@
 struct WireMessage {
     enum class Type : int { Unspecified = 0, Message = 1, Ack = 2, Error = 3, Ping = 4, Pong = 5, Read = 6 };
 
-    quint32 version = 1;
+    quint32 version = 2;
     Type type = Type::Message;
     QString messageId;
     QString conversationId;
@@ -18,6 +18,8 @@ struct WireMessage {
     QByteArray payload;
     QString cursor;
     qint64 readAt = 0;
+    QString errorCode;
+    QString errorMessage;
 };
 
 class WireCodec {

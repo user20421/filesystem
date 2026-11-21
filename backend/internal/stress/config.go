@@ -38,7 +38,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{Server: DefaultServer, EnvFile: "deploy/.env", ReportRoot: "runtime/stress-reports", Target: 1000,
 		IdlePercent: 80, ChatPercent: 18, FilePercent: 2, ConnectionsPerS: 200, StableDuration: 5 * time.Minute,
-		ChatRate: 0.05, FileSize: 100 << 20, ChunkSize: 1 << 20, FileWorkers: 64, FileQueueSize: 128,
+		ChatRate: 0.05, FileSize: 100 << 20, ChunkSize: 5 << 20, FileWorkers: 96, FileQueueSize: 128,
 		FileBudgetMiB: DefaultFileBudgetMiB, BackendMemoryLimitMiB: 3072, DrainTimeout: 5 * time.Minute, RampTimeout: 45 * time.Second, DockerContainer: "secure-im-stress-backend"}
 }
 

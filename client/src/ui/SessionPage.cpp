@@ -21,6 +21,8 @@ SessionPage::SessionPage(std::unique_ptr<SessionContext> context, QWidget *paren
     connect(m_login, &LoginPage::authenticated, this, [this](const AuthSession &session) {
         startSession(session);
     });
+    connect(m_context->api(), &ApiClient::authenticationFailed, this,
+            [this](const QString &error) { handleAuthenticationFailed(error); });
     const AuthSession saved = m_context->store()->loadSession();
     if (!saved.accessToken.isEmpty() && !saved.user.id.isEmpty())
         startSession(saved);
@@ -38,8 +40,7 @@ void SessionPage::startSession(const AuthSession &session, bool online)
     if (m_closing || m_chat)
         return;
     m_context->setSession(session);
-    // Both fresh authentication and restored sessions make custom usernames
-    // eligible contacts. Demo sessions never enter the persistent registry.
+    // Fresh authentication and restored sessions share this user's private registry.
     if (online)
         m_context->store()->rememberAccount(session.user);
     m_chat = new MainWindow(m_context->api(), m_context->store(), m_context->codec(),
@@ -50,15 +51,40 @@ void SessionPage::startSession(const AuthSession &session, bool online)
     connect(m_chat, &MainWindow::connectionStateChanged, this,
             [this](const QString &) { emit connectionStateChanged(); });
     connect(m_chat, &MainWindow::unreadCountChanged, this, &SessionPage::unreadCountChanged);
+    connect(m_chat, &MainWindow::logoutCompleted, this, [this] { handleLogout(); });
     connect(m_chat, &MainWindow::exitRequested, this, &SessionPage::exitRequested);
     emit titleChanged();
     emit connectionStateChanged();
 }
 
-void SessionPage::startDemo(const AuthSession &session)
+void SessionPage::handleAuthenticationFailed(const QString &error)
 {
-    startSession(session, false);
-    m_chat->populateDemoData();
+    returnToLogin(QStringLiteral("登录会话已失效：") + error);
+}
+
+void SessionPage::handleLogout()
+{
+    returnToLogin({});
+}
+
+void SessionPage::returnToLogin(const QString &error)
+{
+    if (m_closing)
+        return;
+    m_context->setSession({});
+    m_context->store()->clearSession();
+    if (m_chat) {
+        MainWindow *chat = m_chat;
+        m_chat = nullptr;
+        chat->shutdown();
+        m_stack->removeWidget(chat);
+        chat->deleteLater();
+    }
+    m_login->showError(error);
+    m_stack->setCurrentWidget(m_login);
+    emit titleChanged();
+    emit connectionStateChanged();
+    emit unreadCountChanged(0);
 }
 
 void SessionPage::setActive(bool active)

@@ -21,7 +21,6 @@ public:
     MainWindow *chatPage() const { return m_chat; }
     bool isAuthenticated() const { return m_chat != nullptr; }
     void startSession(const AuthSession &session, bool online = true);
-    void startDemo(const AuthSession &session);
     void setActive(bool active);
     void shutdown();
     bool isClosing() const { return m_closing; }
@@ -33,6 +32,10 @@ signals:
     void exitRequested();
 
 private:
+    void handleAuthenticationFailed(const QString &error);
+    void handleLogout();
+    void returnToLogin(const QString &error);
+
     std::unique_ptr<SessionContext> m_context;
     QStackedWidget *m_stack;
     LoginPage *m_login;

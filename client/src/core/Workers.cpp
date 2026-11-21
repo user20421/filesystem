@@ -8,6 +8,16 @@
 #include <QThreadPool>
 
 namespace {
+QThreadPool *fileWorkerPool()
+{
+    static const bool configured = [] {
+        QThreadPool::globalInstance()->setMaxThreadCount(4);
+        return true;
+    }();
+    Q_UNUSED(configured);
+    return QThreadPool::globalInstance();
+}
+
 template<typename Result>
 void deliver(QObject *receiver, Result callback)
 {
@@ -111,8 +121,8 @@ private:
 class FileWriterWorker final : public QObject {
     Q_OBJECT
 public:
-    FileWriterWorker(const QString &path, qint64 expectedSize)
-        : m_file(path), m_expectedSize(expectedSize) {}
+    FileWriterWorker(const QString &path, qint64 expectedSize, int writeDelayMs)
+        : m_file(path), m_expectedSize(expectedSize), m_writeDelayMs(writeDelayMs) {}
 
     void open()
     {
@@ -127,11 +137,14 @@ public:
     {
         if (!m_open || m_failed)
             return;
+        if (m_writeDelayMs > 0)
+            QThread::msleep(static_cast<unsigned long>(m_writeDelayMs));
         if (m_file.write(data) != data.size()) {
             fail(m_file.errorString());
             return;
         }
         m_bytes += data.size();
+        emit written(data.size());
     }
 
     void finish()
@@ -161,6 +174,7 @@ public:
     }
 
 signals:
+    void written(qint64 bytes);
     void completed(bool ok, qint64 bytes, const QString &error);
 
 private:
@@ -178,6 +192,7 @@ private:
 
     QSaveFile m_file;
     qint64 m_expectedSize;
+    int m_writeDelayMs = 0;
     qint64 m_bytes = 0;
     bool m_open = false;
     bool m_failed = false;
@@ -187,13 +202,17 @@ private:
 
 Workers::AsyncFileWriter::AsyncFileWriter(const QString &path, qint64 expectedSize,
                                           QObject *receiver, StreamWriteCallback callback,
-                                          QObject *parent)
+                                          QObject *parent, int writeDelayMs)
     : QObject(parent), m_thread(new QThread), m_receiver(receiver),
       m_callback(std::move(callback))
 {
-    auto *worker = new FileWriterWorker(path, expectedSize);
+    auto *worker = new FileWriterWorker(path, expectedSize, writeDelayMs);
     m_worker = worker;
     worker->moveToThread(m_thread);
+    connect(worker, &FileWriterWorker::written, this, [this](qint64 bytes) {
+        m_queuedBytes = qMax<qint64>(0, m_queuedBytes - bytes);
+        emit queuedBytesChanged(m_queuedBytes);
+    });
     connect(worker, &FileWriterWorker::completed, this,
             [this](bool ok, qint64 bytes, const QString &error) {
         if (!m_receiver)
@@ -234,13 +253,18 @@ Workers::AsyncFileWriter::~AsyncFileWriter()
     m_thread = nullptr;
 }
 
-void Workers::AsyncFileWriter::append(const QByteArray &data)
+bool Workers::AsyncFileWriter::append(const QByteArray &data)
 {
-    if (m_thread->isRunning()) {
-        auto *worker = static_cast<FileWriterWorker *>(m_worker);
-        QMetaObject::invokeMethod(worker, [worker, data] { worker->append(data); },
-                                  Qt::QueuedConnection);
-    }
+    if (data.isEmpty())
+        return true;
+    if (!m_thread->isRunning() || data.size() > availableBytes())
+        return false;
+    m_queuedBytes += data.size();
+    m_peakQueuedBytes = qMax(m_peakQueuedBytes, m_queuedBytes);
+    auto *worker = static_cast<FileWriterWorker *>(m_worker);
+    QMetaObject::invokeMethod(worker, [worker, data] { worker->append(data); },
+                              Qt::QueuedConnection);
+    return true;
 }
 
 void Workers::AsyncFileWriter::finish()
@@ -253,20 +277,20 @@ void Workers::AsyncFileWriter::finish()
 
 void Workers::hashFile(const QString &path, QObject *receiver, HashCallback callback)
 {
-    QThreadPool::globalInstance()->start(new HashTask(path, receiver, std::move(callback)));
+    fileWorkerPool()->start(new HashTask(path, receiver, std::move(callback)));
 }
 
 void Workers::readChunk(const QString &path, qint64 offset, int size, QObject *receiver,
                         ChunkCallback callback)
 {
-    QThreadPool::globalInstance()->start(new ReadChunkTask(path, offset, size, receiver,
-                                                          std::move(callback)));
+    fileWorkerPool()->start(new ReadChunkTask(path, offset, size, receiver,
+                                               std::move(callback)));
 }
 
 void Workers::writeFile(const QString &path, const QByteArray &data, QObject *receiver,
                         WriteCallback callback)
 {
-    QThreadPool::globalInstance()->start(new WriteTask(path, data, receiver, std::move(callback)));
+    fileWorkerPool()->start(new WriteTask(path, data, receiver, std::move(callback)));
 }
 
 #include "Workers.moc"

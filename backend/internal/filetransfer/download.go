@@ -10,10 +10,6 @@ import (
 )
 
 func (s *Service) Download(ctx context.Context, id, user string, output io.Writer, onMetadata func(File)) error {
-	if err := s.acquire(ctx); err != nil {
-		return err
-	}
-	defer s.release()
 	unlock := s.lock("file:" + id)
 	defer unlock()
 	f, err := s.getFile(ctx, id)
@@ -26,25 +22,21 @@ func (s *Service) Download(ctx context.Context, id, user string, output io.Write
 	if f.Status != "completed" {
 		return httpx.Error(409, "file_not_ready", "only completed files can be downloaded")
 	}
-	chunks, err := s.chunks(ctx, id)
+	chunks, err := s.chunks(ctx, f.ContentID)
 	if err != nil {
 		return err
 	}
 	if len(chunks) != f.ChunkCount {
 		return fmt.Errorf("completed file has missing chunks")
 	}
-	dek, err := UnwrapDEK(s.kek, f.WrappedDEK, f.DEKNonce)
-	if err != nil {
-		return err
-	}
 	onMetadata(f)
 	for _, c := range chunks {
-		plain, releaseMemory, err := s.readChunk(ctx, dek, c)
+		plain, releaseChunk, err := s.readChunk(ctx, f.ContentID, c)
 		if err != nil {
 			return err
 		}
 		_, err = output.Write(plain)
-		releaseMemory()
+		releaseChunk()
 		if err != nil {
 			return err
 		}
@@ -55,18 +47,13 @@ func (s *Service) Delete(ctx context.Context, id, user string) error {
 	return s.delete(ctx, id, user, true)
 }
 
-// DeleteForAccount removes a transfer in which the deleted user is either the
-// owner or recipient. It deliberately shares the normal per-file lock and
-// object-first deletion path so interrupted account deletions can be retried.
+// DeleteForAccount removes either participant's logical reference. Shared
+// contents and their objects survive until the final reference is removed.
 func (s *Service) DeleteForAccount(ctx context.Context, id, user string) error {
 	return s.delete(ctx, id, user, false)
 }
 
 func (s *Service) delete(ctx context.Context, id, user string, ownerOnly bool) error {
-	if err := s.acquire(ctx); err != nil {
-		return err
-	}
-	defer s.release()
 	unlock := s.lock("file:" + id)
 	defer unlock()
 	f, err := s.getFile(ctx, id)
@@ -76,24 +63,79 @@ func (s *Service) delete(ctx context.Context, id, user string, ownerOnly bool) e
 	if err := Authorize(f, user, ownerOnly); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE files SET status='deleting' WHERE id=?`, id); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	chunks, err := s.chunks(ctx, id)
+	defer tx.Rollback()
+	var contentID, fileStatus, contentStatus string
+	var refs int
+	err = tx.QueryRowContext(ctx, `SELECT f.content_id,f.status,c.status,c.ref_count FROM files f JOIN file_contents c ON c.id=f.content_id WHERE f.id=? FOR UPDATE`, id).Scan(&contentID, &fileStatus, &contentStatus, &refs)
+	if err == sql.ErrNoRows {
+		return httpx.Error(404, "file_not_found", "file not found")
+	}
+	if err != nil {
+		return err
+	}
+	last := fileStatus == "deleting" || (refs == 1 && fileStatus == "active")
+	if fileStatus == "active" {
+		if refs < 1 {
+			return fmt.Errorf("invalid content reference count")
+		}
+		if last {
+			if _, err = tx.ExecContext(ctx, `UPDATE file_contents SET ref_count=0,status='deleting' WHERE id=? AND ref_count=1`, contentID); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE files SET status='deleting' WHERE id=? AND status='active'`, id); err != nil {
+				return err
+			}
+		} else {
+			if _, err = tx.ExecContext(ctx, `UPDATE file_contents SET ref_count=ref_count-1 WHERE id=? AND ref_count>1`, contentID); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `DELETE FROM files WHERE id=? AND status='active'`, id); err != nil {
+				return err
+			}
+		}
+	} else if fileStatus != "deleting" || contentStatus != "deleting" || refs != 0 {
+		return fmt.Errorf("invalid deleting file state")
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if !last {
+		return nil
+	}
+	chunks, err := s.chunks(ctx, contentID)
 	if err != nil {
 		return err
 	}
 	for _, c := range chunks {
 		if err := s.objects.Remove(ctx, c.ObjectKey); err != nil {
-			return fmt.Errorf("remove encrypted object: %w", err)
+			return fmt.Errorf("remove plaintext object: %w", err)
 		}
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM files WHERE id=? AND status='deleting'`, id)
+	tx, err = s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var stillDeleting int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM file_contents WHERE id=? AND status='deleting' AND ref_count=0 FOR UPDATE`, contentID).Scan(&stillDeleting); err != nil {
+		return err
+	}
+	if stillDeleting != 1 {
+		return fmt.Errorf("content state changed during deletion")
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM files WHERE id=? AND status='deleting'`, id); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM file_contents WHERE id=? AND status='deleting' AND ref_count=0`, contentID)
 	if err != nil {
 		return err
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return tx.Commit()
 }

@@ -57,9 +57,9 @@ func (c *integrationClient) verifyReadReceipts(suffix string) {
 	conversationID := ""
 	for i := range messages {
 		messages[i] = &impb.Envelope{
-			Version: 1, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(),
+			Version: 2, Type: impb.Envelope_MESSAGE, MessageId: uuid.NewString(),
 			RecipientId: bob.User.ID, DeviceId: "read-integration-device",
-			Timestamp: time.Now().UnixMilli(), Payload: []byte(fmt.Sprintf("read batch message %d", i+1)),
+			Timestamp: time.Now().UnixMilli(), Payload: textMessagePayload(c.t, fmt.Sprintf("read batch message %d", i+1)),
 		}
 		sendEnvelope(c.t, aliceOne, messages[i])
 		ack := readEnvelopeType(c.t, aliceOne, impb.Envelope_ACK)
@@ -199,7 +199,7 @@ func assertReadBroadcast(t *testing.T, connections []*websocket.Conn, senderID, 
 	t.Helper()
 	for i, conn := range connections {
 		event := readEnvelopeType(t, conn, impb.Envelope_READ)
-		if event.Version != 1 || event.SenderId != readerID || event.RecipientId != senderID ||
+		if event.Version != 2 || event.SenderId != readerID || event.RecipientId != senderID ||
 			event.ConversationId != receipt.ConversationID || event.Cursor != receipt.Cursor ||
 			event.ReadAt != receipt.ReadAt || event.Timestamp != receipt.ReadAt {
 			t.Fatalf("connection %d received invalid READ: %v", i, event)

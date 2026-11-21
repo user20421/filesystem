@@ -1,9 +1,14 @@
 #include "ApiClient.h"
+#include "LocalStore.h"
+#include "MessagePayloadCodec.h"
 
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QTcpServer>
+#include <QSignalSpy>
 #include <QTcpSocket>
+#include <QTemporaryDir>
 #include <QtTest>
 
 namespace {
@@ -36,6 +41,8 @@ public:
     {
         m_responses.append({status, QJsonDocument(body).toJson(QJsonDocument::Compact)});
     }
+    void hold(const QByteArray &path) { m_heldPaths.insert(path); }
+    int pending(const QByteArray &path) const { return m_pending.value(path).size(); }
 
     QList<CapturedRequest> requests;
 
@@ -61,8 +68,12 @@ private:
             const int bodyStart = headerEnd + 4;
             if (buffer->size() - bodyStart < contentLength)
                 return;
-            requests.append({requestLine.value(0), requestLine.value(1), buffer->mid(bodyStart),
-                             authorization});
+            const QByteArray path = requestLine.value(1);
+            requests.append({requestLine.value(0), path, buffer->mid(bodyStart), authorization});
+            if (m_heldPaths.contains(path)) {
+                m_pending[path].append(socket);
+                return;
+            }
             const auto response = m_responses.isEmpty()
                 ? QPair<int, QByteArray>{500, QByteArray("{}")} : m_responses.takeFirst();
             const QByteArray http = "HTTP/1.1 " + QByteArray::number(response.first)
@@ -78,6 +89,8 @@ private:
 
     QTcpServer m_server;
     QList<QPair<int, QByteArray>> m_responses;
+    QSet<QByteArray> m_heldPaths;
+    QHash<QByteArray, QList<QPointer<QTcpSocket>>> m_pending;
 };
 
 QJsonObject userJson(const QString &id, const QString &username)
@@ -95,6 +108,12 @@ private slots:
     void decodesHistoryEnvelopeAndCursor();
     void presenceAndReadReceiptRequests();
     void deletesCurrentAccountOnlyOnNoContent();
+    void concurrentUnauthorizedRequestsShareOneRefreshAndPersistBothTokens();
+    void nonUnauthorizedErrorDoesNotRefresh();
+    void refreshedRequestIsOnlyReplayedOnce();
+    void authenticationEndpointsNeverTriggerAutomaticRefresh();
+    void logoutRefreshesAndRevokesCurrentRefreshToken();
+    void logoutCancelsOldRefreshesAndWaitingRequests();
 };
 
 void ApiClientTest::parsesNestedAuthTokens()
@@ -173,11 +192,13 @@ void ApiClientTest::adaptsRealFileShapes()
     QTRY_VERIFY_WITH_TIMEOUT(initDone, 3000);
     QCOMPARE(info.fileId, QStringLiteral("f1"));
     QCOMPARE(info.chunkSize, 4194304);
+    QVERIFY(info.complete);
     const QJsonObject initRequest = QJsonDocument::fromJson(server.requests.first().body).object();
     QCOMPARE(initRequest.value(QStringLiteral("recipient_id")).toString(), QStringLiteral("u2"));
     QCOMPARE(initRequest.value(QStringLiteral("filename")).toString(), QStringLiteral("hello.txt"));
     QVERIFY(!initRequest.contains(QStringLiteral("peer_id")));
     QVERIFY(!initRequest.contains(QStringLiteral("file_name")));
+    QCOMPARE(initRequest.value(QStringLiteral("chunk_size")).toInt(), 5 * 1024 * 1024);
 
     bool statusDone = false;
     FileStatus status;
@@ -204,9 +225,11 @@ void ApiClientTest::decodesHistoryEnvelopeAndCursor()
     wire.recipientId = QStringLiteral("u1");
     wire.timestamp = 123456;
     wire.readAt = 123999;
-    wire.payload = QJsonDocument(textPayload(QStringLiteral("hello"))).toJson(QJsonDocument::Compact);
-    QByteArray frame;
+    ChatMessage text;
+    text.content = QStringLiteral("hello");
     QString codecError;
+    QVERIFY2(MessagePayloadCodec::encode(text, &wire.payload, &codecError), qPrintable(codecError));
+    QByteArray frame;
     QVERIFY2(codec->encode(wire, &frame, &codecError), qPrintable(codecError));
 
     FakeServer server;
@@ -299,6 +322,277 @@ void ApiClientTest::deletesCurrentAccountOnlyOnNoContent()
         QCOMPARE(request.path, QByteArray("/api/v1/users/me"));
         QCOMPARE(request.authorization, QByteArray("Bearer account-token"));
     }
+}
+
+void ApiClientTest::concurrentUnauthorizedRequestsShareOneRefreshAndPersistBothTokens()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    const QJsonObject unauthorized{{QStringLiteral("error"), QJsonObject{
+        {QStringLiteral("message"), QStringLiteral("access expired")}}}};
+    server.enqueue(401, unauthorized);
+    server.enqueue(401, unauthorized);
+    server.enqueue(200, {{QStringLiteral("data"), QJsonObject{
+        {QStringLiteral("user"), userJson(QStringLiteral("u1"), QStringLiteral("ALICE"))},
+        {QStringLiteral("tokens"), QJsonObject{
+            {QStringLiteral("access_token"), QStringLiteral("new-access")},
+            {QStringLiteral("refresh_token"), QStringLiteral("new-refresh")}}}}}});
+    server.enqueue(200, {{QStringLiteral("data"), QJsonObject{{QStringLiteral("users"), QJsonArray{}}}}});
+    server.enqueue(200, {{QStringLiteral("data"), QJsonObject{
+        {QStringLiteral("online_user_ids"), QJsonArray{}}}}});
+
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    AuthSession initial;
+    initial.accessToken = QStringLiteral("old-access");
+    initial.refreshToken = QStringLiteral("old-refresh");
+    initial.user = User{QStringLiteral("u1"), QStringLiteral("ALICE"), QStringLiteral("ALICE")};
+    QVERIFY(store.saveSession(initial));
+    ApiClient api;
+    api.setServerUrl(server.url());
+    api.setSessionStore(&store);
+    api.setAuthSession(initial);
+    QSignalSpy refreshed(&api, &ApiClient::sessionRefreshed);
+    QSignalSpy failed(&api, &ApiClient::authenticationFailed);
+    bool usersDone = false;
+    bool presenceDone = false;
+    api.users([&](bool ok, const QList<User> &, const QString &error) {
+        QVERIFY2(ok, qPrintable(error));
+        usersDone = true;
+    });
+    api.presence([&](bool ok, const QSet<QString> &, const QString &error) {
+        QVERIFY2(ok, qPrintable(error));
+        presenceDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(usersDone && presenceDone, 5000);
+    QCOMPARE(refreshed.size(), 1);
+    QCOMPARE(failed.size(), 0);
+    QCOMPARE(server.requests.size(), 5);
+    int refreshRequests = 0;
+    int replayedRequests = 0;
+    for (const CapturedRequest &request : server.requests) {
+        if (request.path == "/api/v1/auth/refresh") {
+            ++refreshRequests;
+            QCOMPARE(request.authorization, QByteArray{});
+            QCOMPARE(QJsonDocument::fromJson(request.body).object()
+                         .value(QStringLiteral("refresh_token")).toString(),
+                     QStringLiteral("old-refresh"));
+        } else if (request.authorization == "Bearer new-access") {
+            ++replayedRequests;
+        } else {
+            QCOMPARE(request.authorization, QByteArray("Bearer old-access"));
+        }
+    }
+    QCOMPARE(refreshRequests, 1);
+    QCOMPARE(replayedRequests, 2);
+    QCOMPARE(api.accessToken(), QStringLiteral("new-access"));
+    QCOMPARE(api.refreshToken(), QStringLiteral("new-refresh"));
+    const AuthSession saved = store.loadSession();
+    QCOMPARE(saved.accessToken, QStringLiteral("new-access"));
+    QCOMPARE(saved.refreshToken, QStringLiteral("new-refresh"));
+    QCOMPARE(saved.user.id, QStringLiteral("u1"));
+}
+
+void ApiClientTest::nonUnauthorizedErrorDoesNotRefresh()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    server.enqueue(503, {{QStringLiteral("error"), QJsonObject{
+        {QStringLiteral("message"), QStringLiteral("unavailable")}}}});
+    ApiClient api;
+    api.setServerUrl(server.url());
+    AuthSession initial;
+    initial.accessToken = QStringLiteral("access");
+    initial.refreshToken = QStringLiteral("refresh");
+    initial.user.id = QStringLiteral("u1");
+    api.setAuthSession(initial);
+    QSignalSpy refreshed(&api, &ApiClient::sessionRefreshed);
+    bool done = false;
+    api.users([&](bool ok, const QList<User> &, const QString &error) {
+        QVERIFY(!ok);
+        QCOMPARE(error, QStringLiteral("unavailable"));
+        done = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+    QCOMPARE(server.requests.size(), 1);
+    QCOMPARE(refreshed.size(), 0);
+    QCOMPARE(api.accessToken(), QStringLiteral("access"));
+    QCOMPARE(api.refreshToken(), QStringLiteral("refresh"));
+}
+
+void ApiClientTest::refreshedRequestIsOnlyReplayedOnce()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    server.enqueue(401, {});
+    server.enqueue(200, {{QStringLiteral("data"), QJsonObject{
+        {QStringLiteral("user"), userJson(QStringLiteral("u1"), QStringLiteral("ALICE"))},
+        {QStringLiteral("tokens"), QJsonObject{
+            {QStringLiteral("access_token"), QStringLiteral("new-access")},
+            {QStringLiteral("refresh_token"), QStringLiteral("new-refresh")}}}}}});
+    server.enqueue(401, {});
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    ApiClient api;
+    api.setServerUrl(server.url());
+    api.setSessionStore(&store);
+    AuthSession initial;
+    initial.accessToken = QStringLiteral("old-access");
+    initial.refreshToken = QStringLiteral("old-refresh");
+    initial.user = User{QStringLiteral("u1"), QStringLiteral("ALICE"), QStringLiteral("ALICE")};
+    api.setAuthSession(initial);
+    QVERIFY(store.saveSession(initial));
+    QSignalSpy failed(&api, &ApiClient::authenticationFailed);
+    bool done = false;
+    api.users([&](bool ok, const QList<User> &, const QString &) {
+        QVERIFY(!ok);
+        done = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(done && failed.size() == 1, 5000);
+    QCOMPARE(server.requests.size(), 3);
+    QCOMPARE(server.requests.at(2).authorization, QByteArray("Bearer new-access"));
+    QVERIFY(!QFileInfo::exists(store.path(QStringLiteral("config/session.json"))));
+    QVERIFY(api.accessToken().isEmpty());
+    QVERIFY(api.refreshToken().isEmpty());
+}
+
+void ApiClientTest::authenticationEndpointsNeverTriggerAutomaticRefresh()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    server.enqueue(401, {});
+    server.enqueue(401, {});
+    server.enqueue(401, {});
+    ApiClient api;
+    api.setServerUrl(server.url());
+    AuthSession initial;
+    initial.accessToken = QStringLiteral("access");
+    initial.refreshToken = QStringLiteral("refresh");
+    initial.user.id = QStringLiteral("u1");
+    api.setAuthSession(initial);
+    QSignalSpy failed(&api, &ApiClient::authenticationFailed);
+    bool loginDone = false;
+    api.login(QStringLiteral("ALICE"), QStringLiteral("123456"),
+              [&](bool ok, const AuthSession &, const QString &) {
+        QVERIFY(!ok);
+        loginDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(loginDone, 3000);
+    bool refreshDone = false;
+    api.refresh(QStringLiteral("refresh"), [&](bool ok, const AuthSession &, const QString &) {
+        QVERIFY(!ok);
+        refreshDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(refreshDone, 3000);
+    bool registerDone = false;
+    api.registerUser(QStringLiteral("ALICE"), QStringLiteral("123456"),
+                     [&](bool ok, const AuthSession &, const QString &) {
+        QVERIFY(!ok);
+        registerDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(registerDone, 3000);
+    QCOMPARE(server.requests.size(), 3);
+    QCOMPARE(server.requests.at(0).path, QByteArray("/api/v1/auth/login"));
+    QCOMPARE(server.requests.at(1).path, QByteArray("/api/v1/auth/refresh"));
+    QCOMPARE(server.requests.at(2).path, QByteArray("/api/v1/auth/register"));
+    QCOMPARE(failed.size(), 0);
+}
+
+void ApiClientTest::logoutRefreshesAndRevokesCurrentRefreshToken()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    server.enqueue(401, {});
+    server.enqueue(200, {{QStringLiteral("data"), QJsonObject{
+        {QStringLiteral("user"), userJson(QStringLiteral("u1"), QStringLiteral("ALICE"))},
+        {QStringLiteral("tokens"), QJsonObject{
+            {QStringLiteral("access_token"), QStringLiteral("new-access")},
+            {QStringLiteral("refresh_token"), QStringLiteral("new-refresh")}}}}}});
+    server.enqueue(204, {});
+    ApiClient api;
+    api.setServerUrl(server.url());
+    AuthSession initial;
+    initial.accessToken = QStringLiteral("old-access");
+    initial.refreshToken = QStringLiteral("old-refresh");
+    initial.user = User{QStringLiteral("u1"), QStringLiteral("ALICE"), QStringLiteral("ALICE")};
+    api.setAuthSession(initial);
+    bool done = false;
+    api.logout([&](bool ok, const QString &error) {
+        QVERIFY2(ok, qPrintable(error));
+        done = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(done, 5000);
+    QCOMPARE(server.requests.size(), 3);
+    QCOMPARE(server.requests.at(0).path, QByteArray("/api/v1/auth/logout"));
+    QCOMPARE(server.requests.at(1).path, QByteArray("/api/v1/auth/refresh"));
+    QCOMPARE(server.requests.at(2).path, QByteArray("/api/v1/auth/logout"));
+    QCOMPARE(server.requests.at(2).authorization, QByteArray("Bearer new-access"));
+    QCOMPARE(QJsonDocument::fromJson(server.requests.at(0).body).object()
+                 .value(QStringLiteral("refresh_token")).toString(), QStringLiteral("old-refresh"));
+    QCOMPARE(QJsonDocument::fromJson(server.requests.at(2).body).object()
+                 .value(QStringLiteral("refresh_token")).toString(), QStringLiteral("new-refresh"));
+}
+
+void ApiClientTest::logoutCancelsOldRefreshesAndWaitingRequests()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    server.hold("/api/v1/auth/refresh");
+    server.enqueue(401, {}); // users starts a second, automatic refresh
+    server.enqueue(204, {}); // logout must still run immediately
+
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    ApiClient api;
+    api.setServerUrl(server.url());
+    api.setSessionStore(&store);
+    AuthSession initial;
+    initial.accessToken = QStringLiteral("old-access");
+    initial.refreshToken = QStringLiteral("old-refresh");
+    initial.user = User{QStringLiteral("u1"), QStringLiteral("ALICE"), QStringLiteral("ALICE")};
+    api.setAuthSession(initial);
+    QVERIFY(store.saveSession(initial));
+
+    bool independentDone = false;
+    api.refresh(initial.refreshToken,
+                [&](bool ok, const AuthSession &session, const QString &) {
+        QVERIFY(!ok);
+        independentDone = true;
+        if (ok)
+            api.setAuthSession(session); // A late success must never reach here.
+    });
+    bool usersDone = false;
+    api.users([&](bool ok, const QList<User> &, const QString &) {
+        QVERIFY(!ok);
+        usersDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(server.pending("/api/v1/auth/refresh") == 2, 5000);
+
+    bool logoutDone = false;
+    api.logout([&](bool ok, const QString &error) {
+        QVERIFY2(ok, qPrintable(error));
+        logoutDone = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(logoutDone && independentDone && usersDone, 5000);
+    QCOMPARE(server.requests.size(), 4);
+    QCOMPARE(server.requests.at(3).path, QByteArray("/api/v1/auth/logout"));
+    QCOMPARE(QJsonDocument::fromJson(server.requests.at(3).body).object()
+                 .value(QStringLiteral("refresh_token")).toString(),
+             QStringLiteral("old-refresh"));
+
+    AuthSession replacement;
+    replacement.accessToken = QStringLiteral("replacement-access");
+    replacement.refreshToken = QStringLiteral("replacement-refresh");
+    replacement.user = User{QStringLiteral("u2"), QStringLiteral("BOB"), QStringLiteral("BOB")};
+    api.setAuthSession(replacement);
+    QVERIFY(store.saveSession(replacement));
+    QTest::qWait(150);
+    QCOMPARE(api.accessToken(), replacement.accessToken);
+    QCOMPARE(api.refreshToken(), replacement.refreshToken);
+    QCOMPARE(store.loadSession().refreshToken, replacement.refreshToken);
 }
 
 QTEST_GUILESS_MAIN(ApiClientTest)

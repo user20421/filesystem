@@ -12,7 +12,7 @@ try {
     }
 
     if ($RemoveVolumes) {
-        Write-Host 'Stopping services and PERMANENTLY deleting local database, Redis, and MinIO volumes...' -ForegroundColor Yellow
+        Write-Host 'Stopping services and PERMANENTLY deleting local database and MinIO volumes...' -ForegroundColor Yellow
         Invoke-DockerCompose -ComposeArguments @('down', '--volumes', '--remove-orphans')
     }
     else {

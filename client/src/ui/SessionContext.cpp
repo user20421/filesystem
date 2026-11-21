@@ -9,6 +9,12 @@ SessionContext::SessionContext(const QString &dataDir, const QUrl &serverUrl,
       m_preferredUsername(preferredUsername)
 {
     m_api->setServerUrl(serverUrl);
+    m_api->setSessionStore(m_store);
+    connect(m_api, &ApiClient::sessionRefreshed, this,
+            [this](const AuthSession &session) { setSession(session); });
+    connect(m_api, &ApiClient::authenticationFailed, this, [this](const QString &) {
+        m_session = {};
+    });
     m_lock.setStaleLockTime(30000);
 }
 
@@ -40,7 +46,7 @@ bool SessionContext::open(QString *error)
 void SessionContext::setSession(const AuthSession &session)
 {
     m_session = session;
-    m_api->setAccessToken(session.accessToken);
+    m_api->setAuthSession(session);
 }
 
 void SessionContext::shutdown()

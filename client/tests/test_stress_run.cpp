@@ -9,11 +9,14 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineEdit>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QSpinBox>
 #include <QTabWidget>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QTreeWidget>
 #include <QtTest>
@@ -81,7 +84,7 @@ private slots:
     void stopsActiveRunner();
     void destructorStopsActiveRunner();
     void refreshesHistoryAndOpensReports();
-    void tabSwitchKeepsRunAndWindowCloseStopsIt();
+    void rootLoginThenWindowCloseStopsActiveRun();
 };
 
 void StressRunTest::runsSetupBeforeRunner()
@@ -295,7 +298,7 @@ void StressRunTest::refreshesHistoryAndOpensReports()
     SystemTestPage::setReportOpenerForTests({});
 }
 
-void StressRunTest::tabSwitchKeepsRunAndWindowCloseStopsIt()
+void StressRunTest::rootLoginThenWindowCloseStopsActiveRun()
 {
     QTemporaryDir root;
     EnvironmentGuard project("SECURE_IM_PROJECT_ROOT");
@@ -310,16 +313,42 @@ void StressRunTest::tabSwitchKeepsRunAndWindowCloseStopsIt()
     qputenv("SECURE_IM_STRESS_SKIP_SETUP", "1");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "hold");
 
-    SimulatorWindow window({}, QUrl(QStringLiteral("http://127.0.0.1:1")));
-    auto *page = window.findChild<SystemTestPage *>();
-    auto *tabs = window.findChild<QTabWidget *>(QStringLiteral("sessionTabs"));
+    QTcpServer authServer;
+    QVERIFY(authServer.listen(QHostAddress::LocalHost, 0));
+    QByteArray loginRequest;
+    connect(&authServer, &QTcpServer::newConnection, &authServer, [&] {
+        while (authServer.hasPendingConnections()) {
+            QTcpSocket *socket = authServer.nextPendingConnection();
+            connect(socket, &QTcpSocket::readyRead, socket, [&, socket] {
+                loginRequest.append(socket->readAll());
+                if (!loginRequest.contains("\r\n\r\n"))
+                    return;
+                const QByteArray body = R"({"data":{"user":{"id":"root-id","username":"ROOT","display_name":"ROOT"},"tokens":{"access_token":"authenticated-root-token","refresh_token":"root-refresh"}}})";
+                const QByteArray response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+                socket->write(response);
+                socket->flush();
+                socket->disconnectFromHost();
+            });
+        }
+    });
+    const QUrl serverUrl(QStringLiteral("http://127.0.0.1:%1").arg(authServer.serverPort()));
+    SimulatorWindow window(root.filePath(QStringLiteral("simulator")), serverUrl);
+    QVERIFY(window.isOpen());
+    auto *login = window.findChild<QPushButton *>(QStringLiteral("loginButton"));
+    QVERIFY(login);
+    login->click();
+    QTRY_VERIFY_WITH_TIMEOUT(window.isAuthenticated(), 3000);
+    QVERIFY(loginRequest.startsWith("POST /api/v1/auth/login "));
+    QVERIFY(loginRequest.contains("\"username\":\"ROOT\""));
+    QVERIFY(loginRequest.contains("\"password\":\"123456\""));
+
+    SystemTestPage *page = window.systemTestPage();
     auto *start = page->findChild<QPushButton *>(QStringLiteral("stressTestButton"));
-    QVERIFY(page && tabs && start);
+    QVERIFY(page && start);
     start->click();
     QSignalSpy progress(page->controller(), &StressRunController::progressReceived);
     QTRY_VERIFY_WITH_TIMEOUT(progress.size() == 1, 5000);
-    tabs->setCurrentIndex(1);
-    QTest::qWait(50);
     QVERIFY(page->controller()->isRunning());
     window.close();
     QTRY_VERIFY_WITH_TIMEOUT(!page->controller()->isRunning(), 5000);

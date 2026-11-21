@@ -29,6 +29,8 @@ set(CLIENT_CORE_SOURCES
     src/core/LocalStore.cpp
     src/core/LocalStore.h
     src/core/MessageSyncState.h
+    src/core/MessagePayloadCodec.cpp
+    src/core/MessagePayloadCodec.h
     src/core/TransferManager.cpp
     src/core/TransferManager.h
     src/core/WebSocketClient.cpp
@@ -50,7 +52,9 @@ target_compile_features(client_core PUBLIC cxx_std_17)
 target_compile_definitions(client_core PUBLIC CLIENT_HAS_PROTOBUF=1)
 
 qt_add_protobuf(client_core
-    PROTO_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../proto/im/v1/envelope.proto"
+    PROTO_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../proto/im/v1/envelope.proto"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../proto/im/v1/messages.proto"
     PROTO_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/../proto"
 )
 message(STATUS "Realtime Qt Protobuf codec enabled")
@@ -103,6 +107,7 @@ if(BUILD_TESTING)
     qt_add_executable(test_transfer_manager tests/test_transfer_manager.cpp)
     target_link_libraries(test_transfer_manager PRIVATE client_core Qt6::Test)
     add_test(NAME transfer_manager COMMAND test_transfer_manager)
+    set_tests_properties(transfer_manager PROPERTIES TIMEOUT 120)
 
     qt_add_executable(test_api_client tests/test_api_client.cpp)
     target_link_libraries(test_api_client PRIVATE client_core Qt6::Test)

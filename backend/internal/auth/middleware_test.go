@@ -16,7 +16,7 @@ func TestMiddlewareRejectsDeletedUserAccessToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHandler(NewService(nil, tokens))
+	handler := NewHandler(NewService(nil, tokens), RateLimitConfig{}, RateLimitConfig{})
 	handler.lookupUser = func(context.Context, string) (User, error) {
 		return User{}, httpx.Error(http.StatusUnauthorized, "invalid_token", "user no longer exists")
 	}

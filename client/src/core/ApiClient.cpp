@@ -1,9 +1,13 @@
 #include "ApiClient.h"
 
+#include "LocalStore.h"
+#include "MessagePayloadCodec.h"
+
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QNetworkRequest>
+#include <QTimer>
 #include <QUrlQuery>
 
 namespace {
@@ -103,10 +107,17 @@ FileInitInfo parseFileInit(const QJsonObject &root)
         ? objectValue(data, QStringLiteral("file")) : data;
     FileInitInfo info;
     info.fileId = stringField(object, {"file_id", "id"});
-    info.chunkSize = static_cast<int>(integerField(object, {"chunk_size"}, 4 * 1024 * 1024));
+    info.chunkSize = static_cast<int>(integerField(object, {"chunk_size"}, DefaultFileChunkSize));
     info.uploadedChunks = parseUploadedChunks(data);
     if (info.uploadedChunks.isEmpty())
         info.uploadedChunks = parseUploadedChunks(object);
+    info.status = stringField(object, {"status", "state"});
+    info.complete = object.value(QStringLiteral("complete")).toBool(false)
+        || object.value(QStringLiteral("completed")).toBool(false)
+        || object.value(QStringLiteral("instant")).toBool(false)
+        || info.status == QLatin1String("complete")
+        || info.status == QLatin1String("completed")
+        || info.status == QLatin1String("instant");
     return info;
 }
 
@@ -119,7 +130,7 @@ FileStatus parseFileStatus(const QJsonObject &root)
     status.fileId = stringField(object, {"file_id", "id"});
     status.fileName = stringField(object, {"original_name", "file_name", "filename", "name"});
     status.size = integerField(object, {"size", "file_size"});
-    status.chunkSize = static_cast<int>(integerField(object, {"chunk_size"}, 4 * 1024 * 1024));
+    status.chunkSize = static_cast<int>(integerField(object, {"chunk_size"}, DefaultFileChunkSize));
     // uploaded_chunks is a sibling of file in the real status response.
     status.uploadedChunks = parseUploadedChunks(data);
     if (status.uploadedChunks.isEmpty())
@@ -174,6 +185,47 @@ ChatMessage parseMessage(const QJsonObject &source)
 }
 } // namespace
 
+ApiRequestHandle::ApiRequestHandle(ApiClient *client)
+    : QObject(client), m_client(client) {}
+
+void ApiRequestHandle::abort()
+{
+    if (!m_completed && !m_cancelled && m_client)
+        m_client->cancelRequest(this, true);
+}
+
+QByteArray ApiRequestHandle::readAll()
+{
+    if (!m_reply)
+        return {};
+    const QByteArray data = m_reply->readAll();
+    m_client->scheduleStreamingFinish(this);
+    return data;
+}
+
+QByteArray ApiRequestHandle::read(qint64 maxSize)
+{
+    if (!m_reply || maxSize <= 0)
+        return {};
+    const QByteArray data = m_reply->read(maxSize);
+    m_client->scheduleStreamingFinish(this);
+    return data;
+}
+
+qint64 ApiRequestHandle::bytesAvailable() const
+{
+    return m_reply ? m_reply->bytesAvailable() : 0;
+}
+
+void ApiRequestHandle::setReadPaused(bool paused)
+{
+    if (m_completed || m_cancelled)
+        return;
+    m_readPaused = paused;
+    if (!paused)
+        m_client->scheduleStreamingFinish(this);
+}
+
 ApiClient::ApiClient(QObject *parent)
     : QObject(parent), m_codec(createDefaultWireCodec()) {}
 
@@ -187,17 +239,57 @@ void ApiClient::shutdown()
     if (m_closing)
         return;
     m_closing = true;
-    const auto replies = m_replies;
-    m_replies.clear();
-    for (const QPointer<QNetworkReply> &guarded : replies) {
-        if (QNetworkReply *reply = guarded.data()) {
-            // No completion/progress callback is allowed to re-enter a closing session.
-            reply->disconnect();
-            reply->abort();
-            reply->deleteLater();
+    const auto requests = m_requests;
+    m_requests.clear();
+    m_waitingForRefresh.clear();
+    m_refreshing = false;
+    m_refreshRequest.clear();
+    for (const QPointer<ApiRequestHandle> &guarded : requests) {
+        if (ApiRequestHandle *request = guarded.data()) {
+            request->m_cancelled = true;
+            if (QNetworkReply *reply = request->m_reply.data()) {
+                // No completion/progress callback is allowed to re-enter a closing session.
+                reply->disconnect();
+                reply->abort();
+                reply->deleteLater();
+                request->m_reply.clear();
+            }
+            request->disconnect();
+            request->deleteLater();
         }
     }
     m_manager.clearAccessCache();
+}
+
+void ApiClient::setAuthSession(const AuthSession &session)
+{
+    const bool unchanged = m_accessToken == session.accessToken
+        && m_refreshToken == session.refreshToken && m_session.user.id == session.user.id;
+    if (!unchanged)
+        invalidateAuthentication();
+    m_session = session;
+    m_accessToken = session.accessToken;
+    m_refreshToken = session.refreshToken;
+}
+
+void ApiClient::invalidateAuthentication()
+{
+    ++m_authEpoch;
+    m_loggingOut = false;
+    m_refreshing = false;
+    m_refreshRequest.clear();
+    const auto requests = m_requests;
+    for (const QPointer<ApiRequestHandle> &guarded : requests) {
+        if (guarded && !guarded->m_completed && !guarded->m_cancelled)
+            cancelRequest(guarded.data(), true);
+    }
+    m_waitingForRefresh.clear();
+}
+
+void ApiClient::setAccessToken(const QString &token)
+{
+    m_accessToken = token;
+    m_session.accessToken = token;
 }
 
 QUrl ApiClient::webSocketUrl(const QString &ticket) const
@@ -231,69 +323,297 @@ QString ApiClient::responseError(const QByteArray &body, const QString &fallback
     return fallback;
 }
 
-QNetworkReply *ApiClient::request(const QString &method, const QString &path,
-                                  const QByteArray &body, const QString &contentType,
-                                  const QMap<QString, QString> &headers, RawCallback callback,
-                                  bool streaming, int expectedStatus)
+ApiRequestHandle *ApiClient::request(const QString &method, const QString &path,
+                                     const QByteArray &body, const QString &contentType,
+                                     const QMap<QString, QString> &headers, RawCallback callback,
+                                     bool streaming, int expectedStatus,
+                                     bool allowRefresh, bool logoutBody)
 {
-    if (m_closing)
+    if (m_closing || (m_authFailureInProgress && allowRefresh)
+        || (m_loggingOut && allowRefresh && !logoutBody))
         return nullptr;
-    QNetworkRequest request(m_baseUrl.resolved(QUrl(path)));
-    if (!m_accessToken.isEmpty())
-        request.setRawHeader("Authorization", "Bearer " + m_accessToken.toUtf8());
-    if (!contentType.isEmpty())
-        request.setHeader(QNetworkRequest::ContentTypeHeader, contentType);
-    for (auto it = headers.cbegin(); it != headers.cend(); ++it)
-        request.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+    auto *handle = new ApiRequestHandle(this);
+    handle->m_method = method;
+    handle->m_path = path;
+    handle->m_body = body;
+    handle->m_contentType = contentType;
+    handle->m_headers = headers;
+    handle->m_callback = std::move(callback);
+    handle->m_streaming = streaming;
+    handle->m_expectedStatus = expectedStatus;
+    handle->m_allowRefresh = allowRefresh;
+    handle->m_logoutBody = logoutBody;
+    handle->m_authEpoch = m_authEpoch;
+    m_requests.append(handle);
+    startRequest(handle);
+    return handle;
+}
 
+void ApiClient::startRequest(ApiRequestHandle *handle)
+{
+    if (!handle || m_closing || handle->m_completed || handle->m_cancelled
+        || handle->m_authEpoch != m_authEpoch)
+        return;
+    QNetworkRequest networkRequest(m_baseUrl.resolved(QUrl(handle->m_path)));
+    if (handle->m_allowRefresh && !m_accessToken.isEmpty())
+        networkRequest.setRawHeader("Authorization", "Bearer " + m_accessToken.toUtf8());
+    if (!handle->m_contentType.isEmpty())
+        networkRequest.setHeader(QNetworkRequest::ContentTypeHeader, handle->m_contentType);
+    for (auto it = handle->m_headers.cbegin(); it != handle->m_headers.cend(); ++it)
+        networkRequest.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+
+    // A logout replay must revoke the newly rotated token, not the consumed one.
+    const QByteArray body = handle->m_logoutBody
+        ? QJsonDocument(QJsonObject{{QStringLiteral("refresh_token"), m_refreshToken}})
+            .toJson(QJsonDocument::Compact)
+        : handle->m_body;
     QNetworkReply *reply = nullptr;
-    if (method == QLatin1String("GET"))
-        reply = m_manager.get(request);
-    else if (method == QLatin1String("DELETE"))
-        reply = m_manager.deleteResource(request);
+    if (handle->m_method == QLatin1String("GET"))
+        reply = m_manager.get(networkRequest);
+    else if (handle->m_method == QLatin1String("DELETE"))
+        reply = m_manager.deleteResource(networkRequest);
     else
-        reply = m_manager.sendCustomRequest(request, method.toUtf8(), body);
+        reply = m_manager.sendCustomRequest(networkRequest, handle->m_method.toUtf8(), body);
+    handle->m_reply = reply;
+    if (handle->m_streaming)
+        reply->setReadBufferSize(256 * 1024);
 
-    m_replies.append(reply);
-    connect(reply, &QNetworkReply::finished, this,
-            [this, reply, callback, streaming, expectedStatus]() {
-        m_replies.removeAll(reply);
-        if (m_closing) {
+    connect(reply, &QNetworkReply::readyRead, handle, [handle, reply] {
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (handle->m_reply == reply && handle->m_streaming && !handle->m_cancelled
+            && !handle->m_readPaused && status >= 200 && status < 300)
+            emit handle->readyRead();
+    });
+    connect(reply, &QNetworkReply::downloadProgress, handle,
+            [handle, reply](qint64 received, qint64 total) {
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (handle->m_reply == reply && handle->m_streaming && !handle->m_cancelled
+            && status >= 200 && status < 300)
+            emit handle->downloadProgress(received, total);
+    });
+    QPointer<ApiRequestHandle> guarded(handle);
+    connect(reply, &QNetworkReply::finished, this, [this, guarded, reply] {
+        if (!guarded || guarded->m_reply != reply) {
             reply->deleteLater();
             return;
         }
-        // Streaming callers drain readyRead and any final bytes themselves.
-        // Error bodies are still read here for centralized error adaptation.
-        const QByteArray response = streaming && reply->error() == QNetworkReply::NoError
-            ? QByteArray{} : reply->readAll();
-        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const bool httpOk = status >= 200 && status < 300
-            && (expectedStatus == 0 || status == expectedStatus);
-        const bool ok = reply->error() == QNetworkReply::NoError && httpOk;
-        QString error;
-        if (!ok) {
-            const QString fallback = reply->error() == QNetworkReply::NoError
-                    || reply->errorString().isEmpty()
-                ? QStringLiteral("HTTP %1").arg(status) : reply->errorString();
-            error = responseError(response, fallback);
+        ApiRequestHandle *handle = guarded.data();
+        if (m_closing) {
+            handle->m_reply.clear();
+            reply->deleteLater();
+            return;
         }
-        QPointer<QNetworkReply> guardedReply(reply);
-        callback(ok, response, error);
-        // A completion callback may close its session and destroy the reply.
-        if (guardedReply)
-            guardedReply->deleteLater();
+        finishReply(handle, reply);
     });
-    return reply;
 }
 
-QNetworkReply *ApiClient::jsonRequest(const QString &method, const QString &path,
-                                      const QJsonObject &json, RawCallback callback)
+void ApiClient::finishReply(ApiRequestHandle *handle, QNetworkReply *reply)
+{
+    if (!handle || !reply || handle->m_completed || handle->m_reply != reply)
+        return;
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    const bool httpOk = status >= 200 && status < 300
+        && (handle->m_expectedStatus == 0 || status == handle->m_expectedStatus);
+    const bool ok = reply->error() == QNetworkReply::NoError && httpOk;
+    if (ok && handle->m_streaming) {
+        handle->m_networkFinished = true;
+        if (handle->m_readPaused || reply->bytesAvailable() > 0) {
+            // Keep the stable handle and final buffered bytes alive until the
+            // consumer's bounded writer queue has accepted every byte.
+            if (!handle->m_readPaused && reply->bytesAvailable() > 0) {
+                QPointer<ApiRequestHandle> guarded(handle);
+                QTimer::singleShot(0, handle, [guarded] {
+                    if (guarded && !guarded->m_readPaused && !guarded->m_completed)
+                        emit guarded->readyRead();
+                });
+            }
+            return;
+        }
+    }
+
+    // Streaming callers drain readyRead and final bytes themselves. Error
+    // bodies are consumed here and are never emitted as downloaded data.
+    const QByteArray response = reply->error() == QNetworkReply::OperationCanceledError
+        || (handle->m_streaming && reply->error() == QNetworkReply::NoError)
+        ? QByteArray{} : reply->readAll();
+    QString error;
+    if (!ok) {
+        const QString fallback = reply->error() == QNetworkReply::NoError
+                || reply->errorString().isEmpty()
+            ? QStringLiteral("HTTP %1").arg(status) : reply->errorString();
+        error = responseError(response, fallback);
+    }
+
+    if (status == 401 && handle->m_allowRefresh && !handle->m_cancelled
+        && handle->m_authEpoch == m_authEpoch
+        && handle->m_retryCount == 0 && !m_refreshToken.isEmpty()) {
+        ++handle->m_retryCount;
+        handle->m_reply.clear();
+        reply->deleteLater();
+        if (!m_waitingForRefresh.contains(handle))
+            m_waitingForRefresh.append(handle);
+        beginRefresh();
+        return;
+    }
+
+    const bool rejectedAfterRetry = status == 401 && handle->m_allowRefresh
+        && !handle->m_cancelled && handle->m_authEpoch == m_authEpoch && handle->m_retryCount > 0;
+    const bool noRefreshAvailable = status == 401 && handle->m_allowRefresh
+        && !handle->m_cancelled && handle->m_authEpoch == m_authEpoch
+        && m_refreshToken.isEmpty() && !m_session.user.id.isEmpty();
+    finishRequest(handle, ok && !handle->m_cancelled, response,
+                  handle->m_cancelled ? QStringLiteral("请求已取消") : error);
+    // A refreshed request is replayed exactly once. A second 401 invalidates
+    // the session instead of starting another refresh cycle.
+    if (rejectedAfterRetry || noRefreshAvailable)
+        failAuthentication(error);
+}
+
+void ApiClient::scheduleStreamingFinish(ApiRequestHandle *handle)
+{
+    if (!handle || !handle->m_streaming || !handle->m_networkFinished
+        || handle->m_readPaused || handle->m_completed || handle->m_cancelled)
+        return;
+    QPointer<ApiRequestHandle> guarded(handle);
+    QTimer::singleShot(0, handle, [this, guarded] {
+        if (!guarded || guarded->m_completed || guarded->m_cancelled
+            || guarded->m_readPaused || !guarded->m_networkFinished || !guarded->m_reply)
+            return;
+        if (guarded->m_reply->bytesAvailable() == 0)
+            finishReply(guarded.data(), guarded->m_reply.data());
+    });
+}
+
+void ApiClient::finishRequest(ApiRequestHandle *handle, bool ok, const QByteArray &body,
+                              const QString &error)
+{
+    if (!handle || handle->m_completed)
+        return;
+    handle->m_completed = true;
+    m_requests.removeAll(handle);
+    m_waitingForRefresh.removeAll(handle);
+    QPointer<ApiRequestHandle> guarded(handle);
+    QPointer<QNetworkReply> reply(handle->m_reply);
+    handle->m_callback(ok, body, error);
+    if (guarded)
+        guarded->deleteLater();
+    if (reply)
+        reply->deleteLater();
+}
+
+void ApiClient::cancelRequest(ApiRequestHandle *handle, bool deliverCallback)
+{
+    if (!handle || handle->m_completed || handle->m_cancelled)
+        return;
+    handle->m_cancelled = true;
+    m_waitingForRefresh.removeAll(handle);
+    if (!handle->m_reply) {
+        if (deliverCallback && !m_closing)
+            finishRequest(handle, false, {}, QStringLiteral("请求已取消"));
+        return;
+    }
+    if (handle->m_networkFinished) {
+        QPointer<QNetworkReply> reply = handle->m_reply;
+        handle->m_reply.clear();
+        if (reply) {
+            reply->disconnect();
+            reply->deleteLater();
+        }
+        if (deliverCallback && !m_closing)
+            finishRequest(handle, false, {}, QStringLiteral("请求已取消"));
+        return;
+    }
+    handle->m_reply->abort();
+    if (!deliverCallback && handle->m_reply)
+        handle->m_reply->disconnect();
+}
+
+void ApiClient::beginRefresh()
+{
+    if (m_refreshing || m_closing)
+        return;
+    if (m_refreshToken.isEmpty()) {
+        failAuthentication(QStringLiteral("登录会话已过期，请重新登录"));
+        return;
+    }
+    m_refreshing = true;
+    const quint64 epoch = m_authEpoch;
+    m_refreshRequest = startRefresh(m_refreshToken, [this, epoch](bool ok, const AuthSession &session,
+                                                                 const QString &error) {
+        completeRefresh(ok, session, error, epoch);
+    }, true);
+    if (!m_refreshRequest) {
+        m_refreshing = false;
+        failAuthentication(QStringLiteral("无法创建登录刷新请求"));
+    }
+}
+
+void ApiClient::completeRefresh(bool ok, const AuthSession &session, const QString &error,
+                                quint64 epoch)
+{
+    if (m_closing || epoch != m_authEpoch)
+        return;
+    m_refreshRequest.clear();
+    m_refreshing = false;
+    QString failure = error;
+    if (ok && m_sessionStore) {
+        QString saveError;
+        if (!m_sessionStore->saveSession(session, &saveError))
+            failure = QStringLiteral("无法保存刷新后的会话：") + saveError;
+    }
+    if (!ok || !failure.isEmpty()) {
+        failAuthentication(failure.isEmpty() ? QStringLiteral("登录会话刷新失败") : failure);
+        return;
+    }
+
+    // Do not invalidate requests waiting on this same-epoch refresh. A later
+    // explicit login/logout changes the epoch and makes late callbacks inert.
+    m_session = session;
+    m_accessToken = session.accessToken;
+    m_refreshToken = session.refreshToken;
+    emit sessionRefreshed(session);
+    const auto waiting = m_waitingForRefresh;
+    m_waitingForRefresh.clear();
+    for (const QPointer<ApiRequestHandle> &guarded : waiting) {
+        if (guarded && !guarded->m_cancelled && !guarded->m_completed)
+            startRequest(guarded.data());
+    }
+}
+
+void ApiClient::failAuthentication(const QString &error)
+{
+    if (m_authFailureInProgress || m_closing)
+        return;
+    m_authFailureInProgress = true;
+    m_refreshing = false;
+    m_refreshRequest.clear();
+    m_session = {};
+    m_accessToken.clear();
+    m_refreshToken.clear();
+    if (m_sessionStore)
+        m_sessionStore->clearSession();
+
+    const auto waiting = m_waitingForRefresh;
+    m_waitingForRefresh.clear();
+    const QString message = error.isEmpty() ? QStringLiteral("登录会话已失效，请重新登录") : error;
+    for (const QPointer<ApiRequestHandle> &guarded : waiting) {
+        if (guarded && !guarded->m_completed)
+            finishRequest(guarded.data(), false, {}, message);
+    }
+    m_authFailureInProgress = false;
+    emit authenticationFailed(message);
+}
+
+ApiRequestHandle *ApiClient::jsonRequest(const QString &method, const QString &path,
+                                         const QJsonObject &json, RawCallback callback,
+                                         bool allowRefresh)
 {
     return request(method, path, QJsonDocument(json).toJson(QJsonDocument::Compact),
-                   QStringLiteral("application/json"), {}, std::move(callback));
+                   QStringLiteral("application/json"), {}, std::move(callback),
+                   false, 0, allowRefresh);
 }
 
-QNetworkReply *ApiClient::registerUser(const QString &username, const QString &password,
+ApiRequestHandle *ApiClient::registerUser(const QString &username, const QString &password,
                                        AuthCallback callback)
 {
     return jsonRequest(QStringLiteral("POST"), QStringLiteral("/api/v1/auth/register"),
@@ -312,10 +632,10 @@ QNetworkReply *ApiClient::registerUser(const QString &username, const QString &p
         } else {
             callback(false, {}, error);
         }
-    });
+    }, false);
 }
 
-QNetworkReply *ApiClient::login(const QString &username, const QString &password,
+ApiRequestHandle *ApiClient::login(const QString &username, const QString &password,
                                 AuthCallback callback)
 {
     return jsonRequest(QStringLiteral("POST"), QStringLiteral("/api/v1/auth/login"),
@@ -333,11 +653,19 @@ QNetworkReply *ApiClient::login(const QString &username, const QString &password
         } else {
             callback(false, {}, error);
         }
-    });
+    }, false);
 }
 
-QNetworkReply *ApiClient::refresh(const QString &refreshToken, AuthCallback callback)
+ApiRequestHandle *ApiClient::refresh(const QString &refreshToken, AuthCallback callback)
 {
+    return startRefresh(refreshToken, std::move(callback), false);
+}
+
+ApiRequestHandle *ApiClient::startRefresh(const QString &refreshToken, AuthCallback callback,
+                                          bool internal)
+{
+    if (m_loggingOut && !internal)
+        return nullptr;
     return jsonRequest(QStringLiteral("POST"), QStringLiteral("/api/v1/auth/refresh"),
                        {{QStringLiteral("refresh_token"), refreshToken}},
                        [callback](bool ok, const QByteArray &body, const QString &error) {
@@ -346,6 +674,8 @@ QNetworkReply *ApiClient::refresh(const QString &refreshToken, AuthCallback call
             session = parseAuth(QJsonDocument::fromJson(body).object());
             if (session.accessToken.isEmpty())
                 callback(false, {}, QStringLiteral("刷新响应缺少 access_token"));
+            else if (session.refreshToken.isEmpty())
+                callback(false, {}, QStringLiteral("刷新响应缺少 refresh_token"));
             else if (session.user.id.isEmpty())
                 callback(false, {}, QStringLiteral("刷新响应缺少用户 id"));
             else
@@ -353,10 +683,42 @@ QNetworkReply *ApiClient::refresh(const QString &refreshToken, AuthCallback call
         } else {
             callback(false, {}, error);
         }
-    });
+    }, false);
 }
 
-QNetworkReply *ApiClient::users(UsersCallback callback)
+ApiRequestHandle *ApiClient::logout(OperationCallback callback)
+{
+    if (m_closing || m_loggingOut)
+        return nullptr;
+
+    // Logout is an authentication boundary, not an ordinary queued request.
+    // Invalidate every older request (especially independent refreshes and
+    // requests waiting for one) before creating the revocation request.
+    m_loggingOut = true;
+    ++m_authEpoch;
+    m_refreshing = false;
+    m_refreshRequest.clear();
+    const auto requests = m_requests;
+    for (const QPointer<ApiRequestHandle> &guarded : requests) {
+        if (guarded && !guarded->m_completed && !guarded->m_cancelled)
+            cancelRequest(guarded.data(), true);
+    }
+    m_waitingForRefresh.clear();
+
+    const quint64 epoch = m_authEpoch;
+    ApiRequestHandle *handle = request(QStringLiteral("POST"), QStringLiteral("/api/v1/auth/logout"), {},
+                   QStringLiteral("application/json"), {},
+                   [this, epoch, callback](bool ok, const QByteArray &, const QString &error) {
+        if (epoch == m_authEpoch && !ok)
+            m_loggingOut = false;
+        callback(ok, error);
+    }, false, 204, true, true);
+    if (!handle)
+        m_loggingOut = false;
+    return handle;
+}
+
+ApiRequestHandle *ApiClient::users(UsersCallback callback)
 {
     return jsonRequest(QStringLiteral("GET"), QStringLiteral("/api/v1/users"), {},
                        [callback](bool ok, const QByteArray &body, const QString &error) {
@@ -382,7 +744,7 @@ QNetworkReply *ApiClient::users(UsersCallback callback)
     });
 }
 
-QNetworkReply *ApiClient::presence(PresenceCallback callback)
+ApiRequestHandle *ApiClient::presence(PresenceCallback callback)
 {
     return jsonRequest(QStringLiteral("GET"), QStringLiteral("/api/v1/presence"), {},
                        [callback](bool ok, const QByteArray &body, const QString &error) {
@@ -403,7 +765,7 @@ QNetworkReply *ApiClient::presence(PresenceCallback callback)
     });
 }
 
-QNetworkReply *ApiClient::markRead(const QString &peerId, const QString &cursor,
+ApiRequestHandle *ApiClient::markRead(const QString &peerId, const QString &cursor,
                                    std::function<void(bool, QString)> callback)
 {
     return jsonRequest(QStringLiteral("POST"), QStringLiteral("/api/v1/messages/read"),
@@ -414,7 +776,7 @@ QNetworkReply *ApiClient::markRead(const QString &peerId, const QString &cursor,
     });
 }
 
-QNetworkReply *ApiClient::wsTicket(TicketCallback callback)
+ApiRequestHandle *ApiClient::wsTicket(TicketCallback callback)
 {
     return jsonRequest(QStringLiteral("POST"), QStringLiteral("/api/v1/ws-ticket"), {},
                        [callback](bool ok, const QByteArray &body, const QString &error) {
@@ -429,7 +791,7 @@ QNetworkReply *ApiClient::wsTicket(TicketCallback callback)
     });
 }
 
-QNetworkReply *ApiClient::messages(const QString &peerId, const QString &afterId,
+ApiRequestHandle *ApiClient::messages(const QString &peerId, const QString &afterId,
                                    MessagesCallback callback)
 {
     QUrlQuery query;
@@ -461,9 +823,10 @@ QNetworkReply *ApiClient::messages(const QString &peerId, const QString &afterId
                     callback(false, {}, codecError);
                     return;
                 }
-                const QJsonDocument payload = QJsonDocument::fromJson(wire.payload);
-                message = parseMessage(payload.isObject() ? payload.object()
-                                                         : textPayload(QString::fromUtf8(wire.payload)));
+                if (!MessagePayloadCodec::decode(wire.payload, &message, &codecError)) {
+                    callback(false, {}, codecError);
+                    return;
+                }
                 message.id = wire.messageId;
                 message.conversationId = wire.conversationId;
                 message.senderId = wire.senderId;
@@ -483,14 +846,14 @@ QNetworkReply *ApiClient::messages(const QString &peerId, const QString &afterId
     });
 }
 
-QNetworkReply *ApiClient::initFile(const QString &peerId, const QString &fileName, qint64 size,
+ApiRequestHandle *ApiClient::initFile(const QString &peerId, const QString &fileName, qint64 size,
                                    const QString &sha256, FileInitCallback callback)
 {
     const QJsonObject json{{QStringLiteral("recipient_id"), peerId},
                            {QStringLiteral("filename"), fileName},
                            {QStringLiteral("size"), size},
                            {QStringLiteral("sha256"), sha256},
-                           {QStringLiteral("chunk_size"), 4 * 1024 * 1024}};
+                           {QStringLiteral("chunk_size"), DefaultFileChunkSize}};
     return jsonRequest(QStringLiteral("POST"), QStringLiteral("/api/v1/files/init"), json,
                        [callback](bool ok, const QByteArray &body, const QString &error) {
         if (!ok) {
@@ -503,7 +866,7 @@ QNetworkReply *ApiClient::initFile(const QString &peerId, const QString &fileNam
     });
 }
 
-QNetworkReply *ApiClient::fileStatus(const QString &fileId, FileStatusCallback callback)
+ApiRequestHandle *ApiClient::fileStatus(const QString &fileId, FileStatusCallback callback)
 {
     return jsonRequest(QStringLiteral("GET"), QStringLiteral("/api/v1/files/") + fileId, {},
                        [callback](bool ok, const QByteArray &body, const QString &error) {
@@ -515,7 +878,7 @@ QNetworkReply *ApiClient::fileStatus(const QString &fileId, FileStatusCallback c
     });
 }
 
-QNetworkReply *ApiClient::putChunk(const QString &fileId, int index, const QByteArray &data,
+ApiRequestHandle *ApiClient::putChunk(const QString &fileId, int index, const QByteArray &data,
                                    const QString &sha256, OperationCallback callback)
 {
     return request(QStringLiteral("PUT"),
@@ -527,7 +890,7 @@ QNetworkReply *ApiClient::putChunk(const QString &fileId, int index, const QByte
     });
 }
 
-QNetworkReply *ApiClient::completeFile(const QString &fileId, OperationCallback callback)
+ApiRequestHandle *ApiClient::completeFile(const QString &fileId, OperationCallback callback)
 {
     return jsonRequest(QStringLiteral("POST"),
                        QStringLiteral("/api/v1/files/") + fileId + QStringLiteral("/complete"), {},
@@ -536,18 +899,18 @@ QNetworkReply *ApiClient::completeFile(const QString &fileId, OperationCallback 
     });
 }
 
-QNetworkReply *ApiClient::downloadFile(const QString &fileId, OperationCallback callback,
+ApiRequestHandle *ApiClient::downloadFile(const QString &fileId, OperationCallback callback,
                                        ProgressCallback progress)
 {
-    QNetworkReply *reply = request(QStringLiteral("GET"),
+    ApiRequestHandle *handle = request(QStringLiteral("GET"),
         QStringLiteral("/api/v1/files/") + fileId + QStringLiteral("/download"), {}, {}, {},
         [callback](bool ok, const QByteArray &, const QString &error) { callback(ok, error); }, true);
-    if (progress)
-        connect(reply, &QNetworkReply::downloadProgress, this, std::move(progress));
-    return reply;
+    if (handle && progress)
+        connect(handle, &ApiRequestHandle::downloadProgress, this, std::move(progress));
+    return handle;
 }
 
-QNetworkReply *ApiClient::deleteFile(const QString &fileId, OperationCallback callback)
+ApiRequestHandle *ApiClient::deleteFile(const QString &fileId, OperationCallback callback)
 {
     return jsonRequest(QStringLiteral("DELETE"), QStringLiteral("/api/v1/files/") + fileId, {},
                        [callback](bool ok, const QByteArray &, const QString &error) {
@@ -555,7 +918,7 @@ QNetworkReply *ApiClient::deleteFile(const QString &fileId, OperationCallback ca
     });
 }
 
-QNetworkReply *ApiClient::deleteCurrentAccount(OperationCallback callback)
+ApiRequestHandle *ApiClient::deleteCurrentAccount(OperationCallback callback)
 {
     return request(QStringLiteral("DELETE"), QStringLiteral("/api/v1/users/me"), {}, {}, {},
                    [callback](bool ok, const QByteArray &, const QString &error) {
