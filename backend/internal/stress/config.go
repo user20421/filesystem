@@ -1,4 +1,4 @@
-// Package stress implements the Secure IM real-load stress runner.
+// Package stress implements the IMFT real-load stress runner.
 package stress
 
 import (

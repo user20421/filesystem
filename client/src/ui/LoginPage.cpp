@@ -25,7 +25,7 @@ LoginPage::LoginPage(ApiClient *api, QWidget *parent)
     auto *layout = new QVBoxLayout(panel);
     layout->setContentsMargins(32, 18, 32, 18);
     layout->setSpacing(10);
-    auto *brand = new QLabel(QStringLiteral("聊天和文件传输软件"), panel);
+    auto *brand = new QLabel(QStringLiteral("即时通讯与文件传输系统"), panel);
     brand->setObjectName(QStringLiteral("brandTitle"));
     brand->setAlignment(Qt::AlignCenter);
     layout->addWidget(brand);

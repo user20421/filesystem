@@ -46,7 +46,7 @@ func main() {
 	flags.DurationVar(&duration, "duration", 0, "")
 	flags.Int64Var(&hiddenFileBytes, "file-size-bytes", 0, "")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Secure IM real-load stress runner")
+		fmt.Fprintln(flags.Output(), "IMFT real-load stress runner")
 		fmt.Fprintln(flags.Output(), "Public flags: --server --env-file --report-root --target --mix --connection-rate --stable-duration --chat-rate --file-size-mib --chunk-size --file-workers --file-queue-size --file-budget-mib --ramp-timeout --drain-timeout --docker-container")
 	}
 	if err := flags.Parse(os.Args[1:]); err != nil {

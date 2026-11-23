@@ -1,6 +1,6 @@
 # stress-runner
 
-Real Secure IM load generator. It provisions one `STRESS_*` user per connection with a single reused Argon2id hash, signs access tokens with the backend `auth.TokenManager`, then uses real ws-ticket/WebSocket Protobuf v2 traffic and file REST APIs. Preparation is excluded from the measured stable phase.
+Real IMFT load generator. It provisions one `STRESS_*` user per connection with a single reused Argon2id hash, signs access tokens with the backend `auth.TokenManager`, then uses real ws-ticket/WebSocket Protobuf v2 traffic and file REST APIs. Preparation is excluded from the measured stable phase.
 
 From the repository root:
 

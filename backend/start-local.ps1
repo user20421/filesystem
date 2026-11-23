@@ -64,5 +64,5 @@ $binary = Join-Path $binaryDirectory 'secure-im-server.exe'
 Set-Location $PSScriptRoot
 & go build -o $binary ./cmd/server
 if ($LASTEXITCODE -ne 0) { throw 'Backend build failed.' }
-Write-Host "Starting Secure IM backend at http://$ListenAddr"
+Write-Host "Starting IMFT backend at http://$ListenAddr"
 & $binary

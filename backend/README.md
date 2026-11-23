@@ -1,4 +1,4 @@
-# Secure IM Go backend
+# IMFT Go backend
 
 A modular monolith providing authenticated direct messaging over WebSocket and chunked file transfer. It uses MySQL for metadata, MinIO for plaintext chunks, and an in-memory single-instance online hub. Only MySQL and MinIO are required infrastructure. The HTTP layer is fully native Gin: `cmd/server` defines public `/api/v1` and authenticated route groups, and business handlers and middleware use `*gin.Context` directly without a `net/http` Handler adapter. Explicit `json.Encoder` responses, `RemoteAddr` rate limiting, `MaxBytesReader`, ResponseController deadlines, chunked streaming with `Content-Disposition`, and direct Gorilla WebSocket upgrades preserve the existing API and client behavior.
 

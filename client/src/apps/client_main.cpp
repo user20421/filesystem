@@ -13,7 +13,7 @@ int main(int argc, char *argv[])
     QApplication::setApplicationName(QStringLiteral("secure-im-client"));
     Theme::apply(application);
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("单用户安全 IM Qt 客户端"));
+    parser.setApplicationDescription(QStringLiteral("即时通讯与文件传输系统单用户 Qt 客户端"));
     parser.addHelpOption();
     const QCommandLineOption dataDirOption(QStringLiteral("data-dir"),
         QStringLiteral("客户端数据 base 目录（必填）"), QStringLiteral("directory"));

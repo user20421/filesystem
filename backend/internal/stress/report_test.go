@@ -117,7 +117,7 @@ func TestReportArtifacts(t *testing.T) {
 	html, _ := os.ReadFile(filepath.Join(report.Dir, "report.html"))
 	htmlText := string(html)
 	for _, text := range []string{
-		"Secure IM", "运行编号：", "<h2 class=\"status success\">成功</h2>",
+		"IMFT", "运行编号：", "<h2 class=\"status success\">成功</h2>",
 		"稳定时长完整且未中断", "<td>通过</td>", "文件工作线程/内存预算",
 		"条/秒/用户", "分块通道已用/上限（最后有效采样）", "<td colspan=\"3\">7 / 96</td>",
 	} {
