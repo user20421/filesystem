@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestRateLimiterWindowAndIndependentKeys(t *testing.T) {
@@ -72,7 +74,9 @@ func TestAuthHandlersRejectRateLimitedRequestsBeforeService(t *testing.T) {
 		req.RemoteAddr = remoteAddr
 		req.Header.Set("X-Forwarded-For", "198.51.100.99")
 		recorder := httptest.NewRecorder()
-		handler.Register(recorder, req)
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = req
+		handler.Register(c)
 		assertRateLimited(t, recorder)
 	})
 
@@ -82,7 +86,9 @@ func TestAuthHandlersRejectRateLimitedRequestsBeforeService(t *testing.T) {
 		req.RemoteAddr = remoteAddr
 		req.Header.Set("X-Forwarded-For", "198.51.100.99")
 		recorder := httptest.NewRecorder()
-		handler.Login(recorder, req)
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = req
+		handler.Login(c)
 		assertRateLimited(t, recorder)
 	})
 }

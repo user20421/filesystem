@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"secure-im/backend/internal/account"
 	"secure-im/backend/internal/auth"
 	"secure-im/backend/internal/chat"
@@ -81,32 +82,32 @@ func run(log *slog.Logger) error {
 		<-cleanupDone
 	}()
 	accountHTTP := account.NewHandler(account.NewService(db, files, hub.CloseUser, tickets.RevokeUser))
-	audit := func(r *http.Request, action, id string) {
-		store.Audit(r.Context(), db, auth.UserID(r.Context()), action, id, httpx.ClientIP(r))
+	audit := func(c *gin.Context, action, id string) {
+		store.Audit(c.Request.Context(), db, auth.UserID(c.Request.Context()), action, id, httpx.ClientIP(c.Request))
 	}
 	fileHTTP := filetransfer.NewHandler(files, log, cfg.MaxChunkSize, audit)
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { httpx.Data(w, 200, map[string]string{"status": "ok"}) })
-	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
-		readyCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	mux := newRouter(authHTTP.Middleware(), chatHTTP.WebSocket, httpx.RequestContext(), httpx.Recover(log), requestLogger(log))
+	get(mux.engine, "/health", func(c *gin.Context) { httpx.Data(c, http.StatusOK, map[string]string{"status": "ok"}) })
+	get(mux.engine, "/ready", func(c *gin.Context) {
+		readyCtx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
 		if err := db.PingContext(readyCtx); err != nil {
-			httpx.Fail(w, r, httpx.Error(503, "database_unavailable", "database is unavailable"))
+			httpx.Fail(c, httpx.Error(http.StatusServiceUnavailable, "database_unavailable", "database is unavailable"))
 			return
 		}
 		if err := objects.Ensure(readyCtx); err != nil {
-			httpx.Fail(w, r, httpx.Error(503, "storage_unavailable", "object storage is unavailable"))
+			httpx.Fail(c, httpx.Error(http.StatusServiceUnavailable, "storage_unavailable", "object storage is unavailable"))
 			return
 		}
-		httpx.Data(w, 200, map[string]string{"status": "ready"})
+		httpx.Data(c, http.StatusOK, map[string]string{"status": "ready"})
 	})
 	if cfg.EnableDebugStats {
-		mux.HandleFunc("GET /debug/stats", func(w http.ResponseWriter, r *http.Request) {
+		get(mux.engine, "/debug/stats", func(c *gin.Context) {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			used, limit := files.MemoryStats()
 			slotsUsed, slotsLimit := files.ChunkSlotStats()
-			httpx.Data(w, 200, map[string]any{
+			httpx.Data(c, http.StatusOK, map[string]any{
 				"go": map[string]any{
 					"mem_alloc_bytes":       mem.Alloc,
 					"mem_total_alloc_bytes": mem.TotalAlloc,
@@ -122,30 +123,25 @@ func run(log *slog.Logger) error {
 			})
 		})
 	}
-	mux.HandleFunc("POST /api/v1/auth/register", authHTTP.Register)
-	mux.HandleFunc("POST /api/v1/auth/login", authHTTP.Login)
-	mux.HandleFunc("POST /api/v1/auth/refresh", authHTTP.Refresh)
-	protect := func(handler http.HandlerFunc) http.Handler { return authHTTP.Middleware(handler) }
-	mux.Handle("POST /api/v1/auth/logout", protect(authHTTP.Logout))
-	mux.Handle("GET /api/v1/users/me", protect(authHTTP.Me))
-	mux.Handle("DELETE /api/v1/users/me", protect(accountHTTP.DeleteMe))
-	mux.Handle("GET /api/v1/users", protect(authHTTP.Users))
-	mux.Handle("GET /api/v1/presence", protect(chatHTTP.Presence))
-	mux.Handle("POST /api/v1/ws-ticket", protect(chatHTTP.Ticket))
-	mux.Handle("GET /api/v1/messages", protect(chatHTTP.History))
-	mux.Handle("GET /api/v1/messages/unread", protect(chatHTTP.Unread))
-	mux.Handle("POST /api/v1/messages/read", protect(chatHTTP.MarkRead))
-	mux.Handle("POST /api/v1/files/init", protect(fileHTTP.Init))
-	mux.Handle("GET /api/v1/files/{file_id}", protect(fileHTTP.Status))
-	mux.Handle("PUT /api/v1/files/{file_id}/chunks/{index}", protect(fileHTTP.Upload))
-	mux.Handle("POST /api/v1/files/{file_id}/complete", protect(fileHTTP.Complete))
-	mux.Handle("GET /api/v1/files/{file_id}/download", protect(fileHTTP.Download))
-	mux.Handle("DELETE /api/v1/files/{file_id}", protect(fileHTTP.Delete))
-	mux.HandleFunc("/ws", chatHTTP.WebSocket)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		httpx.Fail(w, r, httpx.Error(404, "not_found", "route not found"))
-	})
-	server := &http.Server{Addr: cfg.Address, Handler: httpx.RequestContext(httpx.Recover(log, requestLogger(log, mux))), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
+	mux.public.POST("/auth/register", authHTTP.Register)
+	mux.public.POST("/auth/login", authHTTP.Login)
+	mux.public.POST("/auth/refresh", authHTTP.Refresh)
+	mux.protected.POST("/auth/logout", authHTTP.Logout)
+	get(mux.protected, "/users/me", authHTTP.Me)
+	mux.protected.DELETE("/users/me", accountHTTP.DeleteMe)
+	get(mux.protected, "/users", authHTTP.Users)
+	get(mux.protected, "/presence", chatHTTP.Presence)
+	mux.protected.POST("/ws-ticket", chatHTTP.Ticket)
+	get(mux.protected, "/messages", chatHTTP.History)
+	get(mux.protected, "/messages/unread", chatHTTP.Unread)
+	mux.protected.POST("/messages/read", chatHTTP.MarkRead)
+	mux.protected.POST("/files/init", fileHTTP.Init)
+	get(mux.protected, "/files/:file_id", fileHTTP.Status)
+	mux.protected.PUT("/files/:file_id/chunks/:index", fileHTTP.Upload)
+	mux.protected.POST("/files/:file_id/complete", fileHTTP.Complete)
+	get(mux.protected, "/files/:file_id/download", fileHTTP.Download)
+	mux.protected.DELETE("/files/:file_id", fileHTTP.Delete)
+	server := &http.Server{Addr: cfg.Address, Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20}
 	errCh := make(chan error, 1)
 	go func() { log.Info("server listening", "address", cfg.Address); errCh <- server.ListenAndServe() }()
 	select {
@@ -164,10 +160,10 @@ func run(log *slog.Logger) error {
 		return nil
 	}
 }
-func requestLogger(log *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func requestLogger(log *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Info("http request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start), "request_id", httpx.RequestID(r.Context()))
-	})
+		c.Next()
+		log.Info("http request", "method", c.Request.Method, "path", c.Request.URL.Path, "duration", time.Since(start), "request_id", httpx.RequestID(c.Request.Context()))
+	}
 }

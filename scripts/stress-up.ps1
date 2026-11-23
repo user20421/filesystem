@@ -79,10 +79,15 @@ function Invoke-StressRootAuthRequest {
 
 # 注册允许 409，但必须真实登录并取得访问令牌，不能伪造 ROOT 会话。
 function Assert-StressRootCredentials {
-    $registration = Invoke-StressRootAuthRequest -Path '/api/v1/auth/register'
-    $alreadyExists = $registration.StatusCode -eq 409
-    if (-not $alreadyExists -and ($registration.StatusCode -lt 200 -or $registration.StatusCode -ge 300)) {
-        throw "ROOT registration failed with HTTP $($registration.StatusCode)."
+    param([switch]$LoginOnly)
+
+    $alreadyExists = $false
+    if (-not $LoginOnly) {
+        $registration = Invoke-StressRootAuthRequest -Path '/api/v1/auth/register'
+        $alreadyExists = $registration.StatusCode -eq 409
+        if (-not $alreadyExists -and ($registration.StatusCode -lt 200 -or $registration.StatusCode -ge 300)) {
+            throw "ROOT registration failed with HTTP $($registration.StatusCode)."
+        }
     }
 
     # Always perform a real login, including after HTTP 409, so an existing ROOT
@@ -128,6 +133,24 @@ function Initialize-StressDatabase {
 }
 
 try {
+    # Already-running environments need no Docker inspection, env writes or rebuild.
+    # Readiness alone is insufficient: a real ROOT login and token are mandatory.
+    $alreadyReady = $false
+    try {
+        $readyResponse = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:18080/ready' -TimeoutSec 3
+        $alreadyReady = $readyResponse.StatusCode -eq 200
+    }
+    catch {
+        $alreadyReady = $false
+    }
+    if ($alreadyReady) {
+        Assert-StressRootCredentials -LoginOnly
+        Write-Host 'Stress backend was already ready; skipped setup and build.'
+        Write-Host 'Stress backend is ready: http://127.0.0.1:18080/ready'
+        Write-Host 'Debug stats: http://127.0.0.1:18080/debug/stats'
+        return
+    }
+
     Assert-Docker
     if (-not (Get-EnvironmentFile)) {
         throw 'No base .env file was found. Run scripts/dev-up.ps1 first.'
@@ -185,7 +208,7 @@ try {
 }
 catch {
     Write-Host "Stress startup failed: $($_.Exception.Message)" -ForegroundColor Red
-    if (Test-Path -LiteralPath (Get-StressEnvironmentFile) -PathType Leaf) {
+    if (-not $alreadyReady -and (Test-Path -LiteralPath (Get-StressEnvironmentFile) -PathType Leaf)) {
         Invoke-StressDockerCompose -ComposeArguments @('ps', '-a')
         Invoke-StressDockerCompose -ComposeArguments @('logs', '--tail', '40', 'backend')
     }

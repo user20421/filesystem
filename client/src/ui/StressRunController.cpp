@@ -71,6 +71,12 @@ StressRunConfig StressRunConfig::forProject(const QString &projectRoot)
     const QString reportOverride = qEnvironmentVariable("SECURE_IM_STRESS_REPORT_ROOT").trimmed();
     if (!reportOverride.isEmpty())
         config.reportRoot = reportOverride;
+    const QString setupOverride = qEnvironmentVariable("SECURE_IM_STRESS_SETUP_SCRIPT").trimmed();
+    if (!setupOverride.isEmpty())
+        config.setupScriptPath = setupOverride;
+    const QString shellOverride = qEnvironmentVariable("SECURE_IM_STRESS_POWERSHELL").trimmed();
+    if (!shellOverride.isEmpty())
+        config.powerShellPath = shellOverride;
     if (qEnvironmentVariable("SECURE_IM_STRESS_SKIP_SETUP") == QLatin1String("1"))
         config.setupScriptPath.clear();
     return config;
@@ -109,14 +115,7 @@ StressRunController::StressRunController(const StressRunConfig &config, QObject 
 
 StressRunController::~StressRunController()
 {
-    if (m_process->state() == QProcess::NotRunning)
-        return;
-    m_stopRequested = true;
-    m_process->terminate();
-    if (!m_process->waitForFinished(500)) {
-        m_process->kill();
-        m_process->waitForFinished(1500);
-    }
+    stopAndWait();
 }
 
 bool StressRunController::isRunning() const
@@ -135,6 +134,8 @@ bool StressRunController::start(qint64 target)
 
     m_stdoutBuffer.clear();
     m_standardError.clear();
+    m_setupOutput.clear();
+    m_prepareOnly = false;
     m_stopRequested = false;
     m_hasFinal = false;
     m_finishEmitted = false;
@@ -146,10 +147,30 @@ bool StressRunController::start(qint64 target)
     return true;
 }
 
+bool StressRunController::prepare()
+{
+    if (isRunning())
+        return false;
+    m_stdoutBuffer.clear();
+    m_standardError.clear();
+    m_setupOutput.clear();
+    m_prepareOnly = true;
+    m_stopRequested = false;
+    m_hasFinal = false;
+    m_finishEmitted = false;
+    m_final = StressFinal{};
+    m_process->setWorkingDirectory(m_config.projectRoot);
+    startSetup();
+    return true;
+}
+
 void StressRunController::startSetup()
 {
     if (m_config.setupScriptPath.trimmed().isEmpty()) {
-        startRunner();
+        if (m_prepareOnly)
+            finish(true, QStringLiteral("环境已就绪。"));
+        else
+            startRunner();
         return;
     }
     m_stage = Stage::Setup;
@@ -164,6 +185,10 @@ void StressRunController::startSetup()
 // startRunner 在环境准备完成后启动真实负载进程，避免 setup 与 runner 同时写配置或占用同一报告目录。
 void StressRunController::startRunner()
 {
+    if (m_prepareOnly) {
+        finish(true, QStringLiteral("环境已就绪。"));
+        return;
+    }
     const qint64 target = m_process->property("stressTarget").toLongLong();
     m_stage = Stage::Runner;
     m_stdoutBuffer.clear();
@@ -191,20 +216,43 @@ void StressRunController::stop()
     }
 }
 
+void StressRunController::stopAndWait()
+{
+    stop();
+    if (m_process->state() != QProcess::NotRunning) {
+        if (!m_process->waitForFinished(2000)) {
+            m_process->kill();
+            m_process->waitForFinished(1500);
+        }
+    }
+    m_killTimer->stop();
+    if (isRunning())
+        finish(false, QStringLiteral("压力测试已停止。"));
+}
+
 void StressRunController::readStandardOutput()
 {
     const QByteArray bytes = m_process->readAllStandardOutput();
-    if (m_stage != Stage::Runner)
-        return; // stress-up output is diagnostic only, never runner NDJSON.
+    if (m_stage != Stage::Runner) {
+        m_setupOutput.append(QString::fromUtf8(bytes));
+        if (m_setupOutput.size() > 16384)
+            m_setupOutput = m_setupOutput.right(16384);
+        return; // Setup output is diagnostic only, never runner NDJSON.
+    }
     m_stdoutBuffer.append(bytes);
     consumeBuffer(false);
 }
 
 void StressRunController::drainStandardOutput()
 {
-    if (m_stage != Stage::Runner)
+    const QByteArray bytes = m_process->readAllStandardOutput();
+    if (m_stage != Stage::Runner) {
+        m_setupOutput.append(QString::fromUtf8(bytes));
+        if (m_setupOutput.size() > 16384)
+            m_setupOutput = m_setupOutput.right(16384);
         return;
-    m_stdoutBuffer.append(m_process->readAllStandardOutput());
+    }
+    m_stdoutBuffer.append(bytes);
     consumeBuffer(true);
 }
 
@@ -294,7 +342,10 @@ void StressRunController::handleFinished(int exitCode, int exitStatus)
     }
     if (m_stage == Stage::Setup) {
         if (exitStatus == static_cast<int>(QProcess::NormalExit) && exitCode == 0) {
-            startRunner();
+            if (m_prepareOnly)
+                finish(true, QStringLiteral("环境已就绪。"));
+            else
+                startRunner();
         } else {
             finish(false, QStringLiteral("环境准备失败：%1").arg(processErrorText(exitCode, exitStatus)));
         }
@@ -335,9 +386,13 @@ QString StressRunController::processErrorText(int exitCode, int exitStatus) cons
 {
     QString text = exitStatus == static_cast<int>(QProcess::NormalExit)
         ? QStringLiteral("退出码 %1").arg(exitCode) : QStringLiteral("进程崩溃");
-    const QString details = m_standardError.trimmed();
-    if (!details.isEmpty())
-        text += QStringLiteral("；%1").arg(details.right(1000));
+    QStringList outputs;
+    if (!m_setupOutput.trimmed().isEmpty())
+        outputs.append(m_setupOutput.trimmed());
+    if (!m_standardError.trimmed().isEmpty())
+        outputs.append(m_standardError.trimmed());
+    if (!outputs.isEmpty())
+        text += QStringLiteral("；%1").arg(outputs.join(QStringLiteral("\n")).right(4000));
     return text;
 }
 

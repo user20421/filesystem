@@ -13,13 +13,13 @@ class QPushButton;
 class LoginPage final : public QWidget {
     Q_OBJECT
 public:
-    LoginPage(ApiClient *api, LocalStore *store, QWidget *parent = nullptr);
+    explicit LoginPage(ApiClient *api, QWidget *parent = nullptr);
     void setUsername(const QString &username);
     void showError(const QString &error);
     void shutdown();
 
-    // Return true when the interceptor owns this request. External flows must
-    // persist into their own store; the normal flow keeps using m_store.
+    // Return true when the interceptor owns this request. SessionPage activates
+    // the backend-identified user and persists ordinary sessions centrally.
     using AuthenticationInterceptor = std::function<bool(
         const QString &, const QString &, bool, ApiClient::AuthCallback)>;
     void setAuthenticationInterceptor(AuthenticationInterceptor interceptor)
@@ -35,7 +35,6 @@ private:
     void setBusy(bool busy);
 
     ApiClient *m_api;
-    LocalStore *m_store;
     QLineEdit *m_username;
     QLineEdit *m_password;
     QPushButton *m_login;

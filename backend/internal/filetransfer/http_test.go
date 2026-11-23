@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"secure-im/backend/internal/auth"
 )
@@ -86,12 +87,14 @@ func TestDownloadBeyondSixtySecondsUsesRollingWriteDeadline(t *testing.T) {
 	tokens := auth.NewTokenManager([]byte("01234567890123456789012345678901"), time.Hour, time.Hour)
 	authHandler := auth.NewHandler(auth.NewService(db, tokens), auth.RateLimitConfig{}, auth.RateLimitConfig{})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/files/"+id+"/download", nil)
-	req.SetPathValue("file_id", id)
 	req.Header.Set("Authorization", "Bearer "+token)
 	// Each payload write takes 31 virtual seconds. A fixed 60-second response
 	// deadline would abort the second write; a rolling idle deadline must not.
 	response := newDeadlineRecorder(31 * time.Second)
-	authHandler.Middleware(http.HandlerFunc(handler.Download)).ServeHTTP(response, req)
+	router := gin.New()
+	router.Use(authHandler.Middleware())
+	router.GET("/api/v1/files/:file_id/download", handler.Download)
+	router.ServeHTTP(response, req)
 
 	if response.Code != http.StatusOK || response.Body.String() != "ab" {
 		t.Fatalf("download failed: status=%d body=%q", response.Code, response.Body.String())
@@ -131,10 +134,12 @@ func TestCompleteClearsGlobalWriteDeadline(t *testing.T) {
 	tokens := auth.NewTokenManager([]byte("01234567890123456789012345678901"), time.Hour, time.Hour)
 	authHandler := auth.NewHandler(auth.NewService(db, tokens), auth.RateLimitConfig{}, auth.RateLimitConfig{})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/files/"+id+"/complete", nil)
-	req.SetPathValue("file_id", id)
 	req.Header.Set("Authorization", "Bearer "+token)
 	response := newDeadlineRecorder(0)
-	authHandler.Middleware(http.HandlerFunc(handler.Complete)).ServeHTTP(response, req)
+	router := gin.New()
+	router.Use(authHandler.Middleware())
+	router.POST("/api/v1/files/:file_id/complete", handler.Complete)
+	router.ServeHTTP(response, req)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("complete status = %d, body=%s", response.Code, response.Body.String())

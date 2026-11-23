@@ -1,4 +1,5 @@
 #include "SimulatorWindow.h"
+#include "SessionContext.h"
 #include "StressRunController.h"
 #include "SystemTestPage.h"
 #include "support/TestEnvironment.h"
@@ -58,12 +59,69 @@ void writeSummary(const QString &root, const QString &name, const QString &times
     html.write("<html>report</html>");
 }
 
+class HoldingAuthServer final : public QObject {
+public:
+    bool start()
+    {
+        connect(&m_server, &QTcpServer::newConnection, this, [this] {
+            while (m_server.hasPendingConnections()) {
+                QTcpSocket *socket = m_server.nextPendingConnection();
+                m_sockets.append(socket);
+                auto buffer = std::make_shared<QByteArray>();
+                connect(socket, &QTcpSocket::readyRead, this, [this, socket, buffer] {
+                    buffer->append(socket->readAll());
+                    if (!buffer->contains("\r\n\r\n") || socket->property("captured").toBool())
+                        return;
+                    socket->setProperty("captured", true);
+                    requests.append(*buffer);
+                    if (!m_responses.isEmpty())
+                        writeResponse(socket, m_responses.takeFirst());
+                    else if (!m_waiting.contains(socket))
+                        m_waiting.append(socket);
+                });
+            }
+        });
+        return m_server.listen(QHostAddress::LocalHost, 0);
+    }
+    QUrl url() const
+    {
+        return QUrl(QStringLiteral("http://127.0.0.1:%1").arg(m_server.serverPort()));
+    }
+    void enqueue(int status, const QByteArray &body = {})
+    {
+        m_responses.append({status, body});
+        while (!m_waiting.isEmpty() && !m_responses.isEmpty())
+            writeResponse(m_waiting.takeFirst(), m_responses.takeFirst());
+    }
+    QList<QByteArray> requests;
+
+private:
+    static void writeResponse(QTcpSocket *socket, const QPair<int, QByteArray> &response)
+    {
+        const QByteArray http = "HTTP/1.1 " + QByteArray::number(response.first)
+            + " Test\r\nContent-Type: application/json\r\nContent-Length: "
+            + QByteArray::number(response.second.size())
+            + "\r\nConnection: close\r\n\r\n" + response.second;
+        socket->write(http);
+        socket->flush();
+        socket->disconnectFromHost();
+    }
+
+    QTcpServer m_server;
+    QList<QTcpSocket *> m_sockets;
+    QList<QTcpSocket *> m_waiting;
+    QList<QPair<int, QByteArray>> m_responses;
+};
+
 } // namespace
 
 class StressRunTest final : public QObject {
     Q_OBJECT
 private slots:
     void runsSetupBeforeRunner();
+    void prepareRunsOnlySetupAndPreservesFailureOutput();
+    void rootSetupPrecedesLoginAndFailuresCanRetry();
+    void secondClientCannotSetupOrLoginUntilLockRelease();
     void parsesStickyNdjsonAndDrainsFinal();
     void showsChunkSlotStates();
     void displaysLocalizedPhasesAndMetricNames();
@@ -97,6 +155,172 @@ void StressRunTest::runsSetupBeforeRunner()
     QVERIFY(setup.open(QIODevice::ReadOnly));
     QCOMPARE(QString::fromUtf8(setup.readAll()), config.setupScriptPath);
     QVERIFY(controller.hasFinal());
+}
+
+void StressRunTest::prepareRunsOnlySetupAndPreservesFailureOutput()
+{
+    {
+        QTemporaryDir root;
+        ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+        ScopedEnvironment setupCapture("SECURE_IM_FAKE_SETUP_FILE");
+        ScopedEnvironment argumentsCapture("SECURE_IM_FAKE_ARGUMENTS_FILE");
+        qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "sticky");
+        const QString marker = root.filePath(QStringLiteral("setup.txt"));
+        const QString arguments = root.filePath(QStringLiteral("runner-arguments.json"));
+        qputenv("SECURE_IM_FAKE_SETUP_FILE", marker.toUtf8());
+        qputenv("SECURE_IM_FAKE_ARGUMENTS_FILE", arguments.toUtf8());
+        StressRunConfig config = fakeConfig(root.path());
+        config.setupScriptPath = root.filePath(QStringLiteral("scripts/stress-up.ps1"));
+        config.powerShellPath = config.runnerPath;
+        StressRunController controller(config);
+        QSignalSpy finished(&controller, &StressRunController::runFinished);
+        QVERIFY(controller.prepare());
+        QTRY_VERIFY_WITH_TIMEOUT(finished.size() == 1, 6000);
+        QCOMPARE(finished.first().at(0).toBool(), true);
+        QVERIFY(QFileInfo::exists(marker));
+        QVERIFY(!QFileInfo::exists(arguments));
+        QVERIFY(!controller.hasFinal());
+        QVERIFY(!controller.isRunning());
+    }
+    {
+        QTemporaryDir root;
+        ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+        ScopedEnvironment setupCapture("SECURE_IM_FAKE_SETUP_FILE");
+        qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "setup-fail");
+        qputenv("SECURE_IM_FAKE_SETUP_FILE", root.filePath(QStringLiteral("setup.txt")).toUtf8());
+        StressRunConfig config = fakeConfig(root.path());
+        config.setupScriptPath = root.filePath(QStringLiteral("scripts/stress-up.ps1"));
+        config.powerShellPath = config.runnerPath;
+        StressRunController controller(config);
+        QSignalSpy finished(&controller, &StressRunController::runFinished);
+        QVERIFY(controller.prepare());
+        QTRY_VERIFY_WITH_TIMEOUT(finished.size() == 1, 6000);
+        QCOMPARE(finished.first().at(0).toBool(), false);
+        const QString message = finished.first().at(1).toString();
+        QVERIFY(message.contains(QStringLiteral("退出码 23")));
+        QVERIFY(message.contains(QStringLiteral("setup stdout failure detail")));
+        QVERIFY(message.contains(QStringLiteral("setup stderr failure detail")));
+    }
+}
+
+void StressRunTest::rootSetupPrecedesLoginAndFailuresCanRetry()
+{
+    QTemporaryDir root;
+    ScopedEnvironment project("SECURE_IM_PROJECT_ROOT");
+    ScopedEnvironment setup("SECURE_IM_STRESS_SETUP_SCRIPT");
+    ScopedEnvironment shell("SECURE_IM_STRESS_POWERSHELL");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment setupCapture("SECURE_IM_FAKE_SETUP_FILE");
+    const StressRunConfig config = fakeConfig(root.path());
+    qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qputenv("SECURE_IM_STRESS_SETUP_SCRIPT",
+            root.filePath(QStringLiteral("scripts/stress-up.ps1")).toUtf8());
+    qputenv("SECURE_IM_STRESS_POWERSHELL", config.runnerPath.toUtf8());
+    qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "setup-fail");
+    const QString marker = root.filePath(QStringLiteral("setup.txt"));
+    qputenv("SECURE_IM_FAKE_SETUP_FILE", marker.toUtf8());
+
+    HoldingAuthServer server;
+    QVERIFY(server.start());
+    RootStressSession session(root.filePath(QStringLiteral("simulator")), server.url());
+    int callbacks = 0;
+    bool succeeded = false;
+    QString lastError;
+    const auto callback = [&] {
+        return [&callbacks, &succeeded, &lastError](bool ok, const AuthSession &, const QString &error) {
+            ++callbacks;
+            succeeded = ok;
+            lastError = error;
+        };
+    };
+    session.login(QStringLiteral("ROOT"), QStringLiteral("123456"), callback());
+    QTRY_COMPARE_WITH_TIMEOUT(callbacks, 1, 6000);
+    QVERIFY(!succeeded);
+    QVERIFY(lastError.contains(QStringLiteral("setup stdout failure detail")));
+    QCOMPARE(server.requests.size(), 0);
+
+    qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "sticky");
+    server.enqueue(401, QByteArray("{\"error\":{\"message\":\"bad root password\"}}"));
+    session.login(QStringLiteral("ROOT"), QStringLiteral("bad123"), callback());
+    QTRY_COMPARE_WITH_TIMEOUT(callbacks, 2, 6000);
+    QVERIFY(!succeeded);
+    QVERIFY(lastError.contains(QStringLiteral("bad root password")));
+    QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 1, 3000);
+    QVERIFY(QFileInfo::exists(marker)); // Setup 已完成，才出现第一条真实登录请求。
+
+    server.enqueue(200, QByteArray(R"({"data":{"user":{"id":"root-id","username":"ROOT","display_name":"ROOT"},"tokens":{"access_token":"retry-root-token","refresh_token":"retry-root-refresh"}}})"));
+    session.login(QStringLiteral("ROOT"), QStringLiteral("123456"), callback());
+    QTRY_COMPARE_WITH_TIMEOUT(callbacks, 3, 6000);
+    QVERIFY(succeeded);
+    QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 2, 3000);
+    QVERIFY(session.context());
+    QCOMPARE(session.context()->session().accessToken, QStringLiteral("retry-root-token"));
+    session.clearSession();
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("runtime/system-test.lock"))));
+}
+
+void StressRunTest::secondClientCannotSetupOrLoginUntilLockRelease()
+{
+    QTemporaryDir root;
+    ScopedEnvironment project("SECURE_IM_PROJECT_ROOT");
+    ScopedEnvironment setup("SECURE_IM_STRESS_SETUP_SCRIPT");
+    ScopedEnvironment shell("SECURE_IM_STRESS_POWERSHELL");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment setupCapture("SECURE_IM_FAKE_SETUP_FILE");
+    const StressRunConfig config = fakeConfig(root.path());
+    qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qputenv("SECURE_IM_STRESS_SETUP_SCRIPT",
+            root.filePath(QStringLiteral("scripts/stress-up.ps1")).toUtf8());
+    qputenv("SECURE_IM_STRESS_POWERSHELL", config.runnerPath.toUtf8());
+    qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "sticky");
+    const QString marker = root.filePath(QStringLiteral("setup.txt"));
+    qputenv("SECURE_IM_FAKE_SETUP_FILE", marker.toUtf8());
+    HoldingAuthServer server;
+    QVERIFY(server.start());
+    const QByteArray body = R"({"data":{"user":{"id":"root-id","username":"ROOT","display_name":"ROOT"},"tokens":{"access_token":"shared-root-token","refresh_token":"root-refresh"}}})";
+
+    RootStressSession first(root.filePath(QStringLiteral("formal/root-stress")), server.url());
+    RootStressSession second(root.filePath(QStringLiteral("simulator")), server.url());
+    int firstCallbacks = 0;
+    int secondCallbacks = 0;
+    bool firstOk = false;
+    bool secondOk = false;
+    QString secondError;
+    server.enqueue(200, body);
+    first.login(QStringLiteral("ROOT"), QStringLiteral("123456"),
+        [&](bool ok, const AuthSession &, const QString &) { ++firstCallbacks; firstOk = ok; });
+    QTRY_COMPARE_WITH_TIMEOUT(firstCallbacks, 1, 6000);
+    QVERIFY(firstOk);
+    QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("runtime/system-test.lock"))));
+    QCOMPARE(server.requests.size(), 1);
+
+    QVERIFY(QFile::remove(marker));
+    second.login(QStringLiteral("ROOT"), QStringLiteral("123456"),
+        [&](bool ok, const AuthSession &, const QString &error) {
+            ++secondCallbacks;
+            secondOk = ok;
+            secondError = error;
+        });
+    QTRY_COMPARE_WITH_TIMEOUT(secondCallbacks, 1, 3000);
+    QVERIFY(!secondOk);
+    QVERIFY(secondError.contains(QStringLiteral("另一个正式客户端或 simulator")));
+    QVERIFY(!QFileInfo::exists(marker)); // 占用时不能 Setup。
+    QCOMPARE(server.requests.size(), 1); // 占用时不能登录。
+
+    first.clearSession();
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("runtime/system-test.lock"))));
+    server.enqueue(200, body);
+    second.login(QStringLiteral("ROOT"), QStringLiteral("123456"),
+        [&](bool ok, const AuthSession &, const QString &error) {
+            ++secondCallbacks;
+            secondOk = ok;
+            secondError = error;
+        });
+    QTRY_COMPARE_WITH_TIMEOUT(secondCallbacks, 2, 6000);
+    QVERIFY2(secondOk, qPrintable(secondError));
+    QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 2, 3000);
+    QVERIFY(QFileInfo::exists(marker));
+    second.clearSession();
 }
 
 void StressRunTest::parsesStickyNdjsonAndDrainsFinal()
@@ -420,6 +644,8 @@ void StressRunTest::rootLoginThenWindowCloseStopsActiveRun()
     QVERIFY(page->controller()->isRunning());
     window.close();
     QTRY_VERIFY_WITH_TIMEOUT(!page->controller()->isRunning(), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(
+        root.filePath(QStringLiteral("runtime/system-test.lock"))), 5000);
 }
 
 QTEST_MAIN(StressRunTest)

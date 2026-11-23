@@ -265,7 +265,9 @@ void ApiClient::setAuthSession(const AuthSession &session)
 {
     const bool unchanged = m_accessToken == session.accessToken
         && m_refreshToken == session.refreshToken && m_session.user.id == session.user.id;
-    if (!unchanged)
+    const bool clearing = session.accessToken.isEmpty() && session.refreshToken.isEmpty()
+        && session.user.id.isEmpty();
+    if (!unchanged || clearing)
         invalidateAuthentication();
     m_session = session;
     m_accessToken = session.accessToken;

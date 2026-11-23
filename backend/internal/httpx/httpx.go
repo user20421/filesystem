@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
@@ -31,30 +32,30 @@ func Error(status int, code, message string) *APIError {
 }
 
 // JSON 按指定状态写出 UTF-8 JSON；编码失败不会被包装成第二次成功响应。
-func JSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+func JSON(c *gin.Context, status int, value any) {
+	c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	c.Writer.WriteHeader(status)
+	_ = json.NewEncoder(c.Writer).Encode(value)
 }
 
 // Data 使用统一的 data 信封返回成功结果。
-func Data(w http.ResponseWriter, status int, value any) {
-	JSON(w, status, map[string]any{"data": value})
+func Data(c *gin.Context, status int, value any) {
+	JSON(c, status, map[string]any{"data": value})
 }
 
 // Fail 将 APIError 转为稳定错误响应，其他内部错误统一隐藏为 500，并携带请求 ID 便于排查。
-func Fail(w http.ResponseWriter, r *http.Request, err error) {
+func Fail(c *gin.Context, err error) {
 	var api *APIError
 	if !errors.As(err, &api) {
 		api = Error(http.StatusInternalServerError, "internal_error", "internal server error")
 	}
-	JSON(w, api.Status, map[string]any{"error": map[string]string{"code": api.Code, "message": api.Message, "request_id": RequestID(r.Context())}})
+	JSON(c, api.Status, map[string]any{"error": map[string]string{"code": api.Code, "message": api.Message, "request_id": RequestID(c.Request.Context())}})
 }
 
 // Decode 限制请求体为 1 MiB、拒绝未知字段，并确保请求只包含一个 JSON 值。
-func Decode(w http.ResponseWriter, r *http.Request, dst any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	dec := json.NewDecoder(r.Body)
+func Decode(c *gin.Context, dst any) error {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+	dec := json.NewDecoder(c.Request.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return Error(http.StatusBadRequest, "invalid_json", "invalid JSON request")
@@ -74,28 +75,30 @@ func ClientIP(r *http.Request) string {
 }
 
 // RequestContext 透传合法请求 ID 或生成新 ID，同时设置 nosniff 防止内容类型嗅探。
-func RequestContext(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-ID")
+func RequestContext() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := c.Request.Header.Get("X-Request-ID")
 		if len(id) < 1 || len(id) > 64 || strings.ContainsAny(id, "\r\n") {
 			id = uuid.NewString()
 		}
-		w.Header().Set("X-Request-ID", id)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		ctx := context.WithValue(r.Context(), requestIDKey, id)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+		c.Writer.Header().Set("X-Request-ID", id)
+		c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
+		ctx := context.WithValue(c.Request.Context(), requestIDKey, id)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
 }
 
 // Recover 记录 panic 堆栈并返回统一 500，避免把内部实现细节暴露给调用方。
-func Recover(log *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func Recover(log *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				log.Error("panic serving request", "error", recovered, "stack", string(debug.Stack()), "request_id", RequestID(r.Context()))
-				Fail(w, r, Error(http.StatusInternalServerError, "internal_error", "internal server error"))
+				log.Error("panic serving request", "error", recovered, "stack", string(debug.Stack()), "request_id", RequestID(c.Request.Context()))
+				c.Abort()
+				Fail(c, Error(http.StatusInternalServerError, "internal_error", "internal server error"))
 			}
 		}()
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }

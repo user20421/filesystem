@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 type fakeDeleter struct{ err error }
@@ -23,7 +25,9 @@ func TestDeleteMeResponses(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(http.MethodDelete, "/api/v1/users/me", nil)
-			NewHandler(fakeDeleter{err: test.err}).DeleteMe(recorder, request)
+			router := gin.New()
+			router.DELETE("/api/v1/users/me", NewHandler(fakeDeleter{err: test.err}).DeleteMe)
+			router.ServeHTTP(recorder, request)
 			if recorder.Code != test.want {
 				t.Fatalf("status = %d, want %d: %s", recorder.Code, test.want, recorder.Body.String())
 			}

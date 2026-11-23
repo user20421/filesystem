@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"google.golang.org/protobuf/proto"
 	"secure-im/backend/internal/auth"
@@ -36,31 +37,31 @@ func NewHandler(service *Service, tickets *TicketStore, hub *Hub, log *slog.Logg
 	}}
 	return h
 }
-func (h *Handler) Ticket(w http.ResponseWriter, r *http.Request) {
-	ticket, err := h.tickets.Issue(auth.UserID(r.Context()))
+func (h *Handler) Ticket(c *gin.Context) {
+	ticket, err := h.tickets.Issue(auth.UserID(c.Request.Context()))
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 201, map[string]any{"ticket": ticket, "expires_in": int64(h.tickets.ttl.Seconds())})
+	httpx.Data(c, http.StatusCreated, map[string]any{"ticket": ticket, "expires_in": int64(h.tickets.ttl.Seconds())})
 }
-func (h *Handler) Presence(w http.ResponseWriter, r *http.Request) {
-	httpx.Data(w, 200, map[string]any{"online_user_ids": h.hub.OnlineUsers()})
+func (h *Handler) Presence(c *gin.Context) {
+	httpx.Data(c, http.StatusOK, map[string]any{"online_user_ids": h.hub.OnlineUsers()})
 }
 
-func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) MarkRead(c *gin.Context) {
 	var input struct {
 		PeerID string `json:"peer_id"`
 		Cursor uint64 `json:"cursor"`
 	}
-	if err := httpx.Decode(w, r, &input); err != nil {
-		httpx.Fail(w, r, err)
+	if err := httpx.Decode(c, &input); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	readerID := auth.UserID(r.Context())
-	receipt, err := h.service.MarkRead(r.Context(), readerID, input.PeerID, input.Cursor)
+	readerID := auth.UserID(c.Request.Context())
+	receipt, err := h.service.MarkRead(c.Request.Context(), readerID, input.PeerID, input.Cursor)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
 	event := &impb.Envelope{
@@ -75,66 +76,66 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	}
 	h.hub.Publish(receipt.PeerID, event)
 	h.hub.Publish(readerID, event)
-	httpx.Data(w, 200, receipt)
+	httpx.Data(c, http.StatusOK, receipt)
 }
 
-func (h *Handler) Unread(w http.ResponseWriter, r *http.Request) {
-	items, err := h.service.Unread(r.Context(), auth.UserID(r.Context()))
+func (h *Handler) Unread(c *gin.Context) {
+	items, err := h.service.Unread(c.Request.Context(), auth.UserID(c.Request.Context()))
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, map[string]any{"unread": items})
+	httpx.Data(c, http.StatusOK, map[string]any{"unread": items})
 }
 
-func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
-	after, err := strconv.ParseUint(r.URL.Query().Get("after_id"), 10, 64)
-	if r.URL.Query().Get("after_id") == "" {
+func (h *Handler) History(c *gin.Context) {
+	after, err := strconv.ParseUint(c.Request.URL.Query().Get("after_id"), 10, 64)
+	if c.Request.URL.Query().Get("after_id") == "" {
 		after = 0
 	} else if err != nil {
-		httpx.Fail(w, r, httpx.Error(400, "invalid_cursor", "after_id must be an unsigned integer"))
+		httpx.Fail(c, httpx.Error(http.StatusBadRequest, "invalid_cursor", "after_id must be an unsigned integer"))
 		return
 	}
 	limit := 200
-	if raw := r.URL.Query().Get("limit"); raw != "" {
+	if raw := c.Request.URL.Query().Get("limit"); raw != "" {
 		limit, err = strconv.Atoi(raw)
 		if err != nil || limit < 1 || limit > 500 {
-			httpx.Fail(w, r, httpx.Error(400, "invalid_limit", "limit must be between 1 and 500"))
+			httpx.Fail(c, httpx.Error(http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 500"))
 			return
 		}
 	}
-	items, err := h.service.History(r.Context(), auth.UserID(r.Context()), r.URL.Query().Get("peer_id"), after, limit)
+	items, err := h.service.History(c.Request.Context(), auth.UserID(c.Request.Context()), c.Request.URL.Query().Get("peer_id"), after, limit)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, map[string]any{"messages": items})
+	httpx.Data(c, http.StatusOK, map[string]any{"messages": items})
 }
-func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
-	userID, ok := h.tickets.Consume(r.URL.Query().Get("ticket"))
+func (h *Handler) WebSocket(c *gin.Context) {
+	userID, ok := h.tickets.Consume(c.Request.URL.Query().Get("ticket"))
 	if !ok {
-		httpx.Fail(w, r, httpx.Error(401, "invalid_ws_ticket", "WebSocket ticket is invalid, expired or already used"))
+		httpx.Fail(c, httpx.Error(http.StatusUnauthorized, "invalid_ws_ticket", "WebSocket ticket is invalid, expired or already used"))
 		return
 	}
 	select {
 	case h.slots <- struct{}{}:
 		defer func() { <-h.slots }()
 	default:
-		httpx.Fail(w, r, httpx.Error(503, "connection_limit", "too many WebSocket connections"))
+		httpx.Fail(c, httpx.Error(http.StatusServiceUnavailable, "connection_limit", "too many WebSocket connections"))
 		return
 	}
-	conn, err := h.upgrader.Upgrade(w, r, nil)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
 	}
-	c := &client{conn: conn, send: make(chan *impb.Envelope, 64), done: make(chan struct{})}
-	if !h.hub.add(userID, c) {
-		c.close()
+	wsClient := &client{conn: conn, send: make(chan *impb.Envelope, 64), done: make(chan struct{})}
+	if !h.hub.add(userID, wsClient) {
+		wsClient.close()
 		return
 	}
-	defer h.hub.remove(userID, c)
-	defer c.close()
-	go c.writer()
+	defer h.hub.remove(userID, wsClient)
+	defer wsClient.close()
+	go wsClient.writer()
 	conn.SetReadLimit(300 << 10)
 	_ = conn.SetReadDeadline(time.Now().Add(75 * time.Second))
 	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(75 * time.Second)) })
@@ -144,31 +145,31 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if kind != websocket.BinaryMessage {
-			h.sendError(c, "invalid_frame", "binary protobuf frames required", "")
+			h.sendError(wsClient, "invalid_frame", "binary protobuf frames required", "")
 			continue
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(75 * time.Second))
 		e := &impb.Envelope{}
 		if err := proto.Unmarshal(data, e); err != nil {
-			h.sendError(c, "invalid_envelope", "invalid protobuf envelope", "")
+			h.sendError(wsClient, "invalid_envelope", "invalid protobuf envelope", "")
 			continue
 		}
 		if e.Type == impb.Envelope_PING {
-			c.enqueue(&impb.Envelope{Version: protocolVersion, Type: impb.Envelope_PONG, Timestamp: time.Now().UnixMilli()})
+			wsClient.enqueue(&impb.Envelope{Version: protocolVersion, Type: impb.Envelope_PONG, Timestamp: time.Now().UnixMilli()})
 			continue
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 		saved, err := h.service.SaveMessage(ctx, userID, e)
 		cancel()
 		if err != nil {
-			h.sendError(c, "message_rejected", "message rejected", e.MessageId)
+			h.sendError(wsClient, "message_rejected", "message rejected", e.MessageId)
 			h.log.Warn("message rejected", "user_id", userID, "message_id", e.MessageId, "error", err)
 			continue
 		}
 		if !saved.Duplicate {
 			h.hub.Publish(saved.Envelope.RecipientId, saved.Envelope)
 		}
-		if !c.enqueue(Ack(saved)) {
+		if !wsClient.enqueue(Ack(saved)) {
 			return
 		}
 	}

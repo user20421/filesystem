@@ -636,5 +636,5 @@ void SystemTestPage::shutdown()
 {
     if (m_countdownTimer)
         m_countdownTimer->stop();
-    m_controller->stop();
+    m_controller->stopAndWait();
 }

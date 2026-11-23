@@ -17,7 +17,7 @@ Secure IM 是一个面向 Windows 本地开发与真实负载验证的即时通�
 | 单聊与同步 | WebSocket + Protobuf v2、持久化后 ACK、消息幂等、离线历史补拉和在线状态；批量恢复各联系人未读红点，可见会话批量已读，已读状态持久化并同步到双方连接。ACK 只表示服务端接收，不表示对方已读。 |
 | 文件传输 | 默认 **5 MiB** 分块，逐块及整文件 SHA-256 校验；上传根据服务端已确认分块续传，支持暂停、继续、取消和重试。全系统按 **文件大小 + SHA-256** 复用已完成内容并秒传，最后一个逻辑引用删除后才清理对象。后台清理 24 小时无活动的上传，并重试失败的最终删除；最终清理会删除该内容前缀下的全部残留对象。下载暂停后继续会重新下载，当前不支持 Range。 |
 | 公平调度 | 后端上传、Complete 和下载共享逐块公平队列，多文件竞争时按文件轮转，新文件不必等待整个大文件；单文件可利用空闲槽位。客户端固定 3 条上传分块通道和 3 条下载文件通道，上传按剩余量动态调度，下载由顺序 writer 流式原子落盘。 |
-| 多用户客户端 | **一个进程对应一个用户**；需要多个用户时多开进程，并为每个进程指定不同的 `--data-dir`。目录锁拒绝共享数据目录，会话、历史、配置和传输文件彼此隔离。 |
+| 多用户客户端 | **一个进程对应一个已激活用户**；`--data-dir` 是共享 base，后端用户名决定 `<base>/users/<规范化用户名>/`。不同用户可共享 base，用户目录锁只拒绝同账号并发，会话、历史、配置和传输文件彼此隔离。 |
 | 窗口与交互 | 普通登录页和聊天页固定为 **560×390**，联系人/聊天分割线不可拖动；ROOT 压测页可缩放并在切换时居中，返回后恢复固定尺寸。退出、注销及文件错误等提示框相对主窗口居中。 |
 | ROOT 集成压测 | 正式客户端登录页集成“系统测试”和 ROOT 登录，必须向独立压测后端真实认证成功才能进入；支持自定义人数、80/18/2 自动负载分配、实时指标、历史报告和结论。ROOT 会话与普通会话隔离，独立 simulator 入口仍可使用。 |
 
@@ -37,6 +37,8 @@ secure-im-client / secure-im-simulator / secure-im-stress-runner
 ```
 
 普通用户连接正常实例；ROOT 页面、simulator 和 stress runner 连接压测实例。两个后端共享 MySQL/MinIO 容器，但分别使用正常和压测数据库、Bucket。
+
+后端 HTTP 层是**完整的 Gin 架构**：`cmd/server/router.go` 使用公开 `/api/v1` 路由组和认证子组，业务 Handler、认证、请求上下文、崩溃恢复与日志中间件均直接使用 `*gin.Context`。JSON 仍通过 `json.Encoder` 编码，文件流继续使用 `MaxBytesReader`、ResponseController deadline、流式分块和 `Content-Disposition`，Gorilla 直接执行 WebSocket Upgrade；对外 URL、JSON（含末尾换行）、状态码、请求 ID 和客户端协议保持不变。
 
 | 路径 | 内容 |
 |---|---|
@@ -93,19 +95,19 @@ Set-Location ..
 
 ### 4. 启动两个独立用户
 
-在两个 PowerShell 窗口分别执行以下命令，每个进程必须使用不同的数据目录：
+在两个 PowerShell 窗口分别执行以下命令；两个不同用户可以共享同一个 base：
 
 ```powershell
 $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
-& .\client\build\qt-windows\bin\secure-im-client.exe --data-dir .\runtime\users\alice --server-url http://127.0.0.1:8080
+& .\client\build\qt-windows\bin\secure-im-client.exe --data-dir .\runtime --server-url http://127.0.0.1:8080 --username ALICE
 ```
 
 ```powershell
 $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
-& .\client\build\qt-windows\bin\secure-im-client.exe --data-dir .\runtime\users\bob --server-url http://127.0.0.1:8080
+& .\client\build\qt-windows\bin\secure-im-client.exe --data-dir .\runtime --server-url http://127.0.0.1:8080 --username BOB
 ```
 
-启动后分别注册或登录即可互发消息和文件。`--username` 可选，仅用于预填登录名。
+启动后分别注册或登录即可互发消息和文件。普通用户数据实际位于 `.\runtime\users\ALICE\` 和 `.\runtime\users\BOB\`，不再使用 `u-` 前缀或启动别名嵌套。`--username` 可选，用于预填登录名及定向恢复匹配会话；不传时仅在存在唯一有效会话时自动恢复，多会话不会任意选择。旧 base 下的 `config/`、`downloads/` 支持带身份自动迁移或无身份首次登录询问迁移；`users/u-用户名` 以及历史 `alice/bob/users/u-用户名` 会在保存会话的用户 ID 和规范化用户名都匹配时整体 rename 到同级新目录。目标非空或存在多个来源时拒绝合并，旧目录锁被占用时停止，rename 失败保留原数据；历史容器只尝试 `rmdir`，非空时保留，绝不递归清理。
 
 ## ROOT 系统压力测试
 
@@ -117,13 +119,13 @@ $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
 powershell -ExecutionPolicy Bypass -File .\scripts\stress-up.ps1
 ```
 
-脚本只启动独立压测后端 `http://127.0.0.1:18080`，复用正常基础设施容器，但使用独立数据库 `secure_im_stress` 和 Bucket `secure-im-stress-files`。它会注册并真实验证 **`ROOT` / `123456`**；该凭据仅限本地隔离压测。压测后端限制 6 CPU / 3 GiB，并关闭其注册/登录限流，不影响正常后端配置。
+脚本只启动独立压测后端 `http://127.0.0.1:18080`，复用正常基础设施容器，但使用独立数据库 `secure_im_stress` 和 Bucket `secure-im-stress-files`。它会注册并真实验证 **`ROOT` / `123456`**；该凭据仅限本地隔离压测。若 `/ready` 已就绪且 ROOT 真实登录、访问令牌验证成功，脚本直接返回，不重复写环境或构建。压测后端限制 6 CPU / 3 GiB，并关闭其注册/登录限流，不影响正常后端配置。
 
 ### 2. 从正式客户端进入并运行
 
-启动 `secure-im-client` 后，点击登录页底部 **“系统测试”**，或输入 **`ROOT` / `123456`**（用户名大小写不敏感）。客户端会向 `18080` 发起真实登录；认证失败或服务未启动时停留在登录页并显示原因。普通账号仍登录 `--server-url` 指定的正常后端。
+启动 `secure-im-client` 后，点击登录页底部 **“系统测试”**，或输入 **`ROOT` / `123456`**（用户名大小写不敏感）。客户端先取得 `<项目>/runtime/system-test.lock`，再只执行 `stress-up.ps1` 环境准备，最后向 `18080` 发起真实 ROOT 登录；Setup 或认证失败会保留输出、停留在登录页并释放锁，可直接重试。正式客户端和 simulator 共用该锁，第二客户端占用时不会执行 Setup 或登录。普通账号仍登录 `--server-url` 指定的正常后端。
 
-ROOT 状态保存在当前 `--data-dir` 下独立的 `root-stress/` 中。进入压测页后选择总人数并点击 **“开始测试”**；“返回普通登录”会停止当前 runner 并恢复普通页面。也可通过兼容入口启动独立工具：
+ROOT 状态保存在当前 `--data-dir` 下独立的 `root-stress/` 中，不会创建 `users/ROOT` 或嵌套进普通用户目录。进入压测页后选择总人数并点击 **“开始测试”**；“返回普通登录”会先停止并回收当前 runner，再释放系统测试锁并恢复普通页面，关闭窗口也遵循相同顺序。也可通过兼容入口启动独立工具：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\client\start-simulator.ps1
@@ -150,7 +152,7 @@ runtime/stress-reports/YYYYMMDDTHHMMSSZ-xxxxxx/
 | 离线工具与镜像资产 | `client/.tools/`、`backend/.tools/`；已拉取的固定版本 MySQL/MinIO Docker 镜像 | 离线环境中应保留。客户端工具可由 `fetch_protoc.ps1` 联网重新下载，镜像则需重新拉取；正常构建不需要全局 protoc。 |
 | 可重建缓存与产物 | `backend/.cache/`、`backend/docker/secure-im-server`、`client/build/` | 可通过 Go/CMake 构建或启动脚本重新生成。清理后首次重建可能仍需网络取得 Go 模块、工具或镜像，离线时不要误删其依赖资产。 |
 
-`stress-up.ps1` 使用宿主机 Go 构建 Linux 后端，再通过 `Dockerfile.offline` 和已缓存的 MinIO 基础镜像制作压测镜像。
+`stress-up.ps1` 在需要启动或重建时使用宿主机 Go 构建 Linux 后端，再通过 `Dockerfile.offline` 和已缓存的 MinIO 基础镜像制作压测镜像；已就绪快速路径不执行这些构建步骤。
 
 ## 测试
 

@@ -35,6 +35,7 @@
 #include <QTreeWidget>
 #include <QtTest>
 
+#include <algorithm>
 #include <numeric>
 
 namespace {
@@ -73,15 +74,12 @@ public:
                         return;
                     socket->setProperty("captured", true);
                     requests.append(*buffer);
-                    if (!m_responses.isEmpty()) {
-                        const auto response = m_responses.takeFirst();
-                        const QByteArray http = "HTTP/1.1 " + QByteArray::number(response.first)
-                            + " Test\r\nContent-Type: application/json\r\nContent-Length: "
-                            + QByteArray::number(response.second.size())
-                            + "\r\nConnection: close\r\n\r\n" + response.second;
-                        socket->write(http);
-                        socket->flush();
-                        socket->disconnectFromHost();
+                    socket->setProperty("request", *buffer);
+                    const int routed = responseIndexFor(*buffer);
+                    if (routed >= 0) {
+                        writeResponse(socket, m_responses.takeAt(routed));
+                    } else if (!m_waiting.contains(socket)) {
+                        m_waiting.append(socket);
                     }
                 });
             }
@@ -92,12 +90,55 @@ public:
     {
         return QUrl(QStringLiteral("http://127.0.0.1:%1").arg(m_server.serverPort()));
     }
-    void enqueue(int status, const QByteArray &body = {}) { m_responses.append({status, body}); }
+    void enqueue(int status, const QByteArray &body = {})
+    {
+        enqueueFor({}, status, body);
+    }
+    void enqueueFor(const QByteArray &requestPrefix, int status, const QByteArray &body = {})
+    {
+        m_responses.append({requestPrefix, status, body});
+        for (int waiting = 0; waiting < m_waiting.size() && !m_responses.isEmpty();) {
+            QTcpSocket *socket = m_waiting.at(waiting);
+            const int response = responseIndexFor(socket->property("request").toByteArray());
+            if (response < 0) {
+                ++waiting;
+                continue;
+            }
+            m_waiting.removeAt(waiting);
+            writeResponse(socket, m_responses.takeAt(response));
+        }
+    }
     QList<QByteArray> requests;
 private:
+    struct Response {
+        QByteArray requestPrefix;
+        int status;
+        QByteArray body;
+    };
+    int responseIndexFor(const QByteArray &request) const
+    {
+        for (int index = 0; index < m_responses.size(); ++index) {
+            if (m_responses.at(index).requestPrefix.isEmpty()
+                || request.startsWith(m_responses.at(index).requestPrefix))
+                return index;
+        }
+        return -1;
+    }
+    static void writeResponse(QTcpSocket *socket, const Response &response)
+    {
+        const QByteArray http = "HTTP/1.1 " + QByteArray::number(response.status)
+            + " Test\r\nContent-Type: application/json\r\nContent-Length: "
+            + QByteArray::number(response.body.size())
+            + "\r\nConnection: close\r\n\r\n" + response.body;
+        socket->write(http);
+        socket->flush();
+        socket->disconnectFromHost();
+    }
+
     QTcpServer m_server;
     QList<QTcpSocket *> m_sockets;
-    QList<QPair<int, QByteArray>> m_responses;
+    QList<QTcpSocket *> m_waiting;
+    QList<Response> m_responses;
 };
 
 void answerMessageBox(QMessageBox::StandardButton choice)
@@ -120,6 +161,12 @@ private slots:
     void initialSessionShowsLoginAndRestoresSavedSession();
     void isolatesDirectoriesTokensAndObjects();
     void rejectsAndReleasesDirectoryLock();
+    void sanitizesSpecialUserDirectories();
+    void migratesPrefixedAndHistoricalDirectoriesByIdentity();
+    void migratesValidLegacySessionAutomatically();
+    void anonymousLegacyMigrationRequiresChoiceAndRejectsMerge();
+    void restoresOnlyUniqueOrPreferredSession();
+    void lateRefreshCannotWriteToNextUser();
     void simulatorRootLoginShowsOnlyStressPage();
     void integratedRootLoginIsolatesSessionAndReturnsToNormalLogin();
     void integratedRootLoginFailureStaysOnNormalLogin();
@@ -152,11 +199,16 @@ int SessionTabsTest::unreadTotal(const MainWindow &window)
 void SessionTabsTest::isolatesDirectoriesTokensAndObjects()
 {
     QTemporaryDir root;
-    SessionContext first(root.filePath(QStringLiteral("user_1")), QUrl(QStringLiteral("http://localhost")));
-    SessionContext second(root.filePath(QStringLiteral("user_2")), QUrl(QStringLiteral("http://localhost")));
+    SessionContext first(root.filePath(QStringLiteral("base")), QUrl(QStringLiteral("http://localhost")));
+    SessionContext second(root.filePath(QStringLiteral("base")), QUrl(QStringLiteral("http://localhost")));
     QVERIFY(first.open());
     QVERIFY(second.open());
-    QVERIFY(first.dataDir() != second.dataDir());
+    QVERIFY(first.store() == nullptr);
+    QVERIFY(second.store() == nullptr);
+    QVERIFY(first.activateUser(session(QStringLiteral("alice"), QStringLiteral("token-alice"))));
+    QVERIFY(second.activateUser(session(QStringLiteral("bob"), QStringLiteral("token-bob"))));
+    QCOMPARE(first.dataDir(), second.dataDir());
+    QVERIFY(first.userDataDir() != second.userDataDir());
     QVERIFY(first.store() != second.store());
     QVERIFY(first.api() != second.api());
     QVERIFY(first.codec() != second.codec());
@@ -183,18 +235,329 @@ void SessionTabsTest::isolatesDirectoriesTokensAndObjects()
 void SessionTabsTest::rejectsAndReleasesDirectoryLock()
 {
     QTemporaryDir root;
-    const QString path = root.filePath(QStringLiteral("user_1"));
+    const QString path = root.filePath(QStringLiteral("base"));
+    const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("token"));
     auto first = std::make_unique<SessionContext>(path, QUrl(QStringLiteral("http://localhost")));
     QVERIFY(first->open());
+    QVERIFY(first->activateUser(alice));
     SessionContext contender(path, QUrl(QStringLiteral("http://localhost")));
     QString error;
-    QVERIFY(!contender.open(&error));
+    QVERIFY(contender.open(&error));
+    QVERIFY(!contender.activateUser(alice, false, &error));
     QVERIFY(error.contains(QStringLiteral("已被使用")));
     first->shutdown();
     first.reset();
     SessionContext reopened(path, QUrl(QStringLiteral("http://localhost")));
     QVERIFY2(reopened.open(&error), qPrintable(error));
+    QVERIFY2(reopened.activateUser(alice, false, &error), qPrintable(error));
     reopened.shutdown();
+}
+
+void SessionTabsTest::sanitizesSpecialUserDirectories()
+{
+    QTemporaryDir root;
+    QCOMPARE(SessionContext::userDirectoryName(QStringLiteral("alice")), QStringLiteral("ALICE"));
+    const QStringList names{QStringLiteral("CON"), QStringLiteral("../CON"),
+        QStringLiteral("A/B"), QStringLiteral("A\\B"), QStringLiteral("NAME."),
+        QStringLiteral(".."), QStringLiteral("bad:name*?")};
+    QSet<QString> paths;
+    for (const QString &name : names) {
+        const QString path = SessionContext::userDataPath(root.path(), name);
+        const QString fileName = QFileInfo(path).fileName();
+        QVERIFY(!fileName.startsWith(QStringLiteral("u-")));
+        QVERIFY(!fileName.endsWith(QLatin1Char('.')));
+        QVERIFY(!fileName.contains(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*]"))));
+        const QString relative = QDir(root.filePath(QStringLiteral("users"))).relativeFilePath(path);
+        QVERIFY(!relative.startsWith(QStringLiteral("..")));
+        paths.insert(QDir::cleanPath(path).toLower());
+    }
+    QCOMPARE(paths.size(), names.size());
+
+    SessionContext context(root.path(), QUrl(QStringLiteral("http://127.0.0.1:1")));
+    QVERIFY(context.open());
+    const AuthSession special = session(QStringLiteral("../con"), QStringLiteral("token"));
+    QVERIFY(context.activateUser(special));
+    QCOMPARE(context.userDataDir(), QDir(SessionContext::userDataPath(
+        root.path(), special.user.username)).absolutePath());
+    QVERIFY(context.store()->root().absolutePath().contains(QStringLiteral("/users/")));
+    QVERIFY(!context.store()->root().absolutePath().contains(QStringLiteral("/users/u-")));
+    context.shutdown();
+}
+
+void SessionTabsTest::migratesPrefixedAndHistoricalDirectoriesByIdentity()
+{
+    const auto writeMarker = [](const QString &storePath, const QString &name) {
+        QFile marker(QDir(storePath).filePath(QStringLiteral("downloads/") + name));
+        QVERIFY(marker.open(QIODevice::WriteOnly));
+        QCOMPARE(marker.write("keep"), qint64(4));
+    };
+    const QUrl server(QStringLiteral("http://127.0.0.1:1"));
+
+    {
+        QTemporaryDir root;
+        const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("token"));
+        const QString source = root.filePath(QStringLiteral("users/u-ALICE"));
+        LocalStore old(source);
+        QVERIFY(old.initialize());
+        QVERIFY(old.saveSession(alice));
+        writeMarker(source, QStringLiteral("old.txt"));
+        SessionContext context(root.path(), server);
+        QVERIFY(context.open());
+        QVERIFY2(context.activateUser(alice), qPrintable(QStringLiteral("prefixed migration failed")));
+        const QString target = SessionContext::userDataPath(root.path(), QStringLiteral("ALICE"));
+        QCOMPARE(context.userDataDir(), QDir(target).absolutePath());
+        QVERIFY(!QFileInfo::exists(source));
+        QVERIFY(QFileInfo::exists(QDir(target).filePath(QStringLiteral("downloads/old.txt"))));
+        context.shutdown();
+    }
+    {
+        QTemporaryDir root;
+        const AuthSession bob = session(QStringLiteral("BOB"), QStringLiteral("token"));
+        const QString first = root.filePath(QStringLiteral("alice/users/u-BOB"));
+        const QString second = root.filePath(QStringLiteral("bob/users/u-BOB"));
+        for (const QString &source : {first, second}) {
+            LocalStore old(source);
+            QVERIFY(old.initialize());
+            QVERIFY(old.saveSession(bob));
+            writeMarker(source, QStringLiteral("old.txt"));
+        }
+        SessionContext context(root.path(), server);
+        QVERIFY(context.open());
+        QString error;
+        QVERIFY(!context.activateUser(bob, false, &error));
+        QVERIFY(error.contains(QStringLiteral("多个")));
+        QVERIFY(QFileInfo::exists(QDir(first).filePath(QStringLiteral("downloads/old.txt"))));
+        QVERIFY(QFileInfo::exists(QDir(second).filePath(QStringLiteral("downloads/old.txt"))));
+        QVERIFY(!QFileInfo::exists(SessionContext::userDataPath(root.path(), QStringLiteral("BOB"))));
+        context.shutdown();
+    }
+    {
+        QTemporaryDir root;
+        const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("token"));
+        const QString source = root.filePath(QStringLiteral("users/u-ALICE"));
+        LocalStore old(source);
+        QVERIFY(old.initialize());
+        QVERIFY(old.saveSession(alice));
+        writeMarker(source, QStringLiteral("old.txt"));
+        const QString target = SessionContext::userDataPath(root.path(), QStringLiteral("ALICE"));
+        QVERIFY(QDir().mkpath(QDir(target).filePath(QStringLiteral("downloads"))));
+        writeMarker(target, QStringLiteral("existing.txt"));
+        SessionContext context(root.path(), server);
+        QVERIFY(context.open());
+        QString error;
+        QVERIFY(!context.activateUser(alice, false, &error));
+        QVERIFY(error.contains(QStringLiteral("禁止合并")));
+        QVERIFY(QFileInfo::exists(QDir(source).filePath(QStringLiteral("downloads/old.txt"))));
+        QVERIFY(QFileInfo::exists(QDir(target).filePath(QStringLiteral("downloads/existing.txt"))));
+        context.shutdown();
+    }
+    {
+        QTemporaryDir root;
+        const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("token"));
+        const QString source = root.filePath(QStringLiteral("alice/users/u-ALICE"));
+        LocalStore old(source);
+        QVERIFY(old.initialize());
+        QVERIFY(old.saveSession(alice));
+        writeMarker(source, QStringLiteral("old.txt"));
+        QFile unrelated(root.filePath(QStringLiteral("alice/keep.txt")));
+        QVERIFY(unrelated.open(QIODevice::WriteOnly));
+        QCOMPARE(unrelated.write("unrelated"), qint64(9));
+        unrelated.close();
+        SessionContext context(root.path(), server);
+        QVERIFY(context.open());
+        QString error;
+        QVERIFY2(context.activateUser(alice, false, &error), qPrintable(error));
+        QVERIFY(QFileInfo::exists(context.store()->path(QStringLiteral("downloads/old.txt"))));
+        QVERIFY(QFileInfo::exists(unrelated.fileName()));
+        QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("alice"))));
+        context.shutdown();
+    }
+    {
+        QTemporaryDir root;
+        const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("token"));
+        const QString source = root.filePath(QStringLiteral("users/u-ALICE"));
+        LocalStore old(source);
+        QVERIFY(old.initialize());
+        QVERIFY(old.saveSession(session(QStringLiteral("BOB"), QStringLiteral("other"))));
+        writeMarker(source, QStringLiteral("other.txt"));
+        SessionContext context(root.path(), server);
+        QVERIFY(context.open());
+        QVERIFY(context.activateUser(alice));
+        QVERIFY(QFileInfo::exists(QDir(source).filePath(QStringLiteral("downloads/other.txt"))));
+        QVERIFY(!QFileInfo::exists(context.store()->path(QStringLiteral("downloads/other.txt"))));
+        context.shutdown();
+    }
+    {
+        QTemporaryDir root;
+        const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("token"));
+        const QString source = root.filePath(QStringLiteral("users/u-ALICE"));
+        LocalStore old(source);
+        QVERIFY(old.initialize());
+        QVERIFY(old.saveSession(alice));
+        writeMarker(source, QStringLiteral("old.txt"));
+        QLockFile oldLock(QDir(source).filePath(QStringLiteral("client.lock")));
+        QVERIFY(oldLock.tryLock(0));
+        SessionContext context(root.path(), server);
+        QVERIFY(context.open());
+        QString error;
+        QVERIFY(!context.activateUser(alice, false, &error));
+        QVERIFY(error.contains(QStringLiteral("锁")));
+        QVERIFY(QFileInfo::exists(QDir(source).filePath(QStringLiteral("downloads/old.txt"))));
+        QVERIFY(!QFileInfo::exists(SessionContext::userDataPath(root.path(), QStringLiteral("ALICE"))));
+        oldLock.unlock();
+        QVERIFY2(context.activateUser(alice, false, &error), qPrintable(error));
+        QVERIFY(QFileInfo::exists(context.store()->path(QStringLiteral("downloads/old.txt"))));
+        context.shutdown();
+    }
+}
+
+void SessionTabsTest::migratesValidLegacySessionAutomatically()
+{
+    QTemporaryDir root;
+    const AuthSession alice = session(QStringLiteral("alice"), QStringLiteral("legacy-token"));
+    {
+        LocalStore legacy(root.path());
+        QVERIFY(legacy.initialize());
+        QVERIFY(legacy.saveSession(alice));
+        QFile marker(legacy.path(QStringLiteral("downloads/old.txt")));
+        QVERIFY(marker.open(QIODevice::WriteOnly));
+        QCOMPARE(marker.write("old-download"), qint64(12));
+    }
+
+    auto context = std::make_unique<SessionContext>(root.path(),
+        QUrl(QStringLiteral("http://127.0.0.1:1")));
+    QVERIFY(context->open());
+    QCOMPARE(context->sessionToRestore().user.username, QStringLiteral("alice"));
+    SessionPage page(std::move(context));
+    QVERIFY(page.isAuthenticated());
+    QCOMPARE(page.context()->session().user.username, QStringLiteral("ALICE"));
+    const QString expected = SessionContext::userDataPath(root.path(), QStringLiteral("ALICE"));
+    QCOMPARE(page.context()->userDataDir(), QDir(expected).absolutePath());
+    QVERIFY(QFileInfo::exists(QDir(expected).filePath(QStringLiteral("config/session.json"))));
+    QVERIFY(QFileInfo::exists(QDir(expected).filePath(QStringLiteral("downloads/old.txt"))));
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("config"))));
+    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("downloads/old.txt"))));
+    page.shutdown();
+}
+
+void SessionTabsTest::anonymousLegacyMigrationRequiresChoiceAndRejectsMerge()
+{
+    const auto createAnonymousLegacy = [](const QString &base) {
+        LocalStore legacy(base);
+        QVERIFY(legacy.initialize());
+        QFile history(legacy.path(QStringLiteral("config/messages.json")));
+        QVERIFY(history.open(QIODevice::WriteOnly));
+        QCOMPARE(history.write("{}"), qint64(2));
+        QFile download(legacy.path(QStringLiteral("downloads/old.txt")));
+        QVERIFY(download.open(QIODevice::WriteOnly));
+        QCOMPARE(download.write("legacy"), qint64(6));
+    };
+    {
+        QTemporaryDir root;
+        createAnonymousLegacy(root.path());
+        auto context = std::make_unique<SessionContext>(root.path(),
+            QUrl(QStringLiteral("http://127.0.0.1:1")));
+        QVERIFY(context->open());
+        SessionPage page(std::move(context));
+        QVERIFY(!page.isAuthenticated());
+        answerMessageBox(QMessageBox::Yes);
+        page.startSession(session(QStringLiteral("alice"), QStringLiteral("token")), false);
+        QVERIFY(page.isAuthenticated());
+        QVERIFY(QFileInfo::exists(page.context()->store()->path(
+            QStringLiteral("downloads/old.txt"))));
+        QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("config/messages.json"))));
+        page.shutdown();
+    }
+    {
+        QTemporaryDir root;
+        createAnonymousLegacy(root.path());
+        const QString target = SessionContext::userDataPath(root.path(), QStringLiteral("ALICE"));
+        QVERIFY(QDir().mkpath(QDir(target).filePath(QStringLiteral("config"))));
+        QFile existing(QDir(target).filePath(QStringLiteral("config/existing.txt")));
+        QVERIFY(existing.open(QIODevice::WriteOnly));
+        QCOMPARE(existing.write("keep"), qint64(4));
+        existing.close();
+
+        auto context = std::make_unique<SessionContext>(root.path(),
+            QUrl(QStringLiteral("http://127.0.0.1:1")));
+        QVERIFY(context->open());
+        SessionPage page(std::move(context));
+        answerMessageBox(QMessageBox::Yes);
+        page.startSession(session(QStringLiteral("alice"), QStringLiteral("token")), false);
+        QVERIFY(!page.isAuthenticated());
+        QVERIFY(page.findChild<QLabel *>(QStringLiteral("loginStatus"))->text()
+            .contains(QStringLiteral("禁止合并")));
+        QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("config/messages.json"))));
+        QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("downloads/old.txt"))));
+        QVERIFY(QFileInfo::exists(existing.fileName()));
+        page.shutdown();
+    }
+}
+
+void SessionTabsTest::restoresOnlyUniqueOrPreferredSession()
+{
+    const auto saveUser = [](const QString &base, const AuthSession &auth) {
+        SessionContext writer(base, QUrl(QStringLiteral("http://127.0.0.1:1")));
+        QVERIFY(writer.open());
+        QVERIFY(writer.activateUser(auth));
+        QVERIFY(writer.store()->saveSession(writer.session()));
+        writer.shutdown();
+    };
+    const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("alice-token"));
+    const AuthSession bob = session(QStringLiteral("BOB"), QStringLiteral("bob-token"));
+    {
+        QTemporaryDir root;
+        saveUser(root.path(), alice);
+        SessionContext unique(root.path(), QUrl(QStringLiteral("http://127.0.0.1:1")));
+        QVERIFY(unique.open());
+        QCOMPARE(unique.sessionToRestore().user.username, QStringLiteral("ALICE"));
+        unique.shutdown();
+        saveUser(root.path(), bob);
+
+        SessionContext multiple(root.path(), QUrl(QStringLiteral("http://127.0.0.1:1")));
+        QVERIFY(multiple.open());
+        QVERIFY(multiple.sessionToRestore().accessToken.isEmpty());
+        multiple.shutdown();
+        SessionContext targeted(root.path(), QUrl(QStringLiteral("http://127.0.0.1:1")),
+                                QStringLiteral("bob"));
+        QVERIFY(targeted.open());
+        QCOMPARE(targeted.sessionToRestore().accessToken, QStringLiteral("bob-token"));
+        targeted.shutdown();
+    }
+}
+
+void SessionTabsTest::lateRefreshCannotWriteToNextUser()
+{
+    HoldingServer server;
+    QVERIFY(server.start());
+    server.enqueue(401, QByteArray("{\"error\":{\"message\":\"expired\"}}"));
+    QTemporaryDir root;
+    SessionContext context(root.path(), server.url());
+    QVERIFY(context.open());
+    const AuthSession alice = session(QStringLiteral("ALICE"), QStringLiteral("alice-token"));
+    QVERIFY(context.activateUser(alice));
+    QVERIFY(context.store()->saveSession(context.session()));
+    const QString aliceSession = context.store()->path(QStringLiteral("config/session.json"));
+    context.api()->users([](bool, const QList<User> &, const QString &) {});
+    QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 2, 3000);
+    QVERIFY(server.requests.at(1).startsWith("POST /api/v1/auth/refresh "));
+
+    context.store()->clearSession();
+    context.closeUser();
+    QVERIFY(context.store() == nullptr);
+    const AuthSession bob = session(QStringLiteral("BOB"), QStringLiteral("bob-token"));
+    QVERIFY(context.activateUser(bob));
+    QVERIFY(context.store()->saveSession(context.session()));
+    const QString bobSession = context.store()->path(QStringLiteral("config/session.json"));
+    server.enqueue(200, QByteArray(R"({"data":{"user":{"id":"ALICE-id","username":"ALICE"},"tokens":{"access_token":"late-alice","refresh_token":"late-alice-refresh"}}})"));
+    QTest::qWait(100);
+    QCoreApplication::processEvents();
+    QCOMPARE(context.session().user.username, QStringLiteral("BOB"));
+    QCOMPARE(context.api()->accessToken(), QStringLiteral("bob-token"));
+    QCOMPARE(context.store()->loadSession().accessToken, QStringLiteral("bob-token"));
+    QVERIFY(!QFileInfo::exists(aliceSession));
+    QVERIFY(QFileInfo::exists(bobSession));
+    context.shutdown();
 }
 
 void SessionTabsTest::simulatorRootLoginShowsOnlyStressPage()
@@ -203,6 +566,10 @@ void SessionTabsTest::simulatorRootLoginShowsOnlyStressPage()
     QVERIFY(server.start());
     server.enqueue(200, QByteArray(R"({"data":{"user":{"id":"root-id","username":"ROOT","display_name":"ROOT"},"tokens":{"access_token":"real-root-token","refresh_token":"real-root-refresh"}}})"));
     QTemporaryDir root;
+    ScopedEnvironment projectRoot("SECURE_IM_PROJECT_ROOT");
+    ScopedEnvironment skipSetup("SECURE_IM_STRESS_SKIP_SETUP");
+    qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qputenv("SECURE_IM_STRESS_SKIP_SETUP", "1");
     SimulatorWindow window(root.filePath(QStringLiteral("simulator")), server.url());
     QVERIFY2(window.isOpen(), qPrintable(window.startupError()));
     QVERIFY(!window.isAuthenticated());
@@ -240,8 +607,10 @@ void SessionTabsTest::integratedRootLoginIsolatesSessionAndReturnsToNormalLogin(
 {
     ScopedEnvironment stressUrl("SECURE_IM_STRESS_SERVER");
     ScopedEnvironment projectRoot("SECURE_IM_PROJECT_ROOT");
+    ScopedEnvironment skipSetup("SECURE_IM_STRESS_SKIP_SETUP");
     QTemporaryDir root;
     qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qputenv("SECURE_IM_STRESS_SKIP_SETUP", "1");
     qunsetenv("SECURE_IM_STRESS_SERVER");
     QCOMPARE(StressRunConfig::forProject(root.path()).server,
              QStringLiteral("http://127.0.0.1:18080"));
@@ -259,17 +628,19 @@ void SessionTabsTest::integratedRootLoginIsolatesSessionAndReturnsToNormalLogin(
     const QSize fixedSize(560, 390);
     QCOMPARE(window.size(), fixedSize);
 
-    // ROOT authentication must leave the normal session and any legacy user files untouched.
+    // ROOT authentication must leave another normal user's directory untouched.
     const AuthSession normal = session(QStringLiteral("ALICE"), QStringLiteral("normal-token"));
-    QVERIFY(window.sessionPage()->context()->store()->saveSession(normal));
+    const QString normalDir = SessionContext::userDataPath(root.filePath(QStringLiteral("alice")),
+                                                           normal.user.username);
+    LocalStore normalStore(normalDir);
+    QVERIFY(normalStore.initialize());
+    QVERIFY(normalStore.saveSession(normal));
     const auto readFile = [](const QString &path) {
         QFile file(path);
         return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
     };
-    const QString normalSessionPath = window.sessionPage()->context()->store()->path(
-        QStringLiteral("config/session.json"));
-    const QString normalAccountsPath = window.sessionPage()->context()->store()->path(
-        QStringLiteral("config/known_accounts.json"));
+    const QString normalSessionPath = normalStore.path(QStringLiteral("config/session.json"));
+    const QString normalAccountsPath = normalStore.path(QStringLiteral("config/known_accounts.json"));
     QFile legacyAccounts(normalAccountsPath);
     QVERIFY(legacyAccounts.open(QIODevice::WriteOnly));
     const QByteArray savedAccounts = R"([{"id":"legacy-id","username":"LEGACY"}])";
@@ -311,8 +682,10 @@ void SessionTabsTest::integratedRootLoginIsolatesSessionAndReturnsToNormalLogin(
     QCOMPARE(window.sessionPage()->context()->session().accessToken, QString{});
     QCOMPARE(readFile(normalSessionPath), savedSession);
     QCOMPARE(readFile(normalAccountsPath), savedAccounts);
-    QVERIFY(QFileInfo::exists(window.sessionPage()->context()->store()->path(
+    QVERIFY(QFileInfo::exists(QDir(window.sessionPage()->context()->dataDir()).filePath(
         QStringLiteral("root-stress/config/session.json"))));
+    QVERIFY(!QFileInfo::exists(QDir(window.sessionPage()->context()->dataDir()).filePath(
+        QStringLiteral("users/ROOT"))));
     QVERIFY(!window.sessionPage()->chatPage());
     QVERIFY(window.width() >= 960 && window.height() >= 640);
     QVERIFY(window.maximumWidth() > fixedSize.width());
@@ -360,8 +733,10 @@ void SessionTabsTest::integratedRootLoginFailureStaysOnNormalLogin()
 {
     ScopedEnvironment stressUrl("SECURE_IM_STRESS_SERVER");
     ScopedEnvironment projectRoot("SECURE_IM_PROJECT_ROOT");
+    ScopedEnvironment skipSetup("SECURE_IM_STRESS_SKIP_SETUP");
     QTemporaryDir root;
     qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qputenv("SECURE_IM_STRESS_SKIP_SETUP", "1");
     qputenv("SECURE_IM_STRESS_SERVER", "http://127.0.0.1:1");
     HoldingServer normalServer;
     QVERIFY(normalServer.start());
@@ -386,8 +761,10 @@ void SessionTabsTest::integratedRootLoginFailureStaysOnNormalLogin()
     QVERIFY(window.findChild<QLineEdit *>(QStringLiteral("usernameEdit"))->isVisible());
     QCOMPARE(window.size(), QSize(560, 390));
     QCOMPARE(normalServer.requests.size(), 0);
-    QVERIFY(!QFileInfo::exists(window.sessionPage()->context()->store()->path(
+    QVERIFY(!QFileInfo::exists(QDir(window.sessionPage()->context()->dataDir()).filePath(
         QStringLiteral("config/session.json"))));
+    QVERIFY(!QFileInfo::exists(QDir(window.sessionPage()->context()->dataDir()).filePath(
+        QStringLiteral("users/ROOT"))));
     window.close();
 }
 
@@ -405,6 +782,8 @@ void SessionTabsTest::refreshFailureStopsSessionAndReturnsToLogin()
     QVERIFY(page.context()->store()->saveSession(page.context()->session()));
     MainWindow *oldChat = page.chatPage();
     TransferManager *transfers = oldChat->transferManager();
+    const QString expiredSessionPath = page.context()->store()->path(
+        QStringLiteral("config/session.json"));
     bool callbackDone = false;
     page.context()->api()->users([&](bool ok, const QList<User> &, const QString &) {
         QVERIFY(!ok);
@@ -415,7 +794,7 @@ void SessionTabsTest::refreshFailureStopsSessionAndReturnsToLogin()
     QVERIFY(oldChat->isClosing());
     QVERIFY(page.context()->session().accessToken.isEmpty());
     QVERIFY(page.context()->session().refreshToken.isEmpty());
-    QVERIFY(!QFileInfo::exists(page.context()->store()->path(QStringLiteral("config/session.json"))));
+    QVERIFY(!QFileInfo::exists(expiredSessionPath));
     auto *status = page.findChild<QLabel *>(QStringLiteral("loginStatus"));
     QVERIFY(status && status->text().contains(QStringLiteral("refresh expired")));
     QCOMPARE(server.requests.size(), 2);
@@ -585,7 +964,10 @@ void SessionTabsTest::initialSessionShowsLoginAndRestoresSavedSession()
         QCOMPARE(page.findChild<QLineEdit *>(QStringLiteral("usernameEdit"))->text(), QStringLiteral("ALICE"));
         QVERIFY(!page.chatPage());
         const AuthSession auth = session(QStringLiteral("ALICE"), QStringLiteral("saved-token"));
-        QVERIFY(page.context()->store()->saveSession(auth));
+        page.startSession(auth, false);
+        QVERIFY(page.isAuthenticated());
+        QVERIFY(QFileInfo::exists(SessionContext::userDataPath(dataDir, auth.user.username)
+            + QStringLiteral("/config/session.json")));
     }
     {
         auto context = std::make_unique<SessionContext>(dataDir, serverUrl);
@@ -632,7 +1014,7 @@ void SessionTabsTest::transferDirectoryUsesFakeOpenerOnce()
     SessionContext context(root.filePath(QStringLiteral("alice")), server.url());
     QVERIFY(context.open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
-    context.setSession(auth);
+    QVERIFY(context.activateUser(auth));
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
     TransferTask *task = window.transferManager()->addDownload(
         QStringLiteral("peer"), QStringLiteral("file-id"), QStringLiteral("report.pdf"), 1024 * 1024);
@@ -672,7 +1054,7 @@ void SessionTabsTest::transferCardActionsRemainAvailable()
     SessionContext context(root.filePath(QStringLiteral("user")), server.url());
     QVERIFY(context.open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
-    context.setSession(auth);
+    QVERIFY(context.activateUser(auth));
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
     window.showTransfersView();
     window.show();
@@ -762,14 +1144,16 @@ void SessionTabsTest::restoredUnreadDotsAppearWithoutSelectionAndClearOnRead()
 {
     HoldingServer server;
     QVERIFY(server.start());
-    server.enqueue(200, QByteArray(R"({"data":{"unread":[{"peer_id":"peer-id","unread_count":2,"last_message_at":1760000000123}]}})"));
-    server.enqueue(200, QByteArray(R"({"data":{"online_user_ids":[]}})"));
-    server.enqueue(200, QByteArray(R"({"data":{"users":[{"id":"alice-id","username":"ALICE"},{"id":"peer-id","username":"BOB"}]}})"));
+    // 启动请求并行到达，按接口路由响应，避免 TCP readyRead 顺序造成偶发错配。
+    server.enqueueFor("GET /api/v1/messages/unread ", 200, QByteArray(R"({"data":{"unread":[{"peer_id":"peer-id","unread_count":2,"last_message_at":1760000000123}]}})"));
+    server.enqueueFor("GET /api/v1/presence ", 200, QByteArray(R"({"data":{"online_user_ids":[]}})"));
+    server.enqueueFor("GET /api/v1/users ", 200, QByteArray(R"({"data":{"users":[{"id":"alice-id","username":"ALICE"},{"id":"peer-id","username":"BOB"}]}})"));
 
     QTemporaryDir root;
     auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")), server.url());
     QVERIFY(context->open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
+    QVERIFY(context->activateUser(auth));
     QVERIFY(context->store()->saveSession(auth));
     ChatMessage local;
     local.id = QStringLiteral("offline-local");
@@ -791,10 +1175,12 @@ void SessionTabsTest::restoredUnreadDotsAppearWithoutSelectionAndClearOnRead()
         ->findChild<QLabel *>(QStringLiteral("contactUnreadDot"));
     QVERIFY(dot && !dot->isHidden());
     QTRY_VERIFY_WITH_TIMEOUT(server.requests.size() >= 3, 3000);
-    QVERIFY(server.requests.first().startsWith("GET /api/v1/messages/unread "));
+    QVERIFY(std::any_of(server.requests.cbegin(), server.requests.cend(), [](const QByteArray &request) {
+        return request.startsWith("GET /api/v1/messages/unread ");
+    }));
 
-    server.enqueue(200, QByteArray(R"({"data":{"messages":[]}})"));
-    server.enqueue(200, QByteArray(R"({"data":{}})"));
+    server.enqueueFor("GET /api/v1/messages?", 200, QByteArray(R"({"data":{"messages":[]}})"));
+    server.enqueueFor("POST /api/v1/messages/read ", 200, QByteArray(R"({"data":{}})"));
     window->m_users->setCurrentItem(window->m_users->item(0));
     QTRY_VERIFY_WITH_TIMEOUT(unreadTotal(*window) == 0, 3000);
     QVERIFY(dot->isHidden());
@@ -817,7 +1203,7 @@ void SessionTabsTest::contactUnreadDotsAreIndependentAndClearOnView()
     SessionContext context(root.filePath(QStringLiteral("user")), QUrl(QStringLiteral("http://127.0.0.1:1")));
     QVERIFY(context.open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
-    context.setSession(auth);
+    QVERIFY(context.activateUser(auth));
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
     User first;
     first.id = QStringLiteral("first-peer-uuid");
@@ -955,7 +1341,7 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     SessionContext context(root.filePath(QStringLiteral("user")), server.url());
     QVERIFY(context.open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
-    context.setSession(auth);
+    QVERIFY(context.activateUser(auth));
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
     window.show();
     QVERIFY(!window.m_composer->isVisible());
@@ -1074,7 +1460,7 @@ void SessionTabsTest::deliveryStatesRenderAndAckIsNotRead()
                            QUrl(QStringLiteral("http://127.0.0.1:1")));
     QVERIFY(context.open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
-    context.setSession(auth);
+    QVERIFY(context.activateUser(auth));
     MainWindow window(context.api(), context.store(), context.codec(), auth, false);
     const QString peer = QStringLiteral("peer");
     window.m_peerId = peer;
@@ -1123,7 +1509,7 @@ void SessionTabsTest::connectedOutboxHistoryIsSingleFlightPerPeer()
     SessionContext context(root.filePath(QStringLiteral("user")), server.url());
     QVERIFY(context.open());
     const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
-    context.setSession(auth);
+    QVERIFY(context.activateUser(auth));
     for (const QString &peer : {QStringLiteral("peer-a"), QStringLiteral("peer-b")}) {
         ChatMessage pending;
         pending.id = QStringLiteral("pending-") + peer;

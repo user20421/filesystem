@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/gin-gonic/gin"
 	"secure-im/backend/internal/auth"
 	"secure-im/backend/internal/httpx"
 )
@@ -16,10 +17,10 @@ type Handler struct{ service deleter }
 
 func NewHandler(service deleter) *Handler { return &Handler{service: service} }
 
-func (h *Handler) DeleteMe(w http.ResponseWriter, r *http.Request) {
-	if err := h.service.Delete(r.Context(), auth.UserID(r.Context())); err != nil {
-		httpx.Fail(w, r, err)
+func (h *Handler) DeleteMe(c *gin.Context) {
+	if err := h.service.Delete(c.Request.Context(), auth.UserID(c.Request.Context())); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	c.Writer.WriteHeader(http.StatusNoContent)
 }

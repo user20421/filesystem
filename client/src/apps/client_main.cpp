@@ -6,7 +6,7 @@
 #include <QCommandLineParser>
 #include <QMessageBox>
 
-// 正式客户端采用一进程一用户模型；--data-dir 必填，由 SessionContext 管理目录锁和全部会话资源。
+// --data-dir 是共享 base；登录后由后端用户名决定 users/ 下的独立目录和用户锁。
 int main(int argc, char *argv[])
 {
     QApplication application(argc, argv);
@@ -16,12 +16,12 @@ int main(int argc, char *argv[])
     parser.setApplicationDescription(QStringLiteral("单用户安全 IM Qt 客户端"));
     parser.addHelpOption();
     const QCommandLineOption dataDirOption(QStringLiteral("data-dir"),
-        QStringLiteral("此用户独占的数据目录（必填）"), QStringLiteral("directory"));
+        QStringLiteral("客户端数据 base 目录（必填）"), QStringLiteral("directory"));
     const QCommandLineOption serverOption(QStringLiteral("server-url"),
         QStringLiteral("后端 HTTP 地址"), QStringLiteral("url"),
         QStringLiteral("http://127.0.0.1:8080"));
     const QCommandLineOption usernameOption(QStringLiteral("username"),
-        QStringLiteral("预填登录用户名（可选）"), QStringLiteral("name"));
+        QStringLiteral("预填登录名，并定向选择唯一匹配的可恢复会话（可选）"), QStringLiteral("name"));
     parser.addOption(dataDirOption);
     parser.addOption(serverOption);
     parser.addOption(usernameOption);

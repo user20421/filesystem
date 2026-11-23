@@ -1,6 +1,6 @@
 # Secure IM Go backend
 
-A modular monolith providing authenticated direct messaging over WebSocket and chunked file transfer. It uses MySQL for metadata, MinIO for plaintext chunks, and an in-memory single-instance online hub. Only MySQL and MinIO are required infrastructure.
+A modular monolith providing authenticated direct messaging over WebSocket and chunked file transfer. It uses MySQL for metadata, MinIO for plaintext chunks, and an in-memory single-instance online hub. Only MySQL and MinIO are required infrastructure. The HTTP layer is fully native Gin: `cmd/server` defines public `/api/v1` and authenticated route groups, and business handlers and middleware use `*gin.Context` directly without a `net/http` Handler adapter. Explicit `json.Encoder` responses, `RemoteAddr` rate limiting, `MaxBytesReader`, ResponseController deadlines, chunked streaming with `Content-Disposition`, and direct Gorilla WebSocket upgrades preserve the existing API and client behavior.
 
 ## Run locally
 
@@ -160,7 +160,7 @@ Set `ENABLE_DEBUG_STATS=true` to expose unauthenticated `GET /debug/stats`, cont
 
 ## Tests
 
-Unit tests cover Argon2id, access/refresh tokens, register/login rate limits, logout revocation, deleted-user access rejection, Protobuf v2 payload validation, one-time and per-user WebSocket ticket revocation, targeted hub closure, account deletion ordering/retry, permissions, content reuse, chunk boundaries, deterministic fair-chunk rotation/single-file parallelism/cancellation/wakeup/limits, concurrent file-memory reservation/release/timeout, and file cleanup freshness/rechecks/shared-content safety/orphan removal/retry/empty-list finalization/cancellation/non-overlap/manual-delete races:
+Unit tests cover Argon2id, access/refresh tokens, register/login rate limits using `RemoteAddr`, logout revocation, deleted-user access rejection and authentication abort/context propagation, Gin GET/HEAD routing, JSON newline/404/decode compatibility, ResponseController deadlines and methodless `/ws` behavior, Protobuf v2 payload validation, one-time and per-user WebSocket ticket revocation, targeted hub closure, account deletion ordering/retry, permissions, content reuse, chunk boundaries, deterministic fair-chunk rotation/single-file parallelism/cancellation/wakeup/limits, concurrent file-memory reservation/release/timeout, and file cleanup freshness/rechecks/shared-content safety/orphan removal/retry/empty-list finalization/cancellation/non-overlap/manual-delete races:
 
 ```powershell
 go test ./...

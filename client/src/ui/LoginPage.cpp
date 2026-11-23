@@ -9,8 +9,8 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 
-LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
-    : QWidget(parent), m_api(api), m_store(store)
+LoginPage::LoginPage(ApiClient *api, QWidget *parent)
+    : QWidget(parent), m_api(api)
 {
     setObjectName(QStringLiteral("loginPage"));
     auto *outer = new QVBoxLayout(this);
@@ -98,9 +98,6 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
     connect(m_login, &QPushButton::clicked, this, [this] { authenticate(false); });
     connect(m_register, &QPushButton::clicked, this, [this] { authenticate(true); });
     connect(m_password, &QLineEdit::returnPressed, this, [this] { authenticate(false); });
-    const AuthSession saved = m_store->loadSession();
-    if (!saved.user.username.isEmpty())
-        m_username->setText(saved.user.username.toUpper());
 }
 
 void LoginPage::setUsername(const QString &username)
@@ -159,23 +156,10 @@ void LoginPage::authenticate(bool registration)
     if (m_authenticationInterceptor
         && m_authenticationInterceptor(username, password, registration, deliver))
         return;
-    ApiClient::AuthCallback callback = [guarded, deliver](bool ok, const AuthSession &session,
-                                                          const QString &error) {
-        if (!guarded || guarded->m_closing)
-            return;
-        if (ok) {
-            QString saveError;
-            if (!guarded->m_store->saveSession(session, &saveError)) {
-                deliver(false, {}, QStringLiteral("无法保存会话：") + saveError);
-                return;
-            }
-        }
-        deliver(ok, session, error);
-    };
     if (registration)
-        m_api->registerUser(username, password, std::move(callback));
+        m_api->registerUser(username, password, deliver);
     else
-        m_api->login(username, password, std::move(callback));
+        m_api->login(username, password, deliver);
 }
 
 void LoginPage::shutdown()

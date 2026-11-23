@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"secure-im/backend/internal/httpx"
 )
 
@@ -93,7 +94,7 @@ func retryAfter(expires, now time.Time) time.Duration {
 	return ((remaining + time.Second - 1) / time.Second) * time.Second
 }
 
-func allowRequest(w http.ResponseWriter, r *http.Request, limiter *rateLimiter, key string) bool {
+func allowRequest(c *gin.Context, limiter *rateLimiter, key string) bool {
 	if limiter == nil {
 		return true
 	}
@@ -105,7 +106,7 @@ func allowRequest(w http.ResponseWriter, r *http.Request, limiter *rateLimiter, 
 	if seconds < 1 {
 		seconds = 1
 	}
-	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-	httpx.Fail(w, r, httpx.Error(http.StatusTooManyRequests, "rate_limited", "too many requests, try again later"))
+	c.Writer.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	httpx.Fail(c, httpx.Error(http.StatusTooManyRequests, "rate_limited", "too many requests, try again later"))
 	return false
 }

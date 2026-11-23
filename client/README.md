@@ -1,6 +1,6 @@
 # Secure IM Qt 客户端
 
-Qt 6 Widgets / C++17 桌面客户端。正式程序 `secure-im-client` 采用**一个进程一个用户**模型，需要多用户时多开进程并为每个用户指定独立数据目录。正式客户端的同一登录页也提供 ROOT 本地系统压测入口；`secure-im-simulator` 保留为兼容的独立压测工具。
+Qt 6 Widgets / C++17 桌面客户端。正式程序 `secure-im-client` 采用**一个进程一个已激活用户**模型；`--data-dir` 指定共享 base，后端返回的登录用户名决定 base 下的独立用户目录。需要多用户时可多开进程，不同用户可以共享 base，同一用户目录仍禁止并发使用。正式客户端的同一登录页也提供 ROOT 本地系统压测入口；`secure-im-simulator` 保留为兼容的独立压测工具。
 
 ## 功能与结构
 
@@ -30,7 +30,7 @@ src/core/Workers.*           哈希、文件 I/O 与流式原子写入
 src/core/MessageDelivery.*   持久化 outbox、ACK 超时、重试及恢复
 src/core/MessageSyncState.h  消息去重及数字 cursor 状态
 src/ui/RootStressSession.* 独立 ROOT 认证上下文与压测配置
-src/ui/SessionContext.*    每进程独立对象、目录锁及幂等 shutdown
+src/ui/SessionContext.*    base、按用户激活/隔离、目录锁、旧数据迁移及幂等 shutdown
 src/ui/SessionPage.*       登录页、聊天页与集成 ROOT 压测页切换
 src/ui/SingleUserWindow.*  正式客户端固定尺寸顶层窗口
 src/ui/MainWindow.*        聊天/传输业务界面
@@ -68,28 +68,32 @@ Set-Location client
 ```powershell
 $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
 client/build/qt-windows/bin/secure-im-client.exe `
-  --data-dir D:/im-data/alice --server-url http://127.0.0.1:8080 --username alice
+  --data-dir D:/im-data --server-url http://127.0.0.1:8080 --username alice
 ```
 
 ```powershell
 $env:PATH = "D:/software/Qt/6.11.2/llvm-mingw_64/bin;$env:PATH"
 client/build/qt-windows/bin/secure-im-client.exe `
-  --data-dir D:/im-data/bob --server-url http://127.0.0.1:8080 --username bob
+  --data-dir D:/im-data --server-url http://127.0.0.1:8080 --username bob
 ```
 
-`--data-dir` 必填且不能是文件系统根目录；两个用户不得共用，客户端通过 `config/client.lock` 拒绝并发使用同一目录。`--username` 只预填登录用户名，可省略。每个目录独立创建 `inbox/`、`outbox/`、`downloads/`、`temp/`、`keys/`、`logs/`、`config/`。令牌不会写入日志，会话文件尽量设置为仅所有者可读写。
+`--data-dir` 必填且不能是文件系统根目录，它只是 base。启动时只准备 base；普通用户登录或恢复成功后，才按后端返回并转为大写的用户名激活 `<base>/users/<规范化用户名>/`，例如 ALICE 直接使用 `<base>/users/ALICE/`，不再有 `u-` 前缀或启动别名嵌套。Windows 保留设备名、尾点/尾空格、控制字符和路径分隔符等会被安全处理，净化后的不同用户名通过稳定后缀避免碰撞和路径穿越。会话恢复只扫描 `users/` 的直接子目录。每个用户目录独立创建 `inbox/`、`outbox/`、`downloads/`、`temp/`、`keys/`、`logs/`、`config/`，下载写入当前用户的 `downloads/`，上传仍可选择任意本机可读路径。
+
+用户锁位于 `<base>/users/<规范化用户名>/client.lock`，只拒绝同一用户目录的并发激活，不阻止 ALICE 与 BOB 共享 base。`--username` 既预填登录名，也定向选择匹配的已保存会话：没有该参数时只有唯一有效会话才自动恢复，存在多个会话时绝不按目录顺序任意选择。令牌不会写入日志，会话文件尽量设置为仅所有者可读写。
+
+旧版本直接位于 base 的 `config/`、`downloads/` 可以迁移到用户目录：旧 `config/session.json` 含有效身份时按该用户名自动迁移；无有效身份时首次登录会明确询问，选择不迁移会保留旧数据。迁移使用 base 内的临时目录和目录 rename，失败会尽量回滚；目标 `config/` 或 `downloads/` 非空时禁止合并。旧 `<base>/users/u-用户名` 及历史 `<base>/alice/users/u-用户名`、`<base>/bob/users/u-用户名` 也会迁移到新同级目录，但仅当保存会话的用户 ID 与规范化用户名均匹配时才整体 rename；目标非空、多个匹配来源或旧锁被占用都会停止，rename 失败不删除来源。迁移后仅对空历史容器调用 `rmdir`，任何非空别名或 `users/` 容器均原样保留。
 
 ## ROOT 本地系统压测
 
-按“运行正式客户端”启动 `secure-im-client`，点击登录页底部 **“系统测试”** 按钮，或在同一登录页输入 **ROOT / 123456**（用户名大小写不敏感）。客户端会向独立压测后端 **`http://127.0.0.1:18080`** 发出真实 `POST /api/v1/auth/login`；只有验证成功才在当前 `SingleUserWindow` 显示 `SystemTestPage`。密码错误、服务未启动或验证失败都会留在登录页并显示原因，不会进入压测页。普通用户名仍请求 `--server-url` 指定的正式后端（默认 `http://127.0.0.1:8080`）并进入聊天。
+按“运行正式客户端”启动 `secure-im-client`，点击登录页底部 **“系统测试”** 按钮，或在同一登录页输入 **ROOT / 123456**（用户名大小写不敏感）。进入顺序固定为取得 `<项目>/runtime/system-test.lock` → 只执行 `stress-up.ps1` Setup（不启动 runner）→ 向独立压测后端 **`http://127.0.0.1:18080`** 发出真实 `POST /api/v1/auth/login`；只有验证成功才在当前 `SingleUserWindow` 显示 `SystemTestPage`。Setup 的标准输出/错误会保留在失败原因中，密码错误、服务未启动或准备失败都会销毁本次失败对象、释放锁并留在登录页，可直接重试。正式客户端与 simulator 共用该锁，第二客户端会看到明确占用提示且不得 Setup 或登录。普通用户名仍请求 `--server-url` 指定的正式后端（默认 `http://127.0.0.1:8080`）并进入聊天。
 
-ROOT 使用普通用户数据目录下独立的 `root-stress/` 会话目录，不读取或覆盖普通用户的 `config/session.json` 及其他既有本地文件，也不复用普通用户的 `ApiClient`。压测页左上角“返回普通登录”会停止当前压测 runner、销毁压测页并恢复固定窗口尺寸，随后可正常登录普通账号；直接关闭窗口也会清理压测状态。兼容入口 `client/start-simulator.ps1` 仍启动独立 `secure-im-simulator`，行为不变。
+ROOT 使用当前 base 下独立的 `<base>/root-stress/` 会话目录，不创建 `<base>/users/ROOT`，不读取或覆盖任何普通用户的 `config/session.json` 及其他既有本地文件，也不复用普通用户的 `ApiClient`。压测页左上角“返回普通登录”会先停止并等待回收当前压测 runner，再销毁压测页、释放 `runtime/system-test.lock` 并恢复固定窗口尺寸，随后可正常登录普通账号；直接关闭窗口也按相同顺序清理。兼容入口 `client/start-simulator.ps1` 仍启动独立 `secure-im-simulator`。
 
-可用 `SECURE_IM_STRESS_SERVER` 覆盖压测后端地址（主要用于开发/测试）。启动测试时先执行 `scripts/stress-up.ps1`，再启动 `client/build/qt-windows/bin/secure-im-stress-runner.exe`，仅传入 `--target`、`--server`、`--env-file`、`--report-root`。
+可用 `SECURE_IM_STRESS_SERVER` 覆盖压测后端地址（主要用于开发/测试）。`StressRunController::prepare()` 只执行 `scripts/stress-up.ps1`；点击开始测试后，`start()` 仍按 Setup → runner 顺序执行，runner 仅传入 `--target`、`--server`、`--env-file`、`--report-root`。`stress-up.ps1` 会先检查 `/ready` 并真实登录 ROOT 验证令牌，已就绪时直接返回，不重复构建。
 
 固定负载为 80/18/2 空闲/聊天/文件、500 MiB 文件预算、**5 MiB** 分块、400 个文件 worker、100 MiB 单文件和 **5 分钟**稳定期。独立后端限制 **6 CPU / 3 GiB**，使用独立数据库 `secure_im_stress` 和 Bucket `secure-im-stress-files`，同时共享正常环境的 MySQL/MinIO 容器。系统测试页使用两行、8 张卡片的紧凑网格；文件预算卡片同时展示“分块通道”，从 runner NDJSON 的 `file_chunk_slots_used` / `file_chunk_slots_limit` 实时显示后端实际占用/上限，未运行显示 `—`，旧 runner 或未知采样显示“未知”。报告写入 `runtime/stress-reports` 并读取各目录 `summary.json`，`metrics.csv` 同样追加分块通道两列，未知值写为 `unknown`。
 
-`SECURE_IM_STRESS_RUNNER`、`SECURE_IM_STRESS_REPORT_ROOT`、`SECURE_IM_STRESS_SERVER` 与 `SECURE_IM_STRESS_SKIP_SETUP=1` 仅作为开发/测试覆盖。runner 自身保留 `--chunk-size`、`--stable-duration` 等命令行覆盖。
+`SECURE_IM_STRESS_RUNNER`、`SECURE_IM_STRESS_REPORT_ROOT`、`SECURE_IM_STRESS_SERVER`、`SECURE_IM_STRESS_SETUP_SCRIPT`、`SECURE_IM_STRESS_POWERSHELL` 与 `SECURE_IM_STRESS_SKIP_SETUP=1` 仅作为开发/测试覆盖。runner 自身保留 `--chunk-size`、`--stable-duration` 等命令行覆盖。
 
 ## 后端对齐点
 
@@ -119,7 +123,7 @@ WebSocket 外层使用 `im.v1.Envelope`，`version=2`。MESSAGE payload 是 `Mes
 
 ## 测试
 
-默认 CTest 覆盖 API 响应适配、批量未读摘要解析、启动恢复红点及阅读清除、固定窗口与禁用分割手柄、logout/refresh 竞态、Protobuf v2 编解码、消息同步、LocalStore、离线 outbox 持久化、同 ID 重试/最大次数、ACK/ERROR/迟到 ACK、history 对账、文件通知、重启、写盘失败、pending 裁剪与 shutdown、上传动态调度与续传、取消删除后立即重试、秒传、独立下载并发、Windows 路径预留、慢 writer 背压和流式写入、ROOT 压测窗口、正式客户端 ROOT 真实登录路由/失败拦截/会话隔离/返回普通登录、runner NDJSON 解析及报告历史。UI 测试在 `QT_QPA_PLATFORM=offscreen` 下运行。
+默认 CTest 覆盖 API 响应适配、批量未读摘要解析、启动恢复红点及阅读清除、固定窗口与禁用分割手柄、logout/refresh 竞态、不同用户目录隔离与用户锁、特殊用户名净化、无前缀目录及历史目录按身份迁移、目标非空/多来源/旧锁拒绝、唯一/定向会话恢复、切换用户后的迟到刷新回调隔离、ROOT 不嵌套用户目录、Protobuf v2 编解码、消息同步、LocalStore、离线 outbox 持久化、同 ID 重试/最大次数、ACK/ERROR/迟到 ACK、history 对账、文件通知、重启、写盘失败、pending 裁剪与 shutdown、上传动态调度与续传、取消删除后立即重试、秒传、独立下载并发、Windows 路径预留、慢 writer 背压和流式写入、ROOT 压测窗口、正式客户端 ROOT 真实登录路由/失败拦截/会话隔离/返回普通登录、Setup-only 与失败输出、Setup 先于登录及失败重试、第二客户端互斥、runner NDJSON 解析及报告历史。UI 测试在 `QT_QPA_PLATFORM=offscreen` 下运行。
 
 `test_backend_integration` 不注册到默认 CTest，可对运行中的后端执行随机双用户注册/登录、WebSocket 消息、重复帧返回相同 ACK cursor、READ、history 和文件上传/下载，最后注销测试账号：
 

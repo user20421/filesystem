@@ -67,7 +67,11 @@ public:
     ~StressRunController() override;
 
     bool start(qint64 target);
+    // prepare 只执行 Setup，不会启动 runner；失败输出保留到下一次调用。
+    bool prepare();
     void stop();
+    // 页面返回或关闭时同步回收进程，之后才能释放系统测试全局锁。
+    void stopAndWait();
     bool isRunning() const;
     bool hasFinal() const { return m_hasFinal; }
     StressRunConfig config() const { return m_config; }
@@ -99,6 +103,8 @@ private:
     Stage m_stage = Stage::Idle;
     QByteArray m_stdoutBuffer;
     QString m_standardError;
+    QString m_setupOutput;
+    bool m_prepareOnly = false;
     bool m_stopRequested = false;
     bool m_hasFinal = false;
     bool m_finishEmitted = false;

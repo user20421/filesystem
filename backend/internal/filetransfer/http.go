@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"secure-im/backend/internal/auth"
 	"secure-im/backend/internal/httpx"
 )
@@ -19,7 +20,7 @@ type Handler struct {
 	log      *slog.Logger
 	maxChunk int64
 }
-type AuditFunc func(http *http.Request, action, resourceID string)
+type AuditFunc func(c *gin.Context, action, resourceID string)
 
 const downloadWriteIdleTimeout = 30 * time.Second
 
@@ -51,12 +52,12 @@ func (w *idleTimeoutResponseWriter) Write(p []byte) (int, error) {
 func NewHandler(service *Service, log *slog.Logger, maxChunk int64, audit AuditFunc) *Handler {
 	return &Handler{service: service, log: log, maxChunk: maxChunk, dbAudit: audit}
 }
-func (h *Handler) audit(r *http.Request, action, id string) {
+func (h *Handler) audit(c *gin.Context, action, id string) {
 	if h.dbAudit != nil {
-		h.dbAudit(r, action, id)
+		h.dbAudit(c, action, id)
 	}
 }
-func (h *Handler) Init(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Init(c *gin.Context) {
 	var input struct {
 		Name        string `json:"filename"`
 		Size        int64  `json:"size"`
@@ -64,91 +65,91 @@ func (h *Handler) Init(w http.ResponseWriter, r *http.Request) {
 		RecipientID string `json:"recipient_id"`
 		ChunkSize   int64  `json:"chunk_size"`
 	}
-	if err := httpx.Decode(w, r, &input); err != nil {
-		httpx.Fail(w, r, err)
+	if err := httpx.Decode(c, &input); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	f, err := h.service.Init(r.Context(), auth.UserID(r.Context()), InitInput{Name: input.Name, Size: input.Size, SHA256: input.SHA256, RecipientID: input.RecipientID, ChunkSize: input.ChunkSize})
+	f, err := h.service.Init(c.Request.Context(), auth.UserID(c.Request.Context()), InitInput{Name: input.Name, Size: input.Size, SHA256: input.SHA256, RecipientID: input.RecipientID, ChunkSize: input.ChunkSize})
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	h.audit(r, "file.init", f.ID)
-	httpx.Data(w, 201, f)
+	h.audit(c, "file.init", f.ID)
+	httpx.Data(c, http.StatusCreated, f)
 }
-func (h *Handler) Status(w http.ResponseWriter, r *http.Request) {
-	f, chunks, err := h.service.Status(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()))
+func (h *Handler) Status(c *gin.Context) {
+	f, chunks, err := h.service.Status(c.Request.Context(), c.Param("file_id"), auth.UserID(c.Request.Context()))
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, map[string]any{"file": f, "uploaded_chunks": chunks})
+	httpx.Data(c, http.StatusOK, map[string]any{"file": f, "uploaded_chunks": chunks})
 }
-func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
-	index, err := strconv.Atoi(r.PathValue("index"))
+func (h *Handler) Upload(c *gin.Context) {
+	index, err := strconv.Atoi(c.Param("index"))
 	if err != nil {
-		httpx.Fail(w, r, httpx.Error(400, "invalid_chunk_index", "chunk index must be an integer"))
+		httpx.Fail(c, httpx.Error(http.StatusBadRequest, "invalid_chunk_index", "chunk index must be an integer"))
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, h.maxChunk+1)
-	if r.ContentLength > h.maxChunk {
-		httpx.Fail(w, r, httpx.Error(413, "chunk_too_large", "chunk exceeds configured maximum"))
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxChunk+1)
+	if c.Request.ContentLength > h.maxChunk {
+		httpx.Fail(c, httpx.Error(http.StatusRequestEntityTooLarge, "chunk_too_large", "chunk exceeds configured maximum"))
 		return
 	}
-	err = h.service.UploadChunk(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()), index, r.Header.Get("X-Chunk-SHA256"), r.Body)
+	err = h.service.UploadChunk(c.Request.Context(), c.Param("file_id"), auth.UserID(c.Request.Context()), index, c.Request.Header.Get("X-Chunk-SHA256"), c.Request.Body)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	h.audit(r, "file.chunk.upload", r.PathValue("file_id"))
-	httpx.Data(w, 200, map[string]any{"uploaded": true, "index": index})
+	h.audit(c, "file.chunk.upload", c.Param("file_id"))
+	httpx.Data(c, http.StatusOK, map[string]any{"uploaded": true, "index": index})
 }
-func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Complete(c *gin.Context) {
 	// Hashing a large file may legitimately exceed the global API WriteTimeout.
-	if err := setWriteDeadline(w, time.Time{}); err != nil {
-		h.log.Error("clear completion write deadline", "file_id", r.PathValue("file_id"), "error", err)
-		httpx.Fail(w, r, httpx.Error(http.StatusInternalServerError, "internal_error", "internal server error"))
+	if err := setWriteDeadline(c.Writer, time.Time{}); err != nil {
+		h.log.Error("clear completion write deadline", "file_id", c.Param("file_id"), "error", err)
+		httpx.Fail(c, httpx.Error(http.StatusInternalServerError, "internal_error", "internal server error"))
 		return
 	}
-	f, err := h.service.Complete(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()))
+	f, err := h.service.Complete(c.Request.Context(), c.Param("file_id"), auth.UserID(c.Request.Context()))
 	if err != nil {
-		h.log.Error("file completion failed", "file_id", r.PathValue("file_id"), "error", err)
-		httpx.Fail(w, r, err)
+		h.log.Error("file completion failed", "file_id", c.Param("file_id"), "error", err)
+		httpx.Fail(c, err)
 		return
 	}
-	h.audit(r, "file.complete", f.ID)
-	httpx.Data(w, 200, f)
+	h.audit(c, "file.complete", f.ID)
+	httpx.Data(c, http.StatusOK, f)
 }
-func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Download(c *gin.Context) {
 	// Remove the fixed global deadline, then enforce a rolling per-write idle
 	// deadline below. Client disconnects and stalled writes still fail.
-	if err := setWriteDeadline(w, time.Time{}); err != nil {
-		h.log.Error("clear download write deadline", "file_id", r.PathValue("file_id"), "error", err)
-		httpx.Fail(w, r, httpx.Error(http.StatusInternalServerError, "internal_error", "internal server error"))
+	if err := setWriteDeadline(c.Writer, time.Time{}); err != nil {
+		h.log.Error("clear download write deadline", "file_id", c.Param("file_id"), "error", err)
+		httpx.Fail(c, httpx.Error(http.StatusInternalServerError, "internal_error", "internal server error"))
 		return
 	}
 	started := false
-	output := &idleTimeoutResponseWriter{w: w, idleTimeout: downloadWriteIdleTimeout}
-	err := h.service.Download(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()), output, func(f File) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(f.OriginalName))
-		w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	output := &idleTimeoutResponseWriter{w: c.Writer, idleTimeout: downloadWriteIdleTimeout}
+	err := h.service.Download(c.Request.Context(), c.Param("file_id"), auth.UserID(c.Request.Context()), output, func(f File) {
+		c.Writer.Header().Set("Content-Type", "application/octet-stream")
+		c.Writer.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(f.OriginalName))
+		c.Writer.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))
 		started = true
 	})
 	if err != nil {
 		if started {
-			h.log.Error("download interrupted", "file_id", r.PathValue("file_id"), "error", err)
+			h.log.Error("download interrupted", "file_id", c.Param("file_id"), "error", err)
 		} else {
-			httpx.Fail(w, r, err)
+			httpx.Fail(c, err)
 		}
 	}
 }
-func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("file_id")
-	if err := h.service.Delete(r.Context(), id, auth.UserID(r.Context())); err != nil {
-		httpx.Fail(w, r, err)
+func (h *Handler) Delete(c *gin.Context) {
+	id := c.Param("file_id")
+	if err := h.service.Delete(c.Request.Context(), id, auth.UserID(c.Request.Context())); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	h.audit(r, "file.delete", id)
-	w.WriteHeader(204)
+	h.audit(c, "file.delete", id)
+	c.Writer.WriteHeader(http.StatusNoContent)
 }

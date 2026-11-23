@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gin-gonic/gin"
 	"secure-im/backend/internal/httpx"
 )
 
@@ -27,8 +28,8 @@ func NewHandler(service *Service, registerLimit, loginLimit RateLimitConfig) *Ha
 		loginLimiter:    newRateLimiter(loginLimit),
 	}
 }
-func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
-	if !allowRequest(w, r, h.registerLimiter, httpx.ClientIP(r)) {
+func (h *Handler) Register(c *gin.Context) {
+	if !allowRequest(c, h.registerLimiter, httpx.ClientIP(c.Request)) {
 		return
 	}
 	var input struct {
@@ -36,99 +37,103 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		DisplayName string `json:"display_name"`
 		Password    string `json:"password"`
 	}
-	if err := httpx.Decode(w, r, &input); err != nil {
-		httpx.Fail(w, r, err)
+	if err := httpx.Decode(c, &input); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	result, err := h.service.Register(r.Context(), input.Username, input.DisplayName, input.Password)
+	result, err := h.service.Register(c.Request.Context(), input.Username, input.DisplayName, input.Password)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 201, result)
+	httpx.Data(c, http.StatusCreated, result)
 }
-func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Login(c *gin.Context) {
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := httpx.Decode(w, r, &input); err != nil {
-		httpx.Fail(w, r, err)
+	if err := httpx.Decode(c, &input); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	key := httpx.ClientIP(r) + "\x00" + normalizeUsername(input.Username)
-	if !allowRequest(w, r, h.loginLimiter, key) {
+	key := httpx.ClientIP(c.Request) + "\x00" + normalizeUsername(input.Username)
+	if !allowRequest(c, h.loginLimiter, key) {
 		return
 	}
-	result, err := h.service.Login(r.Context(), input.Username, input.Password)
+	result, err := h.service.Login(c.Request.Context(), input.Username, input.Password)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, result)
+	httpx.Data(c, http.StatusOK, result)
 }
-func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Refresh(c *gin.Context) {
 	var input struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	if err := httpx.Decode(w, r, &input); err != nil {
-		httpx.Fail(w, r, err)
+	if err := httpx.Decode(c, &input); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	result, err := h.service.Refresh(r.Context(), input.RefreshToken)
+	result, err := h.service.Refresh(c.Request.Context(), input.RefreshToken)
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, result)
+	httpx.Data(c, http.StatusOK, result)
 }
-func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Logout(c *gin.Context) {
 	var input struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	if err := httpx.Decode(w, r, &input); err != nil {
-		httpx.Fail(w, r, err)
+	if err := httpx.Decode(c, &input); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	if err := h.service.Logout(r.Context(), UserID(r.Context()), input.RefreshToken); err != nil {
-		httpx.Fail(w, r, err)
+	if err := h.service.Logout(c.Request.Context(), UserID(c.Request.Context()), input.RefreshToken); err != nil {
+		httpx.Fail(c, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	c.Writer.WriteHeader(http.StatusNoContent)
 }
-func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
-	user, err := h.service.Me(r.Context(), UserID(r.Context()))
+func (h *Handler) Me(c *gin.Context) {
+	user, err := h.service.Me(c.Request.Context(), UserID(c.Request.Context()))
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, user)
+	httpx.Data(c, http.StatusOK, user)
 }
-func (h *Handler) Users(w http.ResponseWriter, r *http.Request) {
-	users, err := h.service.ListUsers(r.Context())
+func (h *Handler) Users(c *gin.Context) {
+	users, err := h.service.ListUsers(c.Request.Context())
 	if err != nil {
-		httpx.Fail(w, r, err)
+		httpx.Fail(c, err)
 		return
 	}
-	httpx.Data(w, 200, map[string]any{"users": users})
+	httpx.Data(c, http.StatusOK, map[string]any{"users": users})
 }
-func (h *Handler) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.SplitN(r.Header.Get("Authorization"), " ", 2)
+func (h *Handler) Middleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		parts := strings.SplitN(c.Request.Header.Get("Authorization"), " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
-			httpx.Fail(w, r, httpx.Error(401, "unauthorized", "Bearer access token required"))
+			c.Abort()
+			httpx.Fail(c, httpx.Error(http.StatusUnauthorized, "unauthorized", "Bearer access token required"))
 			return
 		}
 		id, err := h.service.tokens.ParseAccessToken(strings.TrimSpace(parts[1]))
 		if err != nil {
-			httpx.Fail(w, r, httpx.Error(401, "unauthorized", "invalid or expired access token"))
+			c.Abort()
+			httpx.Fail(c, httpx.Error(http.StatusUnauthorized, "unauthorized", "invalid or expired access token"))
 			return
 		}
 		// JWT validity alone is insufficient after permanent account deletion.
-		if _, err := h.lookupUser(r.Context(), id); err != nil {
-			httpx.Fail(w, r, err)
+		if _, err := h.lookupUser(c.Request.Context(), id); err != nil {
+			c.Abort()
+			httpx.Fail(c, err)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, id)))
-	})
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), userContextKey{}, id))
+		c.Next()
+	}
 }

@@ -22,7 +22,7 @@ SimulatorWindow::SimulatorWindow(const QString &dataDir, const QUrl &serverUrl, 
     m_stack = new QStackedWidget(this);
     m_stack->setObjectName(QStringLiteral("simulatorStack"));
     setCentralWidget(m_stack);
-    m_login = new LoginPage(m_root->context()->api(), m_root->context()->store(), m_stack);
+    m_login = new LoginPage(m_root->context()->api(), m_stack);
     m_login->setAuthenticationInterceptor(
         [this](const QString &username, const QString &password, bool registration,
                ApiClient::AuthCallback callback) {

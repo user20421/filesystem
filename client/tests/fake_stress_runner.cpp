@@ -47,6 +47,24 @@ int main(int argc, char *argv[])
 {
     QCoreApplication application(argc, argv);
     const QStringList arguments = application.arguments().mid(1);
+    const qsizetype scriptIndex = arguments.indexOf(QStringLiteral("-File"));
+    if (scriptIndex >= 0 && scriptIndex + 1 < arguments.size()) {
+        QFile marker(qEnvironmentVariable("SECURE_IM_FAKE_SETUP_FILE"));
+        if (marker.open(QIODevice::WriteOnly))
+            marker.write(arguments.at(scriptIndex + 1).toUtf8());
+        if (qEnvironmentVariable("SECURE_IM_FAKE_STRESS_SCENARIO")
+            == QLatin1String("setup-fail")) {
+            QFile standardOutput;
+            if (standardOutput.open(stdout, QIODevice::WriteOnly | QIODevice::Unbuffered))
+                writeAll(&standardOutput, "setup stdout failure detail\n");
+            QFile standardError;
+            if (standardError.open(stderr, QIODevice::WriteOnly | QIODevice::Unbuffered))
+                writeAll(&standardError, "setup stderr failure detail\n");
+            return 23;
+        }
+        return 0;
+    }
+
     const QString capture = qEnvironmentVariable("SECURE_IM_FAKE_ARGUMENTS_FILE");
     if (!capture.isEmpty()) {
         QFile file(capture);
@@ -54,14 +72,6 @@ int main(int argc, char *argv[])
             file.write(QJsonDocument(QJsonArray::fromStringList(arguments))
                 .toJson(QJsonDocument::Compact));
         }
-    }
-
-    const qsizetype scriptIndex = arguments.indexOf(QStringLiteral("-File"));
-    if (scriptIndex >= 0 && scriptIndex + 1 < arguments.size()) {
-        QFile marker(qEnvironmentVariable("SECURE_IM_FAKE_SETUP_FILE"));
-        if (marker.open(QIODevice::WriteOnly))
-            marker.write(arguments.at(scriptIndex + 1).toUtf8());
-        return 0;
     }
 
     QFile output;
