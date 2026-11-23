@@ -87,7 +87,7 @@ ROOT 使用普通用户数据目录下独立的 `root-stress/` 会话目录，�
 
 可用 `SECURE_IM_STRESS_SERVER` 覆盖压测后端地址（主要用于开发/测试）。启动测试时先执行 `scripts/stress-up.ps1`，再启动 `client/build/qt-windows/bin/secure-im-stress-runner.exe`，仅传入 `--target`、`--server`、`--env-file`、`--report-root`。
 
-固定负载为 80/18/2 空闲/聊天/文件、500 MiB 文件预算、**5 MiB** 分块、96 个文件 worker、100 MiB 单文件和 **5 分钟**稳定期。独立后端限制 **6 CPU / 3 GiB**，使用独立数据库 `secure_im_stress` 和 Bucket `secure-im-stress-files`，同时共享正常环境的 MySQL/MinIO 容器。系统测试页使用两行、8 张卡片的紧凑网格；文件预算卡片同时展示“分块通道”，从 runner NDJSON 的 `file_chunk_slots_used` / `file_chunk_slots_limit` 实时显示后端实际占用/上限，未运行显示 `—`，旧 runner 或未知采样显示“未知”。报告写入 `runtime/stress-reports` 并读取各目录 `summary.json`，`metrics.csv` 同样追加分块通道两列，未知值写为 `unknown`。
+固定负载为 80/18/2 空闲/聊天/文件、500 MiB 文件预算、**5 MiB** 分块、400 个文件 worker、100 MiB 单文件和 **5 分钟**稳定期。独立后端限制 **6 CPU / 3 GiB**，使用独立数据库 `secure_im_stress` 和 Bucket `secure-im-stress-files`，同时共享正常环境的 MySQL/MinIO 容器。系统测试页使用两行、8 张卡片的紧凑网格；文件预算卡片同时展示“分块通道”，从 runner NDJSON 的 `file_chunk_slots_used` / `file_chunk_slots_limit` 实时显示后端实际占用/上限，未运行显示 `—`，旧 runner 或未知采样显示“未知”。报告写入 `runtime/stress-reports` 并读取各目录 `summary.json`，`metrics.csv` 同样追加分块通道两列，未知值写为 `unknown`。
 
 `SECURE_IM_STRESS_RUNNER`、`SECURE_IM_STRESS_REPORT_ROOT`、`SECURE_IM_STRESS_SERVER` 与 `SECURE_IM_STRESS_SKIP_SETUP=1` 仅作为开发/测试覆盖。runner 自身保留 `--chunk-size`、`--stable-duration` 等命令行覆盖。
 

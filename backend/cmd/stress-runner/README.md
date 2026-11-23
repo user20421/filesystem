@@ -9,7 +9,7 @@ go -C backend build -o .cache/stress-runner.exe ./cmd/stress-runner
 backend/.cache/stress-runner.exe
 ```
 
-The defaults are 1000 users, an 80/18/2 idle/chat/file mix, 200 connections/s, **five minutes** stable, 0.05 messages/s/chat user, one 100 MiB file per file job with **5 MiB chunks**, 96 file workers and a 500 MiB runner file-budget criterion. The default server is `http://127.0.0.1:18080`; reports go to `runtime/stress-reports/<run-id>`. The isolated backend independently enforces its own 500 MiB memory budget.
+The defaults are 1000 users, an 80/18/2 idle/chat/file mix, 200 connections/s, **five minutes** stable, 0.05 messages/s/chat user, one 100 MiB file per file job with **5 MiB chunks**, 400 file workers and a 500 MiB runner file-budget criterion. The default server is `http://127.0.0.1:18080`; reports go to `runtime/stress-reports/<run-id>`. The isolated backend independently enforces its own 500 MiB memory budget.
 
 For the isolated Docker stress stack, pass `--env-file deploy/.env.stress`. The runner reads the sibling `deploy/.env` for root MySQL/MinIO credentials and uses `secure_im_stress` plus `secure-im-stress-files`. It deletes only its own run's objects and rows, never either database or bucket itself. The stress Compose backend disables the normal register/login rate limits so synthetic account provisioning is not throttled.
 
