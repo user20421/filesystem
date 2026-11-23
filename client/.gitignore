@@ -1,2 +1,3 @@
+# CMake/Qt 生成物和本地离线 Protobuf 工具
 build/
 .tools/

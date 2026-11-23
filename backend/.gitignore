@@ -1,6 +1,9 @@
+# Go 缓存、离线生成工具与本地秘密
 .cache/
 .tools/
 .env
+
+# 本机及 Linux 构建产物；docker/ 中的文件由压测脚本重建
 /server
 /server.exe
 docker/

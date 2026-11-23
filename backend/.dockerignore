@@ -12,3 +12,5 @@ server
 server.exe
 *.log
 *.tmp
+*.pem
+*.key
