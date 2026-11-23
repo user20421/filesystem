@@ -83,9 +83,7 @@ void RootStressSession::login(const QString &username, const QString &password,
     m_systemTestLock = std::make_unique<QLockFile>(lockPath);
     m_systemTestLock->setStaleLockTime(30000);
     if (!m_systemTestLock->tryLock(0)) {
-        m_startupError = QStringLiteral(
-            "系统测试已被另一个正式客户端或 simulator 占用，不得执行 Setup 或 ROOT 登录：%1")
-            .arg(lockPath);
+        m_startupError = QStringLiteral("系统测试正在其他客户端中运行，请稍后重试。");
         releaseLock();
         callback(false, {}, m_startupError);
         return;

@@ -303,7 +303,7 @@ void StressRunTest::secondClientCannotSetupOrLoginUntilLockRelease()
         });
     QTRY_COMPARE_WITH_TIMEOUT(secondCallbacks, 1, 3000);
     QVERIFY(!secondOk);
-    QVERIFY(secondError.contains(QStringLiteral("另一个正式客户端或 simulator")));
+    QCOMPARE(secondError, QStringLiteral("系统测试正在其他客户端中运行，请稍后重试。"));
     QVERIFY(!QFileInfo::exists(marker)); // 占用时不能 Setup。
     QCOMPARE(server.requests.size(), 1); // 占用时不能登录。
 
