@@ -12,6 +12,7 @@ import (
 	"secure-im/backend/internal/proto/impb"
 )
 
+// HistoryItem 表示一条有序历史消息，Envelope 是 base64 编码的 Protobuf 二进制帧，cursor 用于增量同步。
 type HistoryItem struct {
 	Cursor   uint64 `json:"cursor"`
 	Envelope string `json:"envelope"`

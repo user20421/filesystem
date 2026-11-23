@@ -13,6 +13,7 @@ import (
 	"secure-im/backend/internal/httpx"
 )
 
+// File 是独立的逻辑文件引用，包含参与者与显示状态；底层内容通过 ContentID 与其他引用共享。
 type File struct {
 	ID           string     `json:"id"`
 	ContentID    string     `json:"content_id"`
@@ -29,6 +30,8 @@ type File struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
+
+// Chunk 描述共享内容的一个分块及其对象位置、明文大小和 SHA-256。
 type Chunk struct {
 	Index         int    `json:"index"`
 	ObjectKey     string `json:"-"`
@@ -38,6 +41,7 @@ type Chunk struct {
 
 var shaPattern = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 
+// Authorize 校验文件参与者权限；ownerOnly=true 仅允许上传者，false 允许上传者或接收者。
 func Authorize(file File, userID string, ownerOnly bool) error {
 	if ownerOnly && file.OwnerID == userID {
 		return nil
@@ -47,6 +51,8 @@ func Authorize(file File, userID string, ownerOnly bool) error {
 	}
 	return httpx.Error(403, "file_forbidden", "you are not a participant in this file transfer")
 }
+
+// expectedChunkSize 计算指定分块的字节数，最后一块按文件剩余大小处理，拒绝越界序号。
 func expectedChunkSize(file File, index int) (int64, error) {
 	if index < 0 || index >= file.ChunkCount {
 		return 0, httpx.Error(400, "invalid_chunk_index", "chunk index is out of range")
@@ -62,6 +68,7 @@ func validateName(name string) bool {
 
 const selectFile = `SELECT f.id,f.content_id,f.owner_id,f.recipient_id,f.original_name,c.size,c.sha256,c.chunk_size,c.chunk_count,c.status,c.revision,f.created_at,c.completed_at FROM files f JOIN file_contents c ON c.id=f.content_id `
 
+// scanFile 将数据库 ready 映射为 API 的 completed，其他内部状态原样保留。
 func scanFile(scanner interface{ Scan(...any) error }) (File, error) {
 	var f File
 	var completed sql.NullTime

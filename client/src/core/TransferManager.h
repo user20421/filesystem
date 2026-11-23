@@ -9,6 +9,8 @@
 class LocalStore;
 namespace Workers { class AsyncFileWriter; }
 
+// TransferTask 表示单个上传或下载任务，记录确认进度、在途分块和 generation。
+// generation 是异步回调的代际屏障：暂停、取消、重试后，旧回调不得改写新一轮任务状态。
 class TransferTask final : public QObject {
     Q_OBJECT
 public:
@@ -24,7 +26,6 @@ public:
     QString localPath() const { return m_localPath; }
     qint64 size() const { return m_size; }
     qint64 transferredBytes() const { return m_transferred; }
-    int nextChunk() const { return m_nextChunk; }
     int totalChunks() const { return m_totalChunks; }
     QString error() const { return m_error; }
     qint64 queuedDownloadBytes() const;
@@ -43,11 +44,9 @@ private:
     QString m_fileId;
     QString m_fileName;
     QString m_localPath;
-    QString m_sha256;
     qint64 m_size = 0;
     qint64 m_transferred = 0;
     int m_chunkSize = DefaultFileChunkSize;
-    int m_nextChunk = 0;
     int m_totalChunks = 0;
     QSet<int> m_uploadedChunks;
     QSet<int> m_inflightChunks;
@@ -56,6 +55,7 @@ private:
     QPointer<ApiRequestHandle> m_reply;
     QPointer<ApiRequestHandle> m_deleteReply;
     Workers::AsyncFileWriter *m_writer = nullptr;
+    // 只有创建回调时的 generation 才能修改任务，迟到的 worker/HTTP 回调必须被忽略。
     quint64 m_generation = 0;
     bool m_hashPending = false;
     bool m_resumePending = false;
@@ -67,6 +67,8 @@ private:
     bool m_networkReadPaused = false;
 };
 
+// TransferManager 独立管理 3 条上传分块通道和 3 条下载文件通道。
+// 新文件优先获得首条通道，空闲通道再按剩余数据量分配；暂停和取消不丢失已确认进度。
 class TransferManager final : public QObject {
     Q_OBJECT
 public:

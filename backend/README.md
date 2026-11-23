@@ -15,9 +15,11 @@ Requirements: Go 1.27+, MySQL 8, and a MinIO-compatible S3 service. Generated Pr
 go run ./cmd/server
 ```
 
-The default listener is `127.0.0.1:8080`. Startup pings MySQL, applies embedded SQL migrations, and ensures the MinIO bucket exists. `GET /health` is liveness; `GET /ready` checks MySQL and object storage. SIGINT/SIGTERM closes WebSocket clients and gracefully drains HTTP requests.
+The default listener is `127.0.0.1:8080`. Startup pings MySQL, applies embedded SQL migrations, ensures the MinIO bucket exists, and starts the file cleanup sweeper. `GET /health` is liveness; `GET /ready` checks MySQL and object storage. SIGINT/SIGTERM closes WebSocket clients and gracefully drains HTTP requests. Shutdown cancels the sweeper and waits for its current round before closing MySQL.
 
-MySQL can be configured with `MYSQL_DSN`, or with `MYSQL_ADDR`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD`. MinIO defaults to `127.0.0.1:9000` and bucket `secure-im-files`; credentials come from `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`. See `.env.example` for all limits and TTLs.
+MySQL can be configured with `MYSQL_DSN`, or with `MYSQL_ADDR`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD`; an explicit DSN takes precedence. MinIO defaults to `127.0.0.1:9000` and bucket `secure-im-files`; credentials come from `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`, with `MINIO_USE_SSL` selecting HTTPS.
+
+Current server defaults are `LISTEN_ADDR=127.0.0.1:8080`, `ACCESS_TOKEN_TTL=15m`, `REFRESH_TOKEN_TTL=720h`, `WS_TICKET_TTL=1m`, and `WS_MAX_CONNECTIONS=1000` (allowed range 1–100000). File sizes and memory budgets are bytes: `MAX_ACTIVE_FILES=3` (3–5), `MAX_CHUNK_SIZE=5242880` (64 KiB–16 MiB), `MAX_FILE_SIZE=5368709120`, `UPLOAD_CONCURRENCY=96` (1–256), and `FILE_MEMORY_BUDGET=524288000`. Background file cleanup defaults to `FILE_UPLOAD_IDLE_TTL=24h`, `FILE_DELETING_RETRY_AFTER=5m`, and `FILE_CLEANUP_INTERVAL=1m`; all three durations must be positive. `ENABLE_DEBUG_STATS` defaults to false. Auth limits default to 30 registrations/minute and 10 logins/minute with a 10000-key limiter cache. See `.env.example` for the complete process-environment configuration; malformed optional numeric, boolean, and duration values use their defaults, while values outside validated ranges are rejected.
 
 ## HTTP conventions
 
@@ -79,6 +81,15 @@ GET /api/v1/messages?peer_id=<user-id>&after_id=0&limit=200
 Authorization: Bearer ...
 ```
 
+Fetch all unread counts without loading each conversation's full history:
+
+```text
+GET /api/v1/messages/unread
+Authorization: Bearer ...
+```
+
+The Bearer-protected endpoint groups unread incoming rows by `sender_id` for the authenticated `recipient_id` and returns `{data:{unread:[{peer_id,unread_count,last_message_at}]}}`. It includes only peers with unread messages, sorts entries by `peer_id`, and returns an empty array when there are none. `last_message_at` is the latest unread message creation time in Unix milliseconds. Clients use this single summary to restore contact unread indicators after login or session restoration; peers changed by realtime events while the request is in flight are not overwritten by the older snapshot.
+
 History returns cursor plus base64-encoded binary Protobuf, not a direct payload field:
 
 ```json
@@ -129,6 +140,10 @@ Initialize with the exact field names:
 
 Content identity is the pair `(size, sha256)`. If matching content is already ready, init creates another logical file reference and returns `instant=true`; the sender skips chunk upload and completion. Uploading content and existing references are not treated as ready. Shared content and its objects survive deletion until the final logical reference is removed.
 
+A single-process, non-overlapping sweeper selects at most 100 file references per round, with a 30-second round deadline. Uploading content whose `updated_at` has been idle for `FILE_UPLOAD_IDLE_TTL` loses its active references; failed final deletions become eligible again after `FILE_DELETING_RETRY_AFTER`. Status and cutoff are checked again under the file/content locks, so activity after selection or a newly shared/ready state is skipped. Non-final reference removal preserves the content's idle timestamp, allowing the remaining stale references to be cleaned on subsequent rounds rather than restarting the TTL. Every round logs `selected`, `succeeded`, `skipped`, and `failed`; individual failures are logged and retried by later rounds.
+
+Final-reference deletion holds the content lock while recursively listing only `contents/<content-id>/` and removing every returned key, including unregistered objects and replacement leftovers. It does not rely solely on `file_chunks`. Metadata is finalized only after List and all Remove calls succeed; List, Remove, or database failures leave the `deleting` state available for idempotent manual/background retry. An empty listing is sufficient to finalize metadata. While cleanup is pending, initializing identical content returns `content_cleanup_pending` instead of attaching a new reference.
+
 Status places `uploaded_chunks` beside `file`:
 
 ```json
@@ -137,37 +152,38 @@ Status places `uploaded_chunks` beside `file`:
 
 Completion reads each plaintext chunk, verifies its chunk hash and the assembled whole-file SHA256, then marks the shared content ready. Only completed logical files can be downloaded. Download headers include `Content-Length` and RFC 5987 `Content-Disposition`.
 
-MinIO stores the same plaintext chunk bytes received by the upload API; there is no DEK, KEK, `FILE_KEK`, chunk encryption, or decryption step. Upload, completion, and download share a context-aware fair chunk scheduler. Each upload request takes one slot; completion and download re-enter the FIFO queue for every chunk instead of holding a slot for the whole file. When multiple files compete, each holds at most one slot and a newly arriving file takes the next available turn; a single file may use multiple idle slots. Download writes and completion hashes remain in chunk order, and a blocked download write retains its chunk reservation for backpressure.
+MinIO stores the same plaintext chunk bytes received by the upload API; there is no DEK, KEK, `FILE_KEK`, chunk encryption, or decryption step. Download and Complete clear the server's fixed whole-request write deadline for the current operation; download applies a rolling 30-second idle write timeout before each payload write, so slow but continuously progressing transfers are not cut off at 60 seconds. Upload, completion, and download share a context-aware fair chunk scheduler. Each upload request takes one slot; completion and download re-enter the FIFO queue for every chunk instead of holding a slot for the whole file. When multiple files compete, each holds at most one slot and a newly arriving file takes the next available turn; a single file may use multiple idle slots. Download writes and completion hashes remain in chunk order, and a blocked download write retains its chunk reservation for backpressure.
 
 `UPLOAD_CONCURRENCY` is the configured upper bound for these shared chunk slots (default 96, maximum 256). The effective concurrency is also bounded by queued work and `FILE_MEMORY_BUDGET`: the budget defaults to 500 MiB and reserves each plaintext buffer plus per-chunk overhead across all three operations. When memory is full, chunks wait on their request context and reservations never exceed the budget. The default active-upload limit remains three per user (configurable from three to five). For the isolated stress backend, set `STRESS_UPLOAD_CONCURRENCY` to override the default slot cap of 96 without changing the 500 MiB memory ceiling. The 96 default was selected from local 16-step benchmarks through 128 with 128 12-MiB file jobs and a fixed 500-MiB budget; all tested tiers completed without file failures, while higher tiers did not provide a stable throughput improvement.
 
-Set `ENABLE_DEBUG_STATS=true` to expose unauthenticated `GET /debug/stats`, containing Go heap/runtime statistics, goroutine count, GOMAXPROCS, and file-budget `used`/`limit` bytes. Only enable it with a loopback-only host port mapping.
+Set `ENABLE_DEBUG_STATS=true` to expose unauthenticated `GET /debug/stats`, containing Go heap/runtime statistics, goroutine count, GOMAXPROCS, `file_memory_budget.used`/`limit` bytes, and `file_chunk_slots.used`/`limit`. Chunk slots are a thread-safe snapshot of the shared scheduler's actual granted operations and configured cap (96 by default in both normal and stress configurations). Only enable it with a loopback-only host port mapping.
 
 ## Tests
 
-Unit tests cover Argon2id, access/refresh tokens, register/login rate limits, logout revocation, deleted-user access rejection, Protobuf v2 payload validation, one-time and per-user WebSocket ticket revocation, targeted hub closure, account deletion ordering/retry, permissions, content reuse, chunk boundaries, deterministic fair-chunk rotation/single-file parallelism/cancellation/wakeup/limits, and concurrent file-memory reservation/release/timeout:
+Unit tests cover Argon2id, access/refresh tokens, register/login rate limits, logout revocation, deleted-user access rejection, Protobuf v2 payload validation, one-time and per-user WebSocket ticket revocation, targeted hub closure, account deletion ordering/retry, permissions, content reuse, chunk boundaries, deterministic fair-chunk rotation/single-file parallelism/cancellation/wakeup/limits, concurrent file-memory reservation/release/timeout, and file cleanup freshness/rechecks/shared-content safety/orphan removal/retry/empty-list finalization/cancellation/non-overlap/manual-delete races:
 
 ```powershell
 go test ./...
+go test -race ./...
 go vet ./...
 ```
 
-Repeatable live integration tests are in `integration_test.go`, `integration_read_test.go`, and `integration_account_test.go`; they are skipped by default. With a running backend, MySQL, and MinIO credentials:
+Repeatable live integration coverage is in `integration_test.go`, `integration_read_test.go`, `integration_auth_test.go`, and `integration_account_test.go`; the top-level tests are skipped by default. `integration_read_test.go` supplies the READ/unread checks invoked by `TestRealAPIIntegration`, while `integration_auth_test.go` contains the standalone logout/session test. With a running backend, MySQL, and MinIO credentials:
 
 ```powershell
 $env:SECURE_IM_INTEGRATION_URL = 'http://127.0.0.1:8080'
-$env:INTEGRATION_MYSQL_DSN = 'secure_im:...@tcp(127.0.0.1:13306)/secure_im?parseTime=true'
+$env:INTEGRATION_MYSQL_DSN = 'secure_im:...@tcp(127.0.0.1:13306)/secure_im?parseTime=true&loc=UTC&time_zone=%27%2B00:00%27'
 $env:INTEGRATION_MINIO_ENDPOINT = '127.0.0.1:19000'
 $env:INTEGRATION_MINIO_ACCESS_KEY = '...'
 $env:INTEGRATION_MINIO_SECRET_KEY = '...'
 $env:INTEGRATION_MINIO_BUCKET = 'secure-im-files'
-go test -run 'TestReal(APIIntegration|AuthLogoutIntegration|AccountDeletionIntegration)' -v .
+go test -run '^TestReal' -v .
 ```
 
-They create unique users on every run and verify mixed-case registration/login, uppercase user listings, refresh rotation and logout revocation, multi-device presence, bidirectional Protobuf v2 messaging, typed ACK/ERROR payloads and idempotency, batched READ delivery to both users' devices, repeat idempotency, third-party denial, persisted offline `read_at` with later messages left unread, multi-chunk transfer and SHA256, size+SHA256 instant reuse, plaintext in MinIO, and the active-file limit. The account test additionally verifies permanent deletion in MySQL and MinIO for sent and received files, shared-content last-reference cleanup, bidirectional conversation cleanup, old access/refresh token rejection, WebSocket closure and ticket revocation, while preserving another conversation, its users, and unrelated downloadable content.
+They create unique users on every run and verify mixed-case registration/login, uppercase user listings, refresh rotation, per-session logout revocation and idempotency, cross-user logout denial, multi-device presence, bidirectional Protobuf v2 messaging, typed ACK/ERROR payloads and idempotency, grouped unread summaries before and after READ, batched READ delivery to both users' devices, repeat idempotency, third-party denial, persisted offline `read_at` with later messages left unread, multi-chunk transfer and SHA256, size+SHA256 instant reuse, plaintext in MinIO, and the active-file limit. The account test additionally verifies permanent deletion in MySQL and MinIO for sent and received files, shared-content last-reference cleanup, bidirectional conversation cleanup, old access/refresh token rejection, WebSocket closure and ticket revocation, while preserving another conversation, its users, and unrelated downloadable content.
 
 To keep Go artifacts local, set `GOMODCACHE`, `GOCACHE`, and `GOPATH` under `backend/.cache`. The sources of truth for the wire protocol are `proto/im/v1/envelope.proto` and `proto/im/v1/messages.proto`; their generated Go files are committed so normal builds do not need a global `protoc`.
 
 ## Isolated stress backend
 
-With the normal MySQL and MinIO containers healthy, run `scripts/stress-up.ps1`. It creates ignored `deploy/.env.stress` credentials, idempotently creates/grants only `secure_im_stress`, builds the backend image, and starts the independent `secure-im-stress` Compose project. The backend uses bucket `secure-im-stress-files`, **5 MiB** chunks, 64 concurrent file operations, **6 CPUs** (`cpus: 6` and `GOMAXPROCS=6`), a 3 GiB container limit, a 500 MiB file-memory budget, and is available only at `http://127.0.0.1:18080`. Register/login limits are disabled only in this isolated stress configuration. The ROOT/123456 account is created and verified solely for the local stress tool. `scripts/stress-down.ps1` removes only that backend project; it does not stop the shared base containers or delete any volumes or stress data.
+With the normal MySQL and MinIO containers healthy, run `scripts/stress-up.ps1`. It creates ignored `deploy/.env.stress` credentials, idempotently creates/grants only `secure_im_stress`, builds the backend image, and starts the independent `secure-im-stress` Compose project. The backend uses bucket `secure-im-stress-files`, **5 MiB** chunks, 96 shared chunk slots, **6 CPUs** (`cpus: 6` and `GOMAXPROCS=6`), a 3 GiB container limit, a 500 MiB file-memory budget, and is available only at `http://127.0.0.1:18080`. Register/login limits are disabled only in this isolated stress configuration. The ROOT/123456 account is created and verified solely for the local stress tool. `scripts/stress-down.ps1` removes only that backend project; it does not stop the shared base containers or delete any volumes or stress data.

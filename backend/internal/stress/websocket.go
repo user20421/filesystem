@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -198,8 +197,4 @@ func newRandom(key string) *rand.Rand {
 	sum := sha256.Sum256([]byte(key))
 	seed := int64(binary.BigEndian.Uint64(sum[:8])) ^ time.Now().UnixNano()
 	return rand.New(rand.NewSource(seed))
-}
-
-func IsNormalWSClose(err error) bool {
-	return errors.Is(err, context.Canceled) || websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }

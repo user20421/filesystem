@@ -14,8 +14,8 @@
 class ApiClient;
 class LocalStore;
 
-// Stable logical request handle. Its underlying QNetworkReply may be replaced
-// once after an access-token refresh; consumers keep this handle throughout.
+// ApiRequestHandle 是稳定的逻辑请求句柄：刷新令牌后底层 QNetworkReply 可被替换，调用方仍持有同一对象。
+// 取消、流式读取和背压都通过该句柄转发，避免重试后误操作旧连接。
 class ApiRequestHandle final : public QObject {
     Q_OBJECT
 public:
@@ -54,7 +54,7 @@ private:
     int m_retryCount = 0;
 };
 
-// The only module that knows REST paths and JSON response field names.
+// ApiClient 集中管理 REST 路径、JSON 字段、认证状态和请求生命周期，UI 不直接拼接网络协议细节。
 class ApiClient final : public QObject {
     Q_OBJECT
 public:
@@ -62,6 +62,7 @@ public:
     using UsersCallback = std::function<void(bool, QList<User>, QString)>;
     using PresenceCallback = std::function<void(bool, QSet<QString>, QString)>;
     using MessagesCallback = std::function<void(bool, QList<ChatMessage>, QString)>;
+    using UnreadCallback = std::function<void(bool, QList<UnreadSummary>, QString)>;
     using TicketCallback = std::function<void(bool, QString, QString)>;
     using FileInitCallback = std::function<void(bool, FileInitInfo, QString)>;
     using FileStatusCallback = std::function<void(bool, FileStatus, QString)>;
@@ -100,6 +101,7 @@ public:
     ApiRequestHandle *wsTicket(TicketCallback callback);
     ApiRequestHandle *messages(const QString &peerId, const QString &afterId,
                                MessagesCallback callback);
+    ApiRequestHandle *unread(UnreadCallback callback);
 
     ApiRequestHandle *initFile(const QString &peerId, const QString &fileName, qint64 size,
                                const QString &sha256, FileInitCallback callback);
@@ -157,5 +159,6 @@ private:
     bool m_authFailureInProgress = false;
     bool m_loggingOut = false;
     bool m_closing = false;
+    // Explicit login/logout advances this fence so late refresh callbacks cannot revive old auth.
     quint64 m_authEpoch = 1;
 };

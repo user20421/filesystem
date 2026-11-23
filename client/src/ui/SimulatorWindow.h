@@ -1,10 +1,9 @@
 #pragma once
 
-#include "StressRunController.h"
+#include "RootStressSession.h"
 
 #include <QMainWindow>
 #include <QUrl>
-#include <memory>
 
 struct AuthSession;
 class LoginPage;
@@ -21,11 +20,10 @@ public:
     ~SimulatorWindow() override;
 
     bool isOpen() const;
-    QString startupError() const { return m_startupError; }
+    QString startupError() const { return m_root ? m_root->startupError() : QString{}; }
     bool isAuthenticated() const { return m_systemTest != nullptr; }
     SystemTestPage *systemTestPage() const { return m_systemTest; }
-    SessionContext *context() const { return m_context.get(); }
-    bool savePreview(const QString &path);
+    SessionContext *context() const { return m_root ? m_root->context() : nullptr; }
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -34,11 +32,9 @@ private:
     void showSystemTest(const AuthSession &session);
     void shutdown();
 
-    StressRunConfig m_config;
-    std::unique_ptr<SessionContext> m_context;
+    RootStressSession *m_root = nullptr;
     QStackedWidget *m_stack = nullptr;
     LoginPage *m_login = nullptr;
     SystemTestPage *m_systemTest = nullptr;
-    QString m_startupError;
     bool m_closing = false;
 };

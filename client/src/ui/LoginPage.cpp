@@ -14,7 +14,7 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
 {
     setObjectName(QStringLiteral("loginPage"));
     auto *outer = new QVBoxLayout(this);
-    outer->setContentsMargins(30, 30, 30, 30);
+    outer->setContentsMargins(20, 20, 20, 20);
     outer->addStretch();
     auto *center = new QHBoxLayout;
     center->addStretch();
@@ -23,9 +23,9 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
     panel->setObjectName(QStringLiteral("brandCard"));
     panel->setFixedWidth(430);
     auto *layout = new QVBoxLayout(panel);
-    layout->setContentsMargins(36, 32, 36, 32);
-    layout->setSpacing(16);
-    auto *brand = new QLabel(QStringLiteral("Lumen IM"), panel);
+    layout->setContentsMargins(32, 18, 32, 18);
+    layout->setSpacing(10);
+    auto *brand = new QLabel(QStringLiteral("聊天和文件传输软件"), panel);
     brand->setObjectName(QStringLiteral("brandTitle"));
     brand->setAlignment(Qt::AlignCenter);
     layout->addWidget(brand);
@@ -43,6 +43,7 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
     form->setVerticalSpacing(12);
     m_username = new QLineEdit(panel);
     m_username->setObjectName(QStringLiteral("usernameEdit"));
+    m_username->setFixedHeight(38);
     m_username->setPlaceholderText(QStringLiteral("请输入用户名（自动转为大写）"));
     connect(m_username, &QLineEdit::textEdited, this, [this](const QString &text) {
         const QString upper = text.toUpper();
@@ -54,6 +55,7 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
     });
     m_password = new QLineEdit(panel);
     m_password->setObjectName(QStringLiteral("passwordEdit"));
+    m_password->setFixedHeight(38);
     m_password->setPlaceholderText(QStringLiteral("6~128 个 UTF-8 字节"));
     m_password->setEchoMode(QLineEdit::Password);
     // Local simulation convenience only; never use a prefilled password in production.
@@ -65,12 +67,24 @@ LoginPage::LoginPage(ApiClient *api, LocalStore *store, QWidget *parent)
     auto *buttons = new QHBoxLayout;
     m_login = new QPushButton(QStringLiteral("登录"), panel);
     m_login->setObjectName(QStringLiteral("loginButton"));
+    m_login->setFixedHeight(38);
     m_login->setProperty("primary", true);
     m_register = new QPushButton(QStringLiteral("创建账号"), panel);
     m_register->setObjectName(QStringLiteral("registerButton"));
+    m_register->setFixedHeight(38);
     buttons->addWidget(m_register);
     buttons->addWidget(m_login);
     layout->addLayout(buttons);
+    m_systemTest = new QPushButton(QStringLiteral("系统测试"), panel);
+    m_systemTest->setObjectName(QStringLiteral("openSystemTestButton"));
+    m_systemTest->setProperty("navigation", true);
+    m_systemTest->setFixedHeight(30);
+    layout->addWidget(m_systemTest);
+    connect(m_systemTest, &QPushButton::clicked, this, [this] {
+        m_username->setText(QStringLiteral("ROOT"));
+        m_password->setText(QStringLiteral("123456"));
+        authenticate(false);
+    });
     m_status = new QLabel(panel);
     m_status->setObjectName(QStringLiteral("loginStatus"));
     m_status->setWordWrap(true);
@@ -105,6 +119,7 @@ void LoginPage::setBusy(bool busy)
 {
     m_login->setEnabled(!busy);
     m_register->setEnabled(!busy);
+    m_systemTest->setEnabled(!busy);
     m_username->setEnabled(!busy);
     m_password->setEnabled(!busy);
 }
@@ -128,7 +143,8 @@ void LoginPage::authenticate(bool registration)
     setBusy(true);
     m_status->setText(registration ? QStringLiteral("正在创建安全会话…") : QStringLiteral("正在登录…"));
     QPointer<LoginPage> guarded(this);
-    auto callback = [guarded](bool ok, const AuthSession &session, const QString &error) {
+    ApiClient::AuthCallback deliver = [guarded](bool ok, const AuthSession &session,
+                                                const QString &error) {
         if (!guarded || guarded->m_closing)
             return;
         guarded->setBusy(false);
@@ -136,13 +152,25 @@ void LoginPage::authenticate(bool registration)
             guarded->m_status->setText(error);
             return;
         }
-        QString saveError;
-        if (!guarded->m_store->saveSession(session, &saveError)) {
-            guarded->m_status->setText(QStringLiteral("无法保存会话：") + saveError);
-            return;
-        }
-        guarded->m_password->clear();
+        // Keep the local demo convenience password available after logout too.
+        guarded->m_password->setText(QStringLiteral("123456"));
         emit guarded->authenticated(session);
+    };
+    if (m_authenticationInterceptor
+        && m_authenticationInterceptor(username, password, registration, deliver))
+        return;
+    ApiClient::AuthCallback callback = [guarded, deliver](bool ok, const AuthSession &session,
+                                                          const QString &error) {
+        if (!guarded || guarded->m_closing)
+            return;
+        if (ok) {
+            QString saveError;
+            if (!guarded->m_store->saveSession(session, &saveError)) {
+                deliver(false, {}, QStringLiteral("无法保存会话：") + saveError);
+                return;
+            }
+        }
+        deliver(ok, session, error);
     };
     if (registration)
         m_api->registerUser(username, password, std::move(callback));

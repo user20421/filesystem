@@ -25,6 +25,8 @@ func (c *client) close() {
 		}
 	})
 }
+
+// enqueue 将消息放入有界发送队列；慢消费者占满队列时立即断开，避免单个连接拖垮整个 Hub。
 func (c *client) enqueue(e *impb.Envelope) bool {
 	select {
 	case c.send <- e:
@@ -35,6 +37,7 @@ func (c *client) enqueue(e *impb.Envelope) bool {
 	}
 }
 
+// Hub 是单进程在线连接表，每用户最多允许 5 条连接；离线消息不在这里补发，而是由数据库历史负责。
 type Hub struct {
 	mu    sync.RWMutex
 	users map[string]map[*client]struct{}
@@ -64,7 +67,7 @@ func (h *Hub) remove(userID string, c *client) {
 	}
 }
 
-// OnlineUsers returns a stable snapshot of users with at least one connection.
+// OnlineUsers 返回按 ID 排序的在线用户快照，便于界面与压测稳定读取。
 func (h *Hub) OnlineUsers() []string {
 	h.mu.RLock()
 	users := make([]string, 0, len(h.users))
@@ -84,7 +87,7 @@ func (h *Hub) IsOnline(userID string) bool {
 	return len(h.users[userID]) > 0
 }
 
-// CloseUser removes and closes only the specified user's connections.
+// CloseUser 只移除并关闭指定用户的全部连接，不影响其他在线用户。
 func (h *Hub) CloseUser(userID string) {
 	h.mu.Lock()
 	targets := make([]*client, 0, len(h.users[userID]))
@@ -111,20 +114,18 @@ func (h *Hub) CloseAll() {
 		c.close()
 	}
 }
-func (h *Hub) Publish(userID string, e *impb.Envelope) int {
+
+// Publish 仅向接收者当前在线连接推送消息，未在线时依赖数据库历史补拉。
+func (h *Hub) Publish(userID string, e *impb.Envelope) {
 	h.mu.RLock()
 	targets := make([]*client, 0, len(h.users[userID]))
 	for c := range h.users[userID] {
 		targets = append(targets, c)
 	}
 	h.mu.RUnlock()
-	count := 0
 	for _, c := range targets {
-		if c.enqueue(e) {
-			count++
-		}
+		c.enqueue(e)
 	}
-	return count
 }
 func (c *client) writer() {
 	ticker := time.NewTicker(25 * time.Second)

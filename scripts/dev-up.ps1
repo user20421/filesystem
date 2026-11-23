@@ -1,8 +1,9 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 . (Join-Path $PSScriptRoot '_common.ps1')
 
+# 使用加密安全随机数生成本地密码，避免在示例配置中保存固定秘密。
 function New-LocalPassword {
     $bytes = New-Object byte[] 24
     $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()

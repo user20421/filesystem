@@ -1,5 +1,6 @@
 #include "TransferTaskCard.h"
 
+#include "Format.h"
 #include "TransferManager.h"
 
 #include <QDir>
@@ -15,18 +16,6 @@
 #include <QVBoxLayout>
 
 namespace {
-QString formattedBytes(qint64 bytes)
-{
-    bytes = qMax<qint64>(0, bytes);
-    if (bytes < 1024)
-        return QStringLiteral("%1 B").arg(bytes);
-    if (bytes < 1024 * 1024)
-        return QStringLiteral("%1 KiB").arg(bytes / 1024.0, 0, 'f', 1);
-    if (bytes < 1024LL * 1024 * 1024)
-        return QStringLiteral("%1 MiB").arg(bytes / (1024.0 * 1024.0), 0, 'f', 1);
-    return QStringLiteral("%1 GiB").arg(bytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2);
-}
-
 class TransferLinkLabel final : public QLabel {
     Q_OBJECT
 public:
@@ -185,11 +174,11 @@ void TransferTaskCard::setData(const TransferCardData &data)
         ? qBound(0, static_cast<int>(data.transferred * 100 / data.size), 100)
         : data.stateKey == QLatin1String("completed") ? 100 : 0;
     m_percent->setText(QStringLiteral("%1%").arg(percent));
-    m_bytes->setText(QStringLiteral("%1 / %2").arg(formattedBytes(data.transferred),
-                                                   formattedBytes(data.size)));
+    m_bytes->setText(QStringLiteral("%1 / %2").arg(Format::bytes(qMax<qint64>(0, data.transferred)),
+                                                   Format::bytes(qMax<qint64>(0, data.size))));
     m_progress->setValue(percent);
     m_progress->setToolTip(QStringLiteral("%1% · %2 / %3")
-        .arg(percent).arg(formattedBytes(data.transferred), formattedBytes(data.size)));
+        .arg(percent).arg(Format::bytes(qMax<qint64>(0, data.transferred)), Format::bytes(qMax<qint64>(0, data.size))));
     m_progress->setProperty("state", data.stateKey);
 
     const QString nativePath = QDir::toNativeSeparators(data.localPath);

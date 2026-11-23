@@ -8,57 +8,64 @@ import (
 )
 
 type Config struct {
-	Address              string
-	JWTSecret            []byte
-	AccessTTL            time.Duration
-	RefreshTTL           time.Duration
-	WSTicketTTL          time.Duration
-	MySQLDSN             string
-	MinIOEndpoint        string
-	MinIOAccessKey       string
-	MinIOSecretKey       string
-	MinIOBucket          string
-	MinIOUseSSL          bool
-	MaxActiveFiles       int
-	MaxChunkSize         int64
-	MaxFileSize          int64
-	UploadConcurrency    int
-	FileMemoryBudget     int64
-	EnableDebugStats     bool
-	WSMaxConnections     int
-	RegisterRateLimit    int
-	LoginRateLimit       int
-	AuthRateLimitWindow  time.Duration
-	AuthRateLimitMaxKeys int
+	Address                string
+	JWTSecret              []byte
+	AccessTTL              time.Duration
+	RefreshTTL             time.Duration
+	WSTicketTTL            time.Duration
+	MySQLDSN               string
+	MinIOEndpoint          string
+	MinIOAccessKey         string
+	MinIOSecretKey         string
+	MinIOBucket            string
+	MinIOUseSSL            bool
+	MaxActiveFiles         int
+	MaxChunkSize           int64
+	MaxFileSize            int64
+	UploadConcurrency      int
+	FileMemoryBudget       int64
+	FileUploadIdleTTL      time.Duration
+	FileDeletingRetryAfter time.Duration
+	FileCleanupInterval    time.Duration
+	EnableDebugStats       bool
+	WSMaxConnections       int
+	RegisterRateLimit      int
+	LoginRateLimit         int
+	AuthRateLimitWindow    time.Duration
+	AuthRateLimitMaxKeys   int
 }
 
+// Load 从环境变量构建配置：显式 MYSQL_DSN 优先，非法数值或时长会回退默认值，密钥长度和资源边界必须校验。
 func Load() (Config, error) {
 	c := Config{
-		Address:              env("LISTEN_ADDR", "127.0.0.1:8080"),
-		JWTSecret:            []byte(os.Getenv("JWT_SECRET")),
-		AccessTTL:            duration("ACCESS_TOKEN_TTL", 15*time.Minute),
-		RefreshTTL:           duration("REFRESH_TOKEN_TTL", 30*24*time.Hour),
-		WSTicketTTL:          duration("WS_TICKET_TTL", time.Minute),
-		MySQLDSN:             os.Getenv("MYSQL_DSN"),
-		MinIOEndpoint:        env("MINIO_ENDPOINT", "127.0.0.1:9000"),
-		MinIOAccessKey:       os.Getenv("MINIO_ACCESS_KEY"),
-		MinIOSecretKey:       os.Getenv("MINIO_SECRET_KEY"),
-		MinIOBucket:          env("MINIO_BUCKET", "secure-im-files"),
-		MinIOUseSSL:          boolean("MINIO_USE_SSL", false),
-		MaxActiveFiles:       integer("MAX_ACTIVE_FILES", 3),
-		MaxChunkSize:         int64(integer("MAX_CHUNK_SIZE", 5<<20)),
-		MaxFileSize:          int64(integer("MAX_FILE_SIZE", 5<<30)),
-		UploadConcurrency:    integer("UPLOAD_CONCURRENCY", 96),
-		FileMemoryBudget:     int64(integer("FILE_MEMORY_BUDGET", 500<<20)),
-		EnableDebugStats:     boolean("ENABLE_DEBUG_STATS", false),
-		WSMaxConnections:     integer("WS_MAX_CONNECTIONS", 1000),
-		RegisterRateLimit:    integer("AUTH_REGISTER_RATE_LIMIT", 30),
-		LoginRateLimit:       integer("AUTH_LOGIN_RATE_LIMIT", 10),
-		AuthRateLimitWindow:  duration("AUTH_RATE_LIMIT_WINDOW", time.Minute),
-		AuthRateLimitMaxKeys: integer("AUTH_RATE_LIMIT_MAX_KEYS", 10000),
+		Address:                env("LISTEN_ADDR", "127.0.0.1:8080"),
+		JWTSecret:              []byte(os.Getenv("JWT_SECRET")),
+		AccessTTL:              duration("ACCESS_TOKEN_TTL", 15*time.Minute),
+		RefreshTTL:             duration("REFRESH_TOKEN_TTL", 30*24*time.Hour),
+		WSTicketTTL:            duration("WS_TICKET_TTL", time.Minute),
+		MySQLDSN:               os.Getenv("MYSQL_DSN"),
+		MinIOEndpoint:          env("MINIO_ENDPOINT", "127.0.0.1:9000"),
+		MinIOAccessKey:         os.Getenv("MINIO_ACCESS_KEY"),
+		MinIOSecretKey:         os.Getenv("MINIO_SECRET_KEY"),
+		MinIOBucket:            env("MINIO_BUCKET", "secure-im-files"),
+		MinIOUseSSL:            boolean("MINIO_USE_SSL", false),
+		MaxActiveFiles:         integer("MAX_ACTIVE_FILES", 3),
+		MaxChunkSize:           int64(integer("MAX_CHUNK_SIZE", 5<<20)),
+		MaxFileSize:            int64(integer("MAX_FILE_SIZE", 5<<30)),
+		UploadConcurrency:      integer("UPLOAD_CONCURRENCY", 96),
+		FileMemoryBudget:       int64(integer("FILE_MEMORY_BUDGET", 500<<20)),
+		FileUploadIdleTTL:      duration("FILE_UPLOAD_IDLE_TTL", 24*time.Hour),
+		FileDeletingRetryAfter: duration("FILE_DELETING_RETRY_AFTER", 5*time.Minute),
+		FileCleanupInterval:    duration("FILE_CLEANUP_INTERVAL", time.Minute),
+		EnableDebugStats:       boolean("ENABLE_DEBUG_STATS", false),
+		WSMaxConnections:       integer("WS_MAX_CONNECTIONS", 1000),
+		RegisterRateLimit:      integer("AUTH_REGISTER_RATE_LIMIT", 30),
+		LoginRateLimit:         integer("AUTH_LOGIN_RATE_LIMIT", 10),
+		AuthRateLimitWindow:    duration("AUTH_RATE_LIMIT_WINDOW", time.Minute),
+		AuthRateLimitMaxKeys:   integer("AUTH_RATE_LIMIT_MAX_KEYS", 10000),
 	}
 	if c.MySQLDSN == "" {
-		c.MySQLDSN = fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s",
+		c.MySQLDSN = fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&loc=UTC&time_zone=%%27%%2B00:00%%27&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s",
 			env("MYSQL_USER", "root"), os.Getenv("MYSQL_PASSWORD"), env("MYSQL_ADDR", "127.0.0.1:3306"), env("MYSQL_DATABASE", "secure_im"))
 	}
 	if len(c.JWTSecret) < 32 {
@@ -75,6 +82,9 @@ func Load() (Config, error) {
 	}
 	if c.FileMemoryBudget <= 0 {
 		return c, fmt.Errorf("FILE_MEMORY_BUDGET must be positive")
+	}
+	if c.FileUploadIdleTTL <= 0 || c.FileDeletingRetryAfter <= 0 || c.FileCleanupInterval <= 0 {
+		return c, fmt.Errorf("file cleanup TTLs and interval must be positive")
 	}
 	if c.WSMaxConnections < 1 || c.WSMaxConnections > 100000 {
 		return c, fmt.Errorf("WS_MAX_CONNECTIONS must be between 1 and 100000")

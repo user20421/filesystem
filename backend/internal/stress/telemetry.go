@@ -16,14 +16,18 @@ type debugSample struct {
 	rss, cpu, heapMiB       *float64
 	goroutines              *int
 	budgetUsed, budgetLimit *int64
+	slotUsed, slotLimit     *int64
 }
 
+const healthFailureThreshold = 3
+
 type Telemetry struct {
-	api            *APIClient
-	metrics        *Metrics
-	container      string
-	mu             sync.Mutex
-	rssMax, cpuMax *float64
+	api                       *APIClient
+	metrics                   *Metrics
+	container                 string
+	consecutiveHealthFailures int
+	mu                        sync.Mutex
+	rssMax, cpuMax            *float64
 }
 
 func NewTelemetry(api *APIClient, metrics *Metrics, container string) *Telemetry {
@@ -34,6 +38,7 @@ func (t *Telemetry) Run(ctx context.Context) {
 		t.metrics.BackendStats(nil, nil)
 		t.metrics.BackendRuntime(nil, nil)
 		t.metrics.BackendBudget(nil, nil)
+		t.metrics.BackendChunkSlots(nil, nil)
 	}()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -47,15 +52,16 @@ func (t *Telemetry) Run(ctx context.Context) {
 		}
 	}
 }
+
+// sample 每秒采集健康和资源指标，连续 3 次健康检查失败才记为故障，成功会重置连续失败计数。
 func (t *Telemetry) sample(parent context.Context) {
+	t.sampleHealth(parent)
 	ctx, cancel := context.WithTimeout(parent, 2500*time.Millisecond)
 	defer cancel()
-	if err := t.api.Health(ctx, "/ready"); err != nil && parent.Err() == nil {
-		t.metrics.HealthFailed()
-	}
 	debug := t.debugStats(ctx)
 	rss, cpu := debug.rss, debug.cpu
 	t.metrics.BackendBudget(debug.budgetUsed, debug.budgetLimit)
+	t.metrics.BackendChunkSlots(debug.slotUsed, debug.slotLimit)
 	t.metrics.BackendRuntime(debug.heapMiB, debug.goroutines)
 	if dockerRSS, dockerCPU, err := dockerStats(ctx, t.container); err == nil {
 		if dockerRSS != nil {
@@ -73,6 +79,25 @@ func (t *Telemetry) sample(parent context.Context) {
 	}
 	if cpu != nil && (t.cpuMax == nil || *cpu > *t.cpuMax) {
 		t.cpuMax = clone(cpu)
+	}
+}
+func (t *Telemetry) sampleHealth(parent context.Context) {
+	// Readiness checks need enough time to cover dependency checks and brief
+	// scheduling delays under load. Isolated failures are ignored so transient
+	// load spikes do not fail an otherwise healthy run.
+	healthCtx, healthCancel := context.WithTimeout(parent, 10*time.Second)
+	err := t.api.Health(healthCtx, "/ready")
+	healthCancel()
+	if err == nil {
+		t.consecutiveHealthFailures = 0
+		return
+	}
+	if parent.Err() != nil {
+		return
+	}
+	t.consecutiveHealthFailures++
+	if t.consecutiveHealthFailures >= healthFailureThreshold {
+		t.metrics.HealthFailed()
 	}
 }
 func (t *Telemetry) Max() (*float64, *float64) {
@@ -103,6 +128,9 @@ func (t *Telemetry) debugStats(ctx context.Context) debugSample {
 	}
 	if budget, ok := body["file_memory_budget"].(map[string]any); ok {
 		result.budgetUsed, result.budgetLimit = integerField(budget, "used"), integerField(budget, "limit")
+	}
+	if slots, ok := body["file_chunk_slots"].(map[string]any); ok {
+		result.slotUsed, result.slotLimit = integerField(slots, "used"), integerField(slots, "limit")
 	}
 	if goStats, ok := body["go"].(map[string]any); ok {
 		if heap := numberField(goStats, "heap_alloc_bytes"); heap != nil {

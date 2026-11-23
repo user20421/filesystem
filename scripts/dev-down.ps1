@@ -1,3 +1,4 @@
+﻿# 默认仅停止服务并保留数据卷；-RemoveVolumes 会永久删除 MySQL 和 MinIO 数据，必须谨慎使用。
 [CmdletBinding()]
 param(
     [switch]$RemoveVolumes

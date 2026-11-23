@@ -1,4 +1,4 @@
-# Local secrets and runtime data
+# 本地密钥与运行期数据
 .env
 *.local
 runtime/
@@ -19,16 +19,16 @@ cmake-build-*/
 CMakeUserPresets.json
 *.user
 
-# IDE
+# 开发工具与 IDE 配置
 .vs/
 .vscode/
 .idea/
 
-# OS
+# 操作系统临时文件
 .DS_Store
 Thumbs.db
 
-# Logs and temporary files
+# 日志与临时文件
 *.log
 *.tmp
 *.bak

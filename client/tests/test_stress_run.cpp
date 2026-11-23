@@ -1,10 +1,12 @@
 #include "SimulatorWindow.h"
 #include "StressRunController.h"
 #include "SystemTestPage.h"
+#include "support/TestEnvironment.h"
 
 #include <QApplication>
 #include <QDir>
 #include <QFile>
+#include <QFrame>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -21,6 +23,7 @@
 #include <QTreeWidget>
 #include <QtTest>
 
+#include <algorithm>
 #include <memory>
 
 namespace {
@@ -55,22 +58,6 @@ void writeSummary(const QString &root, const QString &name, const QString &times
     html.write("<html>report</html>");
 }
 
-class EnvironmentGuard final {
-public:
-    explicit EnvironmentGuard(const char *name) : m_name(name), m_hadValue(qEnvironmentVariableIsSet(name)),
-        m_value(qgetenv(name)) {}
-    ~EnvironmentGuard()
-    {
-        if (m_hadValue)
-            qputenv(m_name.constData(), m_value);
-        else
-            qunsetenv(m_name.constData());
-    }
-private:
-    QByteArray m_name;
-    bool m_hadValue;
-    QByteArray m_value;
-};
 } // namespace
 
 class StressRunTest final : public QObject {
@@ -78,6 +65,9 @@ class StressRunTest final : public QObject {
 private slots:
     void runsSetupBeforeRunner();
     void parsesStickyNdjsonAndDrainsFinal();
+    void showsChunkSlotStates();
+    void displaysLocalizedPhasesAndMetricNames();
+    void targetSpinUsesThousands();
     void reportsNonZeroExit();
     void rejectsMissingFinal();
     void showsFluctuationConclusion();
@@ -90,8 +80,8 @@ private slots:
 void StressRunTest::runsSetupBeforeRunner()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
-    EnvironmentGuard setupCapture("SECURE_IM_FAKE_SETUP_FILE");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment setupCapture("SECURE_IM_FAKE_SETUP_FILE");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "sticky");
     const QString marker = root.filePath(QStringLiteral("setup.txt"));
     qputenv("SECURE_IM_FAKE_SETUP_FILE", marker.toUtf8());
@@ -112,8 +102,8 @@ void StressRunTest::runsSetupBeforeRunner()
 void StressRunTest::parsesStickyNdjsonAndDrainsFinal()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
-    EnvironmentGuard capture("SECURE_IM_FAKE_ARGUMENTS_FILE");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment capture("SECURE_IM_FAKE_ARGUMENTS_FILE");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "sticky");
     const QString capturePath = root.filePath(QStringLiteral("arguments.json"));
     qputenv("SECURE_IM_FAKE_ARGUMENTS_FILE", capturePath.toUtf8());
@@ -149,6 +139,11 @@ void StressRunTest::parsesStickyNdjsonAndDrainsFinal()
     QCOMPARE(first.goroutines, qint64(345));
     QCOMPARE(first.fileBudgetUsedMib, 120.5);
     QCOMPARE(first.fileBudgetLimitMib, 500.0);
+    QCOMPARE(first.fileChunkSlotsUsed, qint64(7));
+    QCOMPARE(first.fileChunkSlotsLimit, qint64(96));
+    QCOMPARE(first.fileChunkSlotsKnown, true);
+    const StressProgress legacy = qvariant_cast<StressProgress>(progress.at(1).at(0));
+    QCOMPARE(legacy.fileChunkSlotsKnown, false);
     const StressFinal result = qvariant_cast<StressFinal>(finalResult.first().at(0));
     QCOMPARE(result.status, QStringLiteral("success"));
     QCOMPARE(result.target, qint64(1000));
@@ -171,10 +166,80 @@ void StressRunTest::parsesStickyNdjsonAndDrainsFinal()
     QVERIFY(sawInvalidJson);
 }
 
+void StressRunTest::displaysLocalizedPhasesAndMetricNames()
+{
+    QTemporaryDir root;
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "phases");
+    SystemTestPage page(fakeConfig(root.path()));
+    auto *phase = page.findChild<QLabel *>(QStringLiteral("stressPhaseLabel"));
+    auto *start = page.findChild<QPushButton *>(QStringLiteral("stressTestButton"));
+    auto *stop = page.findChild<QPushButton *>(QStringLiteral("stressStopButton"));
+    QVERIFY(phase && start && stop);
+    const auto labels = page.findChildren<QLabel *>();
+    QVERIFY(std::any_of(labels.cbegin(), labels.cend(), [](const QLabel *label) {
+        return label->text() == QStringLiteral("Go 堆 / 协程数");
+    }));
+
+    start->click();
+    QTRY_COMPARE_WITH_TIMEOUT(phase->text(), QStringLiteral("准备环境"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(phase->text(), QStringLiteral("连接爬坡"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(phase->text(), QStringLiteral("稳定测试"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(phase->text(), QStringLiteral("收尾排空"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(phase->text(), QStringLiteral("清理数据"), 5000);
+    QTRY_COMPARE_WITH_TIMEOUT(phase->text(), QStringLiteral("待命"), 5000);
+    stop->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page.controller()->isRunning(), 5000);
+}
+
+void StressRunTest::targetSpinUsesThousands()
+{
+    QTemporaryDir root;
+    SystemTestPage page(fakeConfig(root.path()));
+    auto *target = page.findChild<QSpinBox *>(QStringLiteral("stressTargetSpinBox"));
+    QVERIFY(target);
+    QCOMPARE(target->singleStep(), 1000);
+    QCOMPARE(target->buttonSymbols(), QSpinBox::PlusMinus);
+    QVERIFY(target->isGroupSeparatorShown());
+    QVERIFY(target->height() >= 36);
+    target->setValue(5000);
+    QTest::keyClick(target, Qt::Key_Up);
+    QCOMPARE(target->value(), 6000);
+    QTest::keyClick(target, Qt::Key_Down);
+    QCOMPARE(target->value(), 5000);
+}
+
+void StressRunTest::showsChunkSlotStates()
+{
+    QTemporaryDir root;
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    SystemTestPage page(fakeConfig(root.path()));
+    auto *chunkSlotsLabel = page.findChild<QLabel *>(QStringLiteral("stressChunkSlotsValue"));
+    auto *start = page.findChild<QPushButton *>(QStringLiteral("stressTestButton"));
+    auto *stop = page.findChild<QPushButton *>(QStringLiteral("stressStopButton"));
+    QVERIFY(chunkSlotsLabel && start && stop);
+    QCOMPARE(page.findChildren<QFrame *>(QStringLiteral("stressMetricCard")).size(), 8);
+    QCOMPARE(chunkSlotsLabel->text(), QStringLiteral("—"));
+
+    qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "hold");
+    start->click();
+    QTRY_COMPARE_WITH_TIMEOUT(chunkSlotsLabel->text(), QStringLiteral("分块通道 7 / 96"), 5000);
+    stop->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page.controller()->isRunning(), 5000);
+    QCOMPARE(chunkSlotsLabel->text(), QStringLiteral("—"));
+
+    qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "unknown-hold");
+    start->click();
+    QTRY_COMPARE_WITH_TIMEOUT(chunkSlotsLabel->text(), QStringLiteral("分块通道未知"), 5000);
+    stop->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page.controller()->isRunning(), 5000);
+    QCOMPARE(chunkSlotsLabel->text(), QStringLiteral("—"));
+}
+
 void StressRunTest::reportsNonZeroExit()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "nonzero");
     StressRunController controller(fakeConfig(root.path()));
     QSignalSpy finalResult(&controller, &StressRunController::finalReceived);
@@ -190,7 +255,7 @@ void StressRunTest::reportsNonZeroExit()
 void StressRunTest::rejectsMissingFinal()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "missing-final");
     StressRunController controller(fakeConfig(root.path()));
     QSignalSpy finished(&controller, &StressRunController::runFinished);
@@ -204,7 +269,7 @@ void StressRunTest::rejectsMissingFinal()
 void StressRunTest::showsFluctuationConclusion()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "fluctuation");
     SystemTestPage page(fakeConfig(root.path()));
     auto *start = page.findChild<QPushButton *>(QStringLiteral("stressTestButton"));
@@ -224,7 +289,7 @@ void StressRunTest::showsFluctuationConclusion()
 void StressRunTest::stopsActiveRunner()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "hold");
     StressRunController controller(fakeConfig(root.path()));
     QSignalSpy progress(&controller, &StressRunController::progressReceived);
@@ -241,7 +306,7 @@ void StressRunTest::stopsActiveRunner()
 void StressRunTest::destructorStopsActiveRunner()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "hold");
     auto controller = std::make_unique<StressRunController>(fakeConfig(root.path()));
     QSignalSpy progress(controller.get(), &StressRunController::progressReceived);
@@ -254,7 +319,7 @@ void StressRunTest::destructorStopsActiveRunner()
 void StressRunTest::refreshesHistoryAndOpensReports()
 {
     QTemporaryDir root;
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     qputenv("SECURE_IM_FAKE_STRESS_SCENARIO", "sticky");
     const StressRunConfig config = fakeConfig(root.path());
     writeSummary(config.reportRoot, QStringLiteral("older"),
@@ -269,6 +334,8 @@ void StressRunTest::refreshesHistoryAndOpensReports()
     QCOMPARE(history->topLevelItemCount(), 2);
     QCOMPARE(history->topLevelItem(0)->text(1), QStringLiteral("10,000"));
     QCOMPARE(history->topLevelItem(1)->text(1), QStringLiteral("5,000"));
+    QCOMPARE(history->topLevelItem(0)->text(2), QStringLiteral("波动"));
+    QCOMPARE(history->topLevelItem(1)->text(2), QStringLiteral("失败"));
     QCOMPARE(history->topLevelItem(0)->text(3), QStringLiteral("report newer"));
 
     QList<QUrl> opened;
@@ -289,6 +356,7 @@ void StressRunTest::refreshesHistoryAndOpensReports()
     QTRY_VERIFY_WITH_TIMEOUT(page.controller()->hasFinal() && !page.controller()->isRunning(), 6000);
     QTRY_VERIFY_WITH_TIMEOUT(history->topLevelItemCount() == 3, 3000);
     QCOMPARE(history->topLevelItem(0)->text(1), QStringLiteral("1,000"));
+    QCOMPARE(history->topLevelItem(0)->text(2), QStringLiteral("成功"));
     QCOMPARE(page.findChild<QLabel *>(QStringLiteral("stressConclusionLabel"))->text(),
              QStringLiteral("成功"));
     QCOMPARE(page.findChild<QLabel *>(QStringLiteral("stressOnlineValue"))->text(),
@@ -301,11 +369,11 @@ void StressRunTest::refreshesHistoryAndOpensReports()
 void StressRunTest::rootLoginThenWindowCloseStopsActiveRun()
 {
     QTemporaryDir root;
-    EnvironmentGuard project("SECURE_IM_PROJECT_ROOT");
-    EnvironmentGuard runner("SECURE_IM_STRESS_RUNNER");
-    EnvironmentGuard reports("SECURE_IM_STRESS_REPORT_ROOT");
-    EnvironmentGuard skip("SECURE_IM_STRESS_SKIP_SETUP");
-    EnvironmentGuard scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
+    ScopedEnvironment project("SECURE_IM_PROJECT_ROOT");
+    ScopedEnvironment runner("SECURE_IM_STRESS_RUNNER");
+    ScopedEnvironment reports("SECURE_IM_STRESS_REPORT_ROOT");
+    ScopedEnvironment skip("SECURE_IM_STRESS_SKIP_SETUP");
+    ScopedEnvironment scenario("SECURE_IM_FAKE_STRESS_SCENARIO");
     const StressRunConfig config = fakeConfig(root.path());
     qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
     qputenv("SECURE_IM_STRESS_RUNNER", config.runnerPath.toUtf8());

@@ -4,15 +4,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
+	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+// ObjectStore 是文件对象存储契约。Get 返回的流由调用者关闭，List 只允许规范的内容前缀，防止误扫或误删整个 Bucket。
 type ObjectStore interface {
-	Ensure(context.Context) error
 	Put(context.Context, string, io.Reader, int64) error
 	Get(context.Context, string) (io.ReadCloser, error)
+	List(context.Context, string) ([]string, error)
 	Remove(context.Context, string) error
 }
 type MinIOStore struct {
@@ -60,6 +63,32 @@ func (s *MinIOStore) Get(ctx context.Context, key string) (io.ReadCloser, error)
 	}
 	return object, nil
 }
+func (s *MinIOStore) List(ctx context.Context, prefix string) ([]string, error) {
+	if !validContentPrefix(prefix) {
+		return nil, fmt.Errorf("invalid object list prefix")
+	}
+	keys := make([]string, 0)
+	for object := range s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if object.Err != nil {
+			return nil, object.Err
+		}
+		if !strings.HasPrefix(object.Key, prefix) {
+			return nil, fmt.Errorf("object store returned key outside requested content prefix")
+		}
+		keys = append(keys, object.Key)
+	}
+	return keys, nil
+}
+
+func validContentPrefix(prefix string) bool {
+	if !strings.HasPrefix(prefix, "contents/") || !strings.HasSuffix(prefix, "/") {
+		return false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(prefix, "contents/"), "/")
+	parsed, err := uuid.Parse(id)
+	return err == nil && parsed.String() == id
+}
+
 func (s *MinIOStore) Remove(ctx context.Context, key string) error {
 	return s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{})
 }

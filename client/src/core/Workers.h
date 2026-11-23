@@ -8,18 +8,15 @@
 
 class QThread;
 
-// Blocking digest and local file work is dispatched to QThreadPool or a
-// dedicated sequential writer worker.  Results return to receiver's thread.
+// Workers 将哈希计算和文件读取放入公共线程池，将下载写入交给专用顺序 writer。
+// 结果通过队列回调返回接收者所在线程，避免阻塞 UI。
 namespace Workers {
 using HashCallback = std::function<void(bool, QString, QString)>;
 using ChunkCallback = std::function<void(bool, QByteArray, QString, QString)>;
-using WriteCallback = std::function<void(bool, QString)>;
 
 void hashFile(const QString &path, QObject *receiver, HashCallback callback);
 void readChunk(const QString &path, qint64 offset, int size, QObject *receiver,
                ChunkCallback callback);
-void writeFile(const QString &path, const QByteArray &data, QObject *receiver,
-               WriteCallback callback);
 
 using StreamWriteCallback = std::function<void(bool, qint64, QString)>;
 class AsyncFileWriter final : public QObject {

@@ -1,42 +1,12 @@
 #include "SessionContext.h"
-#include "SessionPage.h"
+#include "SingleUserWindow.h"
 #include "Theme.h"
 
 #include <QApplication>
-#include <QCloseEvent>
 #include <QCommandLineParser>
-#include <QMainWindow>
 #include <QMessageBox>
 
-namespace {
-class SingleUserWindow final : public QMainWindow {
-public:
-    SingleUserWindow(std::unique_ptr<SessionContext> context, QWidget *parent = nullptr)
-        : QMainWindow(parent), m_page(new SessionPage(std::move(context), this))
-    {
-        setWindowTitle(QStringLiteral("Lumen IM · 安全消息"));
-        resize(1120, 780);
-        setCentralWidget(m_page);
-        connect(m_page, &SessionPage::titleChanged, this, [this] {
-            if (m_page->isAuthenticated())
-                setWindowTitle(QStringLiteral("Lumen IM · %1")
-                    .arg(m_page->context()->session().user.label()));
-        });
-        connect(m_page, &SessionPage::exitRequested, this, &QMainWindow::close);
-    }
-
-protected:
-    void closeEvent(QCloseEvent *event) override
-    {
-        m_page->shutdown();
-        QMainWindow::closeEvent(event);
-    }
-
-private:
-    SessionPage *m_page;
-};
-} // namespace
-
+// 正式客户端采用一进程一用户模型；--data-dir 必填，由 SessionContext 管理目录锁和全部会话资源。
 int main(int argc, char *argv[])
 {
     QApplication application(argc, argv);

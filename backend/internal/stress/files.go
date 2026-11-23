@@ -44,14 +44,10 @@ type FilePool struct {
 	transferFunc       func(context.Context, fileJob) error
 }
 
-func NewFilePool(cfg Config, api *APIClient, metrics *Metrics, userCount int, dataError func(error), callbacks ...func(error)) *FilePool {
-	var failure func(error)
-	if len(callbacks) > 0 {
-		failure = callbacks[0]
-	}
+func NewFilePool(cfg Config, api *APIClient, metrics *Metrics, userCount int, dataError, failure func(error)) *FilePool {
 	return &FilePool{cfg: cfg, api: api, metrics: metrics, budget: NewByteBudget(cfg.FileBudgetMiB << 20), queue: make(chan fileJob, cfg.FileQueueSize), ownerLocks: make([]sync.Mutex, userCount), dataError: dataError, failure: failure}
 }
-func (p *FilePool) Start(runCtx, produceCtx context.Context, users []User) {
+func (p *FilePool) Start(runCtx context.Context, users []User) {
 	for i := 0; i < p.cfg.FileWorkers; i++ {
 		p.workers.Add(1)
 		go func() { defer p.workers.Done(); p.worker(runCtx) }()
@@ -62,7 +58,7 @@ func (p *FilePool) Start(runCtx, produceCtx context.Context, users []User) {
 		}
 		recipient := users[user.Partner]
 		p.producers.Add(1)
-		go func() { defer p.producers.Done(); p.produce(produceCtx, user, recipient) }()
+		go func() { defer p.producers.Done(); p.produce(runCtx, user, recipient) }()
 	}
 	go func() { p.producers.Wait(); close(p.queue) }()
 }
@@ -73,6 +69,10 @@ func (p *FilePool) produce(ctx context.Context, sender, recipient User) {
 	select {
 	case <-ctx.Done():
 		p.metrics.FileQueued(-1)
+		p.metrics.FileFailed()
+		if p.failure != nil {
+			p.failure(fmt.Errorf("file %s sender %s: produce canceled before enqueue: %w", job.id, sender.Username, ctx.Err()))
+		}
 	case p.queue <- job:
 	}
 }
@@ -112,9 +112,9 @@ func (p *FilePool) ownerLock(id string) *sync.Mutex {
 	}
 	return &p.ownerLocks[h%uint32(len(p.ownerLocks))]
 }
-func (p *FilePool) Wait()                                 { p.workers.Wait() }
-func (p *FilePool) BudgetSnapshot() (int64, int64, int64) { return p.budget.Snapshot() }
+func (p *FilePool) Wait() { p.workers.Wait() }
 
+// transfer 完成单个文件的初始化、分块上传、Complete、下载和 SHA-256 对比，失败时尽力清理逻辑引用。
 func (p *FilePool) transfer(ctx context.Context, job fileJob) (result error) {
 	const hashBufferSize = int64(128 << 10)
 	if err := p.budget.Acquire(ctx, hashBufferSize); err != nil {
@@ -159,7 +159,7 @@ func (p *FilePool) transfer(ctx context.Context, job fileJob) (result error) {
 			return err
 		}
 	}
-	downloaded, err := p.downloadHash(ctx, job.recipient.Token, info.ID, job.id)
+	downloaded, err := p.downloadHash(ctx, job.recipient.Token, info.ID)
 	if err != nil {
 		return err
 	}
@@ -222,7 +222,7 @@ func (p *FilePool) uploadChunkOnce(ctx context.Context, token, id string, index 
 	return nil
 }
 
-func (p *FilePool) downloadHash(ctx context.Context, token, id, seed string) (string, error) {
+func (p *FilePool) downloadHash(ctx context.Context, token, id string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.api.Base+"/api/v1/files/"+id+"/download", nil)
 	if err != nil {
 		return "", err
@@ -230,7 +230,7 @@ func (p *FilePool) downloadHash(ctx context.Context, token, id, seed string) (st
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := p.api.HTTP.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("download request: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -245,7 +245,7 @@ func (p *FilePool) downloadHash(ctx context.Context, token, id, seed string) (st
 	hash := sha256.New()
 	count, err := io.CopyBuffer(hash, resp.Body, buffer)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("download read: %w", err)
 	}
 	if count != p.cfg.FileSize {
 		err = fmt.Errorf("download size mismatch: got %d want %d", count, p.cfg.FileSize)

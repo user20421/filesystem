@@ -66,6 +66,21 @@ func schedulerState(scheduler *chunkScheduler) (active, queued int, byKey map[st
 	return scheduler.active, len(scheduler.queue), byKey
 }
 
+func TestChunkSchedulerStats(t *testing.T) {
+	scheduler := newChunkScheduler(96)
+	if active, limit := scheduler.Stats(); active != 0 || limit != 96 {
+		t.Fatalf("initial stats = %d/%d, want 0/96", active, limit)
+	}
+	release := waitSchedulerAcquired(t, startSchedulerAcquire(context.Background(), scheduler, "a"))
+	if active, limit := scheduler.Stats(); active != 1 || limit != 96 {
+		t.Fatalf("active stats = %d/%d, want 1/96", active, limit)
+	}
+	release()
+	if active, limit := scheduler.Stats(); active != 0 || limit != 96 {
+		t.Fatalf("released stats = %d/%d, want 0/96", active, limit)
+	}
+}
+
 func TestChunkSchedulerRoundRobinAcrossFiles(t *testing.T) {
 	scheduler := newChunkScheduler(1)
 	releaseA := waitSchedulerAcquired(t, startSchedulerAcquire(context.Background(), scheduler, "a"))

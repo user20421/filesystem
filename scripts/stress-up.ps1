@@ -1,10 +1,11 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [int]$TimeoutSeconds = 180
 )
 
 . (Join-Path $PSScriptRoot '_common.ps1')
 
+# 生成加密安全随机字节，并及时释放随机数生成器资源。
 function New-StressRandomBytes {
     param([int]$Size = 32)
     $bytes = New-Object byte[] $Size
@@ -18,10 +19,12 @@ function New-StressRandomBytes {
     return $bytes
 }
 
+# 将随机字节编码为仅用于本地压测的十六进制密码。
 function New-StressHexPassword {
     return ((New-StressRandomBytes -Size 24) | ForEach-Object { $_.ToString('x2') }) -join ''
 }
 
+# 只补充缺失的压测配置，不覆盖已有密钥；该文件被 Git 忽略。
 function Initialize-StressEnvironmentFile {
     $path = Get-StressEnvironmentFile
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -45,6 +48,7 @@ function Initialize-StressEnvironmentFile {
     Write-Host "Using stress-only credentials: $path"
 }
 
+# 调用本地压测认证接口，HTTP 错误也返回状态码供调用方判断。
 function Invoke-StressRootAuthRequest {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -73,6 +77,7 @@ function Invoke-StressRootAuthRequest {
     }
 }
 
+# 注册允许 409，但必须真实登录并取得访问令牌，不能伪造 ROOT 会话。
 function Assert-StressRootCredentials {
     $registration = Invoke-StressRootAuthRequest -Path '/api/v1/auth/register'
     $alreadyExists = $registration.StatusCode -eq 409
@@ -103,6 +108,7 @@ function Assert-StressRootCredentials {
     Write-Host 'ROOT registration/login verified for the stress backend.'
 }
 
+# 校验账号格式，幂等创建独立压测数据库、用户和授权。
 function Initialize-StressDatabase {
     $rootPassword = Get-EnvironmentValue -Name 'MYSQL_ROOT_PASSWORD' -DefaultValue ''
     if (-not $rootPassword) {

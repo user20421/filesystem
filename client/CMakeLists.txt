@@ -8,8 +8,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-# Qt's qt_add_protobuf drives qtprotobufgen through a host protoc.  A locally
-# downloaded tool can be supplied without installing Google Protobuf globally.
+# qt_add_protobuf 通过宿主机 protoc 驱动 qtprotobufgen；本地工具仅用于代码生成，不需要全局安装 Protobuf。
 set(CLIENT_PROTOC_EXECUTABLE "" CACHE FILEPATH "Host protoc used only for code generation")
 if(CLIENT_PROTOC_EXECUTABLE AND NOT TARGET WrapProtoc::WrapProtoc)
     if(NOT EXISTS "${CLIENT_PROTOC_EXECUTABLE}")
@@ -28,6 +27,8 @@ set(CLIENT_CORE_SOURCES
     src/core/ApiTypes.h
     src/core/LocalStore.cpp
     src/core/LocalStore.h
+    src/core/MessageDelivery.cpp
+    src/core/MessageDelivery.h
     src/core/MessageSyncState.h
     src/core/MessagePayloadCodec.cpp
     src/core/MessagePayloadCodec.h
@@ -49,7 +50,6 @@ target_link_libraries(client_core
     PUBLIC Qt6::Network Qt6::WebSockets
     PRIVATE Qt6::Protobuf)
 target_compile_features(client_core PUBLIC cxx_std_17)
-target_compile_definitions(client_core PUBLIC CLIENT_HAS_PROTOBUF=1)
 
 qt_add_protobuf(client_core
     PROTO_FILES
@@ -66,10 +66,13 @@ else()
 endif()
 
 add_library(client_ui STATIC
+    src/ui/Format.cpp src/ui/Format.h
     src/ui/LoginPage.cpp src/ui/LoginPage.h
     src/ui/MainWindow.cpp src/ui/MainWindow.h
+    src/ui/RootStressSession.cpp src/ui/RootStressSession.h
     src/ui/SessionContext.cpp src/ui/SessionContext.h
     src/ui/SessionPage.cpp src/ui/SessionPage.h
+    src/ui/SingleUserWindow.cpp src/ui/SingleUserWindow.h
     src/ui/SimulatorWindow.cpp src/ui/SimulatorWindow.h
     src/ui/StressRunController.cpp src/ui/StressRunController.h
     src/ui/SystemTestPage.cpp src/ui/SystemTestPage.h
@@ -104,6 +107,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_message_sync PRIVATE client_core Qt6::Test)
     add_test(NAME message_sync COMMAND test_message_sync)
 
+    qt_add_executable(test_message_delivery tests/test_message_delivery.cpp)
+    target_link_libraries(test_message_delivery PRIVATE client_core Qt6::Test)
+    add_test(NAME message_delivery COMMAND test_message_delivery)
+    set_tests_properties(message_delivery PROPERTIES TIMEOUT 30)
+
     qt_add_executable(test_transfer_manager tests/test_transfer_manager.cpp)
     target_link_libraries(test_transfer_manager PRIVATE client_core Qt6::Test)
     add_test(NAME transfer_manager COMMAND test_transfer_manager)
@@ -115,7 +123,7 @@ if(BUILD_TESTING)
 
     qt_add_executable(test_backend_integration tests/test_backend_integration.cpp)
     target_link_libraries(test_backend_integration PRIVATE client_core Qt6::Test)
-    # Not registered with CTest: run explicitly with CLIENT_BACKEND_URL set.
+    # 不注册到默认 CTest：真实后端集成测试需显式设置 CLIENT_BACKEND_URL。
 
     qt_add_executable(test_wire_codec tests/test_wire_codec.cpp)
     target_link_libraries(test_wire_codec PRIVATE client_core Qt6::Test)
@@ -125,13 +133,14 @@ if(BUILD_TESTING)
     target_link_libraries(test_session_tabs PRIVATE client_ui Qt6::Test)
     add_test(NAME session_tabs COMMAND test_session_tabs)
     set_tests_properties(session_tabs PROPERTIES
-        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_FONTDIR=C:/Windows/Fonts;SECURE_IM_PREVIEW_PATH=${CMAKE_BINARY_DIR}/session-tabs-preview.png")
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_FONTDIR=C:/Windows/Fonts")
 
     qt_add_executable(fake_stress_runner tests/fake_stress_runner.cpp)
     target_link_libraries(fake_stress_runner PRIVATE Qt6::Core)
 
     qt_add_executable(test_stress_run tests/test_stress_run.cpp)
     target_link_libraries(test_stress_run PRIVATE client_ui Qt6::Test)
+    # 先构建可控的假 runner，确保测试启动前该可执行文件存在。
     add_dependencies(test_stress_run fake_stress_runner)
     add_test(NAME stress_run COMMAND test_stress_run)
     set_tests_properties(stress_run PROPERTIES

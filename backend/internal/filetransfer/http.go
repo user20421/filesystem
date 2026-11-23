@@ -1,10 +1,13 @@
 package filetransfer
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"secure-im/backend/internal/auth"
 	"secure-im/backend/internal/httpx"
@@ -17,6 +20,33 @@ type Handler struct {
 	maxChunk int64
 }
 type AuditFunc func(http *http.Request, action, resourceID string)
+
+const downloadWriteIdleTimeout = 30 * time.Second
+
+// setWriteDeadline manages the deadline for this request only. Response
+// recorders and other wrappers may not expose connection deadlines.
+func setWriteDeadline(w http.ResponseWriter, deadline time.Time) error {
+	err := http.NewResponseController(w).SetWriteDeadline(deadline)
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	}
+	return err
+}
+
+type idleTimeoutResponseWriter struct {
+	w           http.ResponseWriter
+	idleTimeout time.Duration
+}
+
+func (w *idleTimeoutResponseWriter) Write(p []byte) (int, error) {
+	// Refresh immediately before every actual payload write. This is an idle
+	// timeout, not a total response timeout; a slow but active download can run
+	// longer than the server's global WriteTimeout.
+	if err := setWriteDeadline(w.w, time.Now().Add(w.idleTimeout)); err != nil {
+		return 0, fmt.Errorf("set download write deadline: %w", err)
+	}
+	return w.w.Write(p)
+}
 
 func NewHandler(service *Service, log *slog.Logger, maxChunk int64, audit AuditFunc) *Handler {
 	return &Handler{service: service, log: log, maxChunk: maxChunk, dbAudit: audit}
@@ -74,6 +104,12 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	httpx.Data(w, 200, map[string]any{"uploaded": true, "index": index})
 }
 func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
+	// Hashing a large file may legitimately exceed the global API WriteTimeout.
+	if err := setWriteDeadline(w, time.Time{}); err != nil {
+		h.log.Error("clear completion write deadline", "file_id", r.PathValue("file_id"), "error", err)
+		httpx.Fail(w, r, httpx.Error(http.StatusInternalServerError, "internal_error", "internal server error"))
+		return
+	}
 	f, err := h.service.Complete(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()))
 	if err != nil {
 		h.log.Error("file completion failed", "file_id", r.PathValue("file_id"), "error", err)
@@ -84,8 +120,16 @@ func (h *Handler) Complete(w http.ResponseWriter, r *http.Request) {
 	httpx.Data(w, 200, f)
 }
 func (h *Handler) Download(w http.ResponseWriter, r *http.Request) {
+	// Remove the fixed global deadline, then enforce a rolling per-write idle
+	// deadline below. Client disconnects and stalled writes still fail.
+	if err := setWriteDeadline(w, time.Time{}); err != nil {
+		h.log.Error("clear download write deadline", "file_id", r.PathValue("file_id"), "error", err)
+		httpx.Fail(w, r, httpx.Error(http.StatusInternalServerError, "internal_error", "internal server error"))
+		return
+	}
 	started := false
-	err := h.service.Download(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()), w, func(f File) {
+	output := &idleTimeoutResponseWriter{w: w, idleTimeout: downloadWriteIdleTimeout}
+	err := h.service.Download(r.Context(), r.PathValue("file_id"), auth.UserID(r.Context()), output, func(f File) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(f.OriginalName))
 		w.Header().Set("Content-Length", strconv.FormatInt(f.Size, 10))

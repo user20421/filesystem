@@ -27,6 +27,9 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// run 按“连接数据库→执行迁移→检查对象存储→启动文件清理→启动 HTTP”的顺序装配服务。
+// 退出时先停止清理器和实时连接，再优雅关闭 HTTP 与数据库，避免后台任务访问已释放资源。
 func run(log *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -62,6 +65,21 @@ func run(log *slog.Logger) error {
 	tickets := chat.NewTicketStore(cfg.WSTicketTTL)
 	chatHTTP := chat.NewHandler(chatService, tickets, hub, log, cfg.WSMaxConnections)
 	files := filetransfer.NewServiceWithMemoryBudget(db, objects, cfg.MaxActiveFiles, cfg.MaxChunkSize, cfg.MaxFileSize, cfg.UploadConcurrency, cfg.FileMemoryBudget)
+	cleanupCtx, stopCleanup := context.WithCancel(ctx)
+	cleanupDone := make(chan struct{})
+	sweeper := filetransfer.NewSweeper(files, log, filetransfer.CleanupConfig{
+		UploadIdleTTL:      cfg.FileUploadIdleTTL,
+		DeletingRetryAfter: cfg.FileDeletingRetryAfter,
+		Interval:           cfg.FileCleanupInterval,
+	})
+	go func() {
+		defer close(cleanupDone)
+		sweeper.Run(cleanupCtx)
+	}()
+	defer func() {
+		stopCleanup()
+		<-cleanupDone
+	}()
 	accountHTTP := account.NewHandler(account.NewService(db, files, hub.CloseUser, tickets.RevokeUser))
 	audit := func(r *http.Request, action, id string) {
 		store.Audit(r.Context(), db, auth.UserID(r.Context()), action, id, httpx.ClientIP(r))
@@ -87,6 +105,7 @@ func run(log *slog.Logger) error {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			used, limit := files.MemoryStats()
+			slotsUsed, slotsLimit := files.ChunkSlotStats()
 			httpx.Data(w, 200, map[string]any{
 				"go": map[string]any{
 					"mem_alloc_bytes":       mem.Alloc,
@@ -99,6 +118,7 @@ func run(log *slog.Logger) error {
 					"gomaxprocs":            runtime.GOMAXPROCS(0),
 				},
 				"file_memory_budget": map[string]int64{"used": used, "limit": limit},
+				"file_chunk_slots":   map[string]int{"used": slotsUsed, "limit": slotsLimit},
 			})
 		})
 	}
@@ -113,6 +133,7 @@ func run(log *slog.Logger) error {
 	mux.Handle("GET /api/v1/presence", protect(chatHTTP.Presence))
 	mux.Handle("POST /api/v1/ws-ticket", protect(chatHTTP.Ticket))
 	mux.Handle("GET /api/v1/messages", protect(chatHTTP.History))
+	mux.Handle("GET /api/v1/messages/unread", protect(chatHTTP.Unread))
 	mux.Handle("POST /api/v1/messages/read", protect(chatHTTP.MarkRead))
 	mux.Handle("POST /api/v1/files/init", protect(fileHTTP.Init))
 	mux.Handle("GET /api/v1/files/{file_id}", protect(fileHTTP.Status))

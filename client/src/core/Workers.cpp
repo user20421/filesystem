@@ -93,31 +93,6 @@ private:
     Workers::ChunkCallback m_callback;
 };
 
-class WriteTask final : public QRunnable {
-public:
-    WriteTask(QString path, QByteArray data, QObject *receiver, Workers::WriteCallback callback)
-        : m_path(std::move(path)), m_data(std::move(data)), m_receiver(receiver),
-          m_callback(std::move(callback)) {}
-    void run() override
-    {
-        QSaveFile file(m_path);
-        QString error;
-        if (!file.open(QIODevice::WriteOnly))
-            error = file.errorString();
-        if (error.isEmpty() && file.write(m_data) != m_data.size())
-            error = file.errorString();
-        if (error.isEmpty() && !file.commit())
-            error = file.errorString();
-        deliver(m_receiver, [callback = m_callback, error]() mutable {
-            callback(error.isEmpty(), error);
-        });
-    }
-private:
-    QString m_path;
-    QByteArray m_data;
-    QObject *m_receiver;
-    Workers::WriteCallback m_callback;
-};
 class FileWriterWorker final : public QObject {
     Q_OBJECT
 public:
@@ -285,12 +260,6 @@ void Workers::readChunk(const QString &path, qint64 offset, int size, QObject *r
 {
     fileWorkerPool()->start(new ReadChunkTask(path, offset, size, receiver,
                                                std::move(callback)));
-}
-
-void Workers::writeFile(const QString &path, const QByteArray &data, QObject *receiver,
-                        WriteCallback callback)
-{
-    fileWorkerPool()->start(new WriteTask(path, data, receiver, std::move(callback)));
 }
 
 #include "Workers.moc"

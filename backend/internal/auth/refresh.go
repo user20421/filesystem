@@ -10,6 +10,8 @@ import (
 	"secure-im/backend/internal/httpx"
 )
 
+// Refresh 原子轮换刷新令牌，拒绝已撤销、已轮换或过期的令牌。
+// 行锁与条件更新保证同一旧令牌在并发刷新中只能被消费一次，新令牌的哈希写入与旧令牌轮换必须在同一事务提交。
 func (s *Service) Refresh(ctx context.Context, raw string) (Result, error) {
 	if len(raw) < 32 || len(raw) > 256 {
 		return Result{}, invalidRefresh()
@@ -38,6 +40,7 @@ func (s *Service) Refresh(ctx context.Context, raw string) (Result, error) {
 	if rotated.Valid || revoked.Valid || !expiresAt.After(time.Now()) {
 		return Result{}, invalidRefresh()
 	}
+	// 行锁与条件更新共同保证原子轮换：并发刷新中仅一个事务能消费旧令牌并写入新令牌。
 	result, err := tx.ExecContext(ctx, `UPDATE refresh_tokens SET rotated_at=NOW(6) WHERE id=? AND rotated_at IS NULL AND revoked_at IS NULL`, tokenID)
 	if err != nil {
 		return Result{}, err

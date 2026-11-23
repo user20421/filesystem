@@ -58,3 +58,13 @@ func TestPercentileAndMessageMetrics(t *testing.T) {
 		t.Fatalf("unexpected totals %+v", totals)
 	}
 }
+
+func TestTotalsUseConfiguredFileBudgetWhenReportedLimitIsZero(t *testing.T) {
+	metrics := NewMetrics("budget", 500)
+	used, zero := int64(10<<20), int64(0)
+	metrics.BackendBudget(&used, &zero)
+	totals := metrics.Totals()
+	if !totals.FileBudgetKnown || totals.FileBudgetHighMiB != 10 || totals.FileBudgetLimitMiB != 500 {
+		t.Fatalf("budget totals = %+v", totals)
+	}
+}

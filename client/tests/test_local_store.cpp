@@ -1,6 +1,8 @@
 #include "LocalStore.h"
 
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -10,8 +12,12 @@ private slots:
     void createsIsolatedLayout();
     void sanitizesUntrustedNames();
     void storesAndDeduplicatesHistory();
-    void persistsKnownAccountsWithoutCredentials();
     void mergesCursorAndReadReceiptAcrossDuplicateHistory();
+    void deliveryStateNeverRegressesAndLateAckRecovers();
+    void readReceiptOnlyChangesReadAt();
+    void outboxUsesSenderAndRestartRecovery();
+    void reportsWriteFailure();
+    void trimmingRetainsPendingMessages();
 };
 
 void LocalStoreTest::createsIsolatedLayout()
@@ -65,45 +71,6 @@ void LocalStoreTest::storesAndDeduplicatesHistory()
     QVERIFY(store.messages(QStringLiteral("other")).isEmpty());
 }
 
-void LocalStoreTest::persistsKnownAccountsWithoutCredentials()
-{
-    QTemporaryDir root;
-    LocalStore first(root.filePath(QStringLiteral("alice")));
-    LocalStore second(root.filePath(QStringLiteral("bob")));
-    QVERIFY(first.initialize());
-    QVERIFY(second.initialize());
-
-    User good;
-    good.id = QStringLiteral("good-id");
-    good.username = QStringLiteral("GOOD");
-    good.displayName = QStringLiteral("Custom display name");
-    QVERIFY(first.rememberAccount(good));
-    QVERIFY(first.rememberAccount(good)); // Reauthentication is idempotent.
-    QVERIFY(first.knownAccountIds().contains(good.id));
-    QVERIFY(!second.knownAccountIds().contains(good.id));
-    QVERIFY(second.rememberAccount(good));
-
-    const QString firstPath = first.path(QStringLiteral("config/known_accounts.json"));
-    const QString secondPath = second.path(QStringLiteral("config/known_accounts.json"));
-    QVERIFY(firstPath != secondPath);
-    QVERIFY(QFileInfo::exists(firstPath));
-    QVERIFY(QFileInfo::exists(secondPath));
-    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("known_accounts.json"))));
-    QFile registry(firstPath);
-    QVERIFY(registry.open(QIODevice::ReadOnly));
-    const QByteArray json = registry.readAll();
-    QVERIFY(json.contains("good-id"));
-    QVERIFY(json.contains("GOOD"));
-    QVERIFY(!json.contains("Custom display name"));
-    QVERIFY(!json.contains("token"));
-    QVERIFY(!json.contains("password"));
-    registry.close();
-
-    QVERIFY(first.forgetAccount(good.id));
-    QVERIFY(first.knownAccountIds().isEmpty());
-    QVERIFY(second.knownAccountIds().contains(good.id));
-}
-
 void LocalStoreTest::mergesCursorAndReadReceiptAcrossDuplicateHistory()
 {
     QTemporaryDir dir;
@@ -136,6 +103,157 @@ void LocalStoreTest::mergesCursorAndReadReceiptAcrossDuplicateHistory()
     newer.readAt = 1700000000999LL;
     QVERIFY(reloaded.appendMessage(QStringLiteral("peer"), newer));
     QCOMPARE(reloaded.messages(QStringLiteral("peer")).first().readAt, 1700000000999LL);
+}
+
+void LocalStoreTest::deliveryStateNeverRegressesAndLateAckRecovers()
+{
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    ChatMessage message;
+    message.id = QStringLiteral("file-1");
+    message.senderId = QStringLiteral("me");
+    message.recipientId = QStringLiteral("peer");
+    message.kind = QStringLiteral("file");
+    message.fileId = QStringLiteral("file-id");
+    message.fileName = QStringLiteral("report.pdf");
+    message.fileSize = 4096;
+    message.timestamp = 1234;
+    message.pending = true;
+    message.attemptCount = 2;
+    message.nextAttemptAt = 2000;
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), message));
+
+    ChatMessage error = message;
+    error.pending = false;
+    error.failed = true;
+    error.deliveryError = QStringLiteral("rejected");
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), error));
+    // A stale retry projection cannot resurrect a failed entry.
+    QVERIFY(!store.appendMessage(QStringLiteral("peer"), message));
+    QCOMPARE(store.messages(QStringLiteral("peer")).first().attemptCount, 2);
+    QVERIFY(store.messages(QStringLiteral("peer")).first().failed);
+
+    ChatMessage history;
+    history.id = message.id;
+    history.cursor = QStringLiteral("99");
+    history.acked = true;
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), history));
+    const ChatMessage recovered = store.messages(QStringLiteral("peer")).first();
+    QVERIFY(recovered.acked && !recovered.pending && !recovered.failed);
+    QCOMPARE(recovered.cursor, QStringLiteral("99"));
+    QCOMPARE(recovered.fileId, QStringLiteral("file-id"));
+    QCOMPARE(recovered.fileName, QStringLiteral("report.pdf"));
+    QCOMPARE(recovered.fileSize, qint64(4096));
+    QCOMPARE(recovered.timestamp, qint64(1234));
+    QCOMPARE(recovered.deliveryError, QString{});
+}
+
+void LocalStoreTest::readReceiptOnlyChangesReadAt()
+{
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    ChatMessage message;
+    message.id = QStringLiteral("m1");
+    message.cursor = QStringLiteral("7");
+    message.senderId = QStringLiteral("me");
+    message.recipientId = QStringLiteral("peer");
+    message.pending = true;
+    message.attemptCount = 1;
+    message.nextAttemptAt = 100;
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), message));
+    QVERIFY(store.markMessagesRead(QStringLiteral("peer"), QStringLiteral("me"),
+                                   QStringLiteral("7"), 500));
+    const ChatMessage updated = store.messages(QStringLiteral("peer")).first();
+    QCOMPARE(updated.readAt, qint64(500));
+    QVERIFY(updated.pending && !updated.acked && !updated.failed);
+    QCOMPARE(updated.attemptCount, 1);
+    QCOMPARE(updated.nextAttemptAt, qint64(100));
+}
+
+void LocalStoreTest::outboxUsesSenderAndRestartRecovery()
+{
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    ChatMessage legacy;
+    legacy.id = QStringLiteral("legacy");
+    legacy.cursor = QStringLiteral("8");
+    legacy.senderId = QStringLiteral("me");
+    legacy.recipientId = QStringLiteral("peer");
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), legacy));
+    ChatMessage failed = legacy;
+    failed.id = QStringLiteral("failed");
+    failed.cursor.clear();
+    failed.failed = true;
+    failed.attemptCount = 3;
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), failed));
+    ChatMessage other = failed;
+    other.id = QStringLiteral("other");
+    other.senderId = QStringLiteral("other-user");
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), other));
+    QCOMPARE(store.outbox(QStringLiteral("me")).size(), 2);
+
+    QVERIFY(store.recoverOutbox(QStringLiteral("me"), 1000));
+    const QList<ChatMessage> outbox = store.outbox(QStringLiteral("me"));
+    QCOMPARE(outbox.size(), 1);
+    QCOMPARE(outbox.first().id, QStringLiteral("failed"));
+    QVERIFY(outbox.first().pending && !outbox.first().failed);
+    QCOMPARE(outbox.first().attemptCount, 0);
+    QCOMPARE(outbox.first().nextAttemptAt, qint64(1000));
+    QVERIFY(store.findMessage(QStringLiteral("legacy"), QStringLiteral("me"), &legacy));
+    QVERIFY(legacy.acked);
+    QVERIFY(store.findMessage(QStringLiteral("other"), QStringLiteral("other-user"), &other));
+    QVERIFY(other.failed);
+}
+
+void LocalStoreTest::reportsWriteFailure()
+{
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    QVERIFY(QDir().mkdir(store.path(QStringLiteral("config/messages.json"))));
+    ChatMessage message;
+    message.id = QStringLiteral("m1");
+    message.senderId = QStringLiteral("me");
+    message.recipientId = QStringLiteral("peer");
+    message.pending = true;
+    QString error;
+    QVERIFY(!store.appendMessage(QStringLiteral("peer"), message, &error));
+    QVERIFY(!error.isEmpty());
+}
+
+void LocalStoreTest::trimmingRetainsPendingMessages()
+{
+    QTemporaryDir dir;
+    LocalStore store(dir.path());
+    QVERIFY(store.initialize());
+    QJsonArray rows;
+    for (int index = 0; index < 1999; ++index) {
+        rows.append(QJsonObject{{QStringLiteral("message_id"), QString::number(index)},
+                                {QStringLiteral("sender_id"), QStringLiteral("me")},
+                                {QStringLiteral("acked"), true}});
+    }
+    rows.append(QJsonObject{{QStringLiteral("message_id"), QStringLiteral("pending")},
+                            {QStringLiteral("sender_id"), QStringLiteral("me")},
+                            {QStringLiteral("recipient_id"), QStringLiteral("peer")},
+                            {QStringLiteral("pending"), true}});
+    QFile file(store.path(QStringLiteral("config/messages.json")));
+    QVERIFY(file.open(QIODevice::WriteOnly));
+    QVERIFY(file.write(QJsonDocument(QJsonObject{{QStringLiteral("peer"), rows}})
+                           .toJson(QJsonDocument::Compact)) > 0);
+    file.close();
+    ChatMessage next;
+    next.id = QStringLiteral("next");
+    next.senderId = QStringLiteral("peer");
+    next.content = QStringLiteral("new");
+    QVERIFY(store.appendMessage(QStringLiteral("peer"), next));
+    const QList<ChatMessage> messages = store.messages(QStringLiteral("peer"));
+    QCOMPARE(messages.size(), 2000);
+    ChatMessage pending;
+    QVERIFY(store.findMessage(QStringLiteral("pending"), QStringLiteral("me"), &pending));
+    QVERIFY(pending.pending);
 }
 
 QTEST_GUILESS_MAIN(LocalStoreTest)

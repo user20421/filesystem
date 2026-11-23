@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QTimer>
 
+// 可控假 runner：通过 SECURE_IM_FAKE_STRESS_SCENARIO 模拟正常、保持、失败、未知指标和 NDJSON 边界场景，供 UI 生命周期测试使用。
 namespace {
 void writeAll(QFile *output, const QByteArray &data)
 {
@@ -68,8 +69,24 @@ int main(int argc, char *argv[])
         return 90;
     const QString scenario = qEnvironmentVariable("SECURE_IM_FAKE_STRESS_SCENARIO",
         QStringLiteral("sticky"));
-    if (scenario == QLatin1String("hold")) {
-        writeAll(&output, "{\"type\":\"progress\",\"progress\":{\"phase\":\"steady\",\"target\":1000,\"online\":800}}\n");
+    if (scenario == QLatin1String("hold") || scenario == QLatin1String("unknown-hold")) {
+        if (scenario == QLatin1String("hold")) {
+            writeAll(&output, "{\"type\":\"progress\",\"progress\":{\"phase\":\"steady\",\"target\":1000,\"online\":800,\"file_chunk_slots_used\":7,\"file_chunk_slots_limit\":96}}\n");
+        } else {
+            writeAll(&output, "{\"type\":\"progress\",\"progress\":{\"phase\":\"steady\",\"target\":1000,\"online\":800}}\n");
+        }
+        return QCoreApplication::exec();
+    }
+    if (scenario == QLatin1String("phases")) {
+        const QStringList phases{QStringLiteral("preflight"), QStringLiteral("rampup"),
+            QStringLiteral("stable"), QStringLiteral("drain"), QStringLiteral("cleanup"),
+            QStringLiteral("idle")};
+        for (int index = 0; index < phases.size(); ++index) {
+            QTimer::singleShot(index * 150, &output, [&output, phase = phases.at(index)] {
+                writeAll(&output, QStringLiteral("{\"type\":\"progress\",\"phase\":\"%1\",\"target\":1000}\n")
+                    .arg(phase).toUtf8());
+            });
+        }
         return QCoreApplication::exec();
     }
     if (scenario == QLatin1String("nonzero")) {
@@ -98,7 +115,8 @@ int main(int argc, char *argv[])
             "\"files_queued\":3,\"files_active\":4,\"files_completed\":55,\"files_failed\":1,"
             "\"bytes_completed\":10485760,\"file_mib_per_sec\":12.5,\"backend_rss_mib\":768.5,"
             "\"backend_cpu_percent\":63.25,\"go_heap_mib\":128.75,\"goroutines\":345,"
-            "\"file_budget_used_mib\":120.5,\"file_budget_limit_mib\":500}}\r\n"
+            "\"file_budget_used_mib\":120.5,\"file_budget_limit_mib\":500,"
+            "\"file_chunk_slots_used\":7,\"file_chunk_slots_limit\":96}}\r\n"
             "{this is not json}\r\n"
             "{\"type\":\"progress\",\"phase\":\"steady\",\"target\":1000,\"online\":1000,\"files_failed\":1}\r\n");
         writeFakeReport(arguments);

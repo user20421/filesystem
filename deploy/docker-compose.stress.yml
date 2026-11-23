@@ -1,5 +1,7 @@
 name: secure-im-stress
 
+# 独立压测后端：复用正常环境的 MySQL/MinIO 容器，但使用独立数据库和 Bucket，物理资源仍共享。
+# Dockerfile.offline 使用宿主机预构建的 Linux 二进制；后端限制 6 CPU、3 GiB，文件分块内存预算为 500 MiB。
 services:
   backend:
     container_name: secure-im-stress-backend
@@ -7,8 +9,6 @@ services:
     build:
       context: ../backend
       dockerfile: Dockerfile.offline
-      args:
-        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
     restart: unless-stopped
     cpus: 6
     mem_limit: 3g
@@ -24,18 +24,19 @@ services:
       MINIO_BUCKET: secure-im-stress-files
       MINIO_USE_SSL: "false"
       JWT_SECRET: ${STRESS_JWT_SECRET:?Set STRESS_JWT_SECRET in .env.stress}
-      MAX_ACTIVE_FILES: 5
+      MAX_ACTIVE_FILES: ${STRESS_MAX_ACTIVE_FILES:-5}
+      # 分块大小为 5 MiB，文件上限为 5 GiB；UPLOAD_CONCURRENCY 是共享分块槽位上限，不代表实际并发恒为该值。
       MAX_CHUNK_SIZE: 5242880
       MAX_FILE_SIZE: 5368709120
       UPLOAD_CONCURRENCY: ${STRESS_UPLOAD_CONCURRENCY:-96}
       FILE_MEMORY_BUDGET: 524288000
       ENABLE_DEBUG_STATS: "true"
       WS_MAX_CONNECTIONS: 50000
-      # Synthetic account provisioning must not be constrained by normal auth limits.
+      # 批量准备压测账号时关闭认证限流，仅限本地隔离压测环境。
       AUTH_REGISTER_RATE_LIMIT: 0
       AUTH_LOGIN_RATE_LIMIT: 0
       GOMAXPROCS: 6
-      # Go rejects decimal quantities; this is 2.4 GiB rounded up to bytes.
+      # Go 内存软限制使用整数字节，约为 2.4 GiB。
       GOMEMLIMIT: 2576980378
       TZ: ${TZ:-Asia/Shanghai}
     ports:
@@ -49,6 +50,7 @@ services:
       retries: 24
       start_period: 10s
 
+# 复用正常 Compose 已创建的网络，不由本文件重复创建。
 networks:
   secure-im-net:
     name: secure-im-net

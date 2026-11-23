@@ -19,7 +19,6 @@ import (
 )
 
 type Environment struct {
-	Values                                                     map[string]string
 	MySQLRootDSN                                               string
 	JWTSecret                                                  []byte
 	MinIOEndpoint, MinIOAccessKey, MinIOSecretKey, MinIOBucket string
@@ -54,45 +53,21 @@ func readEnvFile(path string) (map[string]string, error) {
 }
 
 func LoadEnvironment(path string) (Environment, error) {
-	e := Environment{Values: make(map[string]string)}
-	file, err := os.Open(path)
+	e := Environment{}
+	values, err := readEnvFile(path)
 	if err != nil {
 		return e, fmt.Errorf("open env file: %w", err)
 	}
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		line = strings.TrimPrefix(line, "export ")
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		value = strings.TrimSpace(value)
-		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
-			value = value[1 : len(value)-1]
-		}
-		e.Values[strings.TrimSpace(key)] = value
-	}
-	closeErr := file.Close()
-	if err = scanner.Err(); err != nil {
-		return e, err
-	}
-	if closeErr != nil {
-		return e, closeErr
-	}
 	// The isolated stress env intentionally contains only STRESS_* secrets. Merge
 	// the sibling base env for root DB and MinIO credentials without modifying it.
-	if e.Values["STRESS_JWT_SECRET"] != "" || e.Values["STRESS_MYSQL_PASSWORD"] != "" {
+	if values["STRESS_JWT_SECRET"] != "" || values["STRESS_MYSQL_PASSWORD"] != "" {
 		base, readErr := readEnvFile(filepath.Join(filepath.Dir(path), ".env"))
 		if readErr != nil {
 			return e, fmt.Errorf("open base env for stress credentials: %w", readErr)
 		}
 		for key, value := range base {
-			if _, exists := e.Values[key]; !exists {
-				e.Values[key] = value
+			if _, exists := values[key]; !exists {
+				values[key] = value
 			}
 		}
 	}
@@ -100,7 +75,7 @@ func LoadEnvironment(path string) (Environment, error) {
 		if value, ok := os.LookupEnv(key); ok && value != "" {
 			return value
 		}
-		if value := e.Values[key]; value != "" {
+		if value := values[key]; value != "" {
 			return value
 		}
 		return fallback
@@ -112,7 +87,7 @@ func LoadEnvironment(path string) (Environment, error) {
 		defaultDatabase = "secure_im_stress"
 	}
 	database := lookup("STRESS_MYSQL_DATABASE", defaultDatabase)
-	e.MySQLRootDSN = lookup("STRESS_MYSQL_ROOT_DSN", fmt.Sprintf("root:%s@tcp(%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s", lookup("MYSQL_ROOT_PASSWORD", ""), lookup("MYSQL_ADDR", "127.0.0.1:"+port), database))
+	e.MySQLRootDSN = lookup("STRESS_MYSQL_ROOT_DSN", fmt.Sprintf("root:%s@tcp(%s)/%s?parseTime=true&loc=UTC&time_zone=%%27%%2B00:00%%27&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s", lookup("MYSQL_ROOT_PASSWORD", ""), lookup("MYSQL_ADDR", "127.0.0.1:"+port), database))
 	e.JWTSecret = []byte(lookup("STRESS_JWT_SECRET", lookup("JWT_SECRET", "")))
 	e.MinIOEndpoint = lookup("MINIO_ENDPOINT", "127.0.0.1:"+lookup("MINIO_API_PORT", "19000"))
 	e.MinIOAccessKey = lookup("MINIO_ACCESS_KEY", lookup("MINIO_ROOT_USER", "minioadmin"))

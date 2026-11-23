@@ -76,11 +76,6 @@ StressRunConfig StressRunConfig::forProject(const QString &projectRoot)
     return config;
 }
 
-StressRunController::StressRunController(QObject *parent)
-    : StressRunController(StressRunConfig::forProject(), parent)
-{
-}
-
 StressRunController::StressRunController(const StressRunConfig &config, QObject *parent)
     : QObject(parent), m_config(config)
 {
@@ -166,6 +161,7 @@ void StressRunController::startSetup()
     m_process->start(QIODevice::ReadWrite);
 }
 
+// startRunner 在环境准备完成后启动真实负载进程，避免 setup 与 runner 同时写配置或占用同一报告目录。
 void StressRunController::startRunner()
 {
     const qint64 target = m_process->property("stressTarget").toLongLong();
@@ -193,11 +189,6 @@ void StressRunController::stop()
     } else {
         finish(false, QStringLiteral("压力测试已停止。"));
     }
-}
-
-QString StressRunController::runnerArgumentsForTests() const
-{
-    return m_process->arguments().join(QLatin1Char(' '));
 }
 
 void StressRunController::readStandardOutput()
@@ -232,6 +223,7 @@ void StressRunController::consumeBuffer(bool drainFinalLine)
     }
 }
 
+// consumeLine 逐行解析 NDJSON，容忍跨 read 的粘包、CRLF 和末尾半行；非法行只记录诊断，不能误当成最终报告。
 void StressRunController::consumeLine(QByteArray line)
 {
     line = line.trimmed();
@@ -268,6 +260,13 @@ void StressRunController::consumeLine(QByteArray line)
         progress.goroutines = integer(value, "goroutines");
         progress.fileBudgetUsedMib = number(value, "file_budget_used_mib");
         progress.fileBudgetLimitMib = number(value, "file_budget_limit_mib");
+        const QJsonValue slotsUsed = value.value(QStringLiteral("file_chunk_slots_used"));
+        const QJsonValue slotsLimit = value.value(QStringLiteral("file_chunk_slots_limit"));
+        progress.fileChunkSlotsKnown = slotsUsed.isDouble() && slotsLimit.isDouble();
+        if (progress.fileChunkSlotsKnown) {
+            progress.fileChunkSlotsUsed = static_cast<qint64>(slotsUsed.toDouble());
+            progress.fileChunkSlotsLimit = static_cast<qint64>(slotsLimit.toDouble());
+        }
         emit progressReceived(progress);
     } else if (type == QLatin1String("final")) {
         const QJsonObject value = payload(root, "final");

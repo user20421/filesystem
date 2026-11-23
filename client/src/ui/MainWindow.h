@@ -21,9 +21,10 @@ class QTextBrowser;
 class QTreeWidget;
 class QTreeWidgetItem;
 class QTimer;
+class MessageDelivery;
 
-// The authenticated chat surface.  Despite the historical class name this is a
-// plain widget so the exact same implementation can be embedded in both apps.
+// MainWindow 是嵌入式的聊天工作区，协调联系人、历史消息、实时帧、未读、已读和文件传输。
+// 它仍是普通 QWidget，不是独立顶层窗口，退出和关闭时必须显式调用 shutdown。
 class MainWindow final : public QWidget {
     Q_OBJECT
 public:
@@ -34,8 +35,6 @@ public:
     void shutdown();
     bool isClosing() const { return m_closing; }
     void setActive(bool active);
-    QString username() const { return m_session.user.username; }
-    QString connectionState() const { return m_connectionState; }
     TransferManager *transferManager() const { return m_transfers; }
     void showTransfersView();
     void showChatView();
@@ -44,9 +43,6 @@ public:
     static void setDirectoryOpenerForTests(DirectoryOpener opener);
 
 signals:
-    void connectionStateChanged(const QString &state);
-    void unreadCountChanged(int count);
-    void noticeChanged(const QString &notice);
     void logoutCompleted();
     void exitRequested();
 
@@ -56,6 +52,7 @@ private:
     void buildUi();
     void loadUsers();
     void loadPresence();
+    void loadUnreadSummary();
     void applyUsers(const QList<User> &users);
     void setPeerUnread(const QString &peerId, int count);
     void clearPeerUnread(const QString &peerId);
@@ -63,6 +60,7 @@ private:
     void selectPeer();
     void filterUsers(const QString &text);
     void loadHistory();
+    void requestHistory(const QString &peerId);
     void connectSocket();
     void scheduleReconnect();
     void sendText();
@@ -92,6 +90,7 @@ private:
     AuthSession m_session;
     WebSocketClient *m_socket;
     TransferManager *m_transfers;
+    MessageDelivery *m_delivery = nullptr;
 
     QLabel *m_sessionLabel = nullptr;
     QLabel *m_socketLabel = nullptr;
@@ -115,7 +114,6 @@ private:
     QTimer *m_reconnectTimer = nullptr;
 
     QString m_peerId;
-    QString m_connectionState = QStringLiteral("离线");
     QMap<QString, QString> m_userNames;
     QMap<QString, User> m_contacts;
     QSet<QString> m_onlineUserIds;
@@ -126,6 +124,7 @@ private:
     QMap<QString, QString> m_sentReadCursors;
     QSet<QString> m_readRequests;
     bool m_synchronizingHistory = false;
+    QSet<QString> m_historyRequests;
     QSet<QString> m_downloadIds;
     bool m_ticketPending = false;
     bool m_online = true;
@@ -134,7 +133,9 @@ private:
     bool m_exitPending = false;
     bool m_accountDeletionPending = false;
     QMap<QString, int> m_unreadByPeer;
-    int m_unreadCount = 0;
+    // Per-peer versions reject stale summary snapshots after realtime/read updates.
+    QMap<QString, quint64> m_unreadVersions;
+    quint64 m_unreadVersion = 0;
 
     static DirectoryOpener s_directoryOpener;
 };

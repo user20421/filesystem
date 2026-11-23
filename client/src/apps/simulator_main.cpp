@@ -7,6 +7,7 @@
 #include <QMessageBox>
 #include <QScreen>
 
+// 保留独立 ROOT 压测入口，与普通聊天会话分离；关闭窗口时会停止活动 runner。
 int main(int argc, char *argv[])
 {
     QApplication application(argc, argv);

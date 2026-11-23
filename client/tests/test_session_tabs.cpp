@@ -1,12 +1,15 @@
 #include "ApiClient.h"
 #include "MainWindow.h"
+#include "MessageDelivery.h"
 #include "MessagePayloadCodec.h"
 #include "SessionContext.h"
 #include "SessionPage.h"
+#include "SingleUserWindow.h"
 #include "SimulatorWindow.h"
 #include "SystemTestPage.h"
 #include "Theme.h"
 #include "TransferTaskCard.h"
+#include "support/TestEnvironment.h"
 
 #include <QApplication>
 #include <QDir>
@@ -14,7 +17,6 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QHeaderView>
-#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -22,7 +24,8 @@
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QTabBar>
+#include <QScreen>
+#include <QSplitter>
 #include <QTabWidget>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -32,18 +35,9 @@
 #include <QTreeWidget>
 #include <QtTest>
 
-namespace {
-class ScopedCurrentDirectory final {
-public:
-    explicit ScopedCurrentDirectory(const QString &path)
-        : m_previous(QDir::currentPath()), m_valid(QDir::setCurrent(path)) {}
-    ~ScopedCurrentDirectory() { QDir::setCurrent(m_previous); }
-    bool isValid() const { return m_valid; }
-private:
-    QString m_previous;
-    bool m_valid;
-};
+#include <numeric>
 
+namespace {
 AuthSession session(const QString &name, const QString &token)
 {
     AuthSession result;
@@ -127,6 +121,8 @@ private slots:
     void isolatesDirectoriesTokensAndObjects();
     void rejectsAndReleasesDirectoryLock();
     void simulatorRootLoginShowsOnlyStressPage();
+    void integratedRootLoginIsolatesSessionAndReturnsToNormalLogin();
+    void integratedRootLoginFailureStaysOnNormalLogin();
     void loginUsesNormalAuthenticationAndUppercaseUsername();
     void refreshFailureStopsSessionAndReturnsToLogin();
     void exitRequiresConfirmationAndClearsOnlySession();
@@ -135,10 +131,23 @@ private slots:
     void pendingRequestsAndTransfersCloseSafely();
     void transferDirectoryUsesFakeOpenerOnce();
     void transferCardActionsRemainAvailable();
+    void fixedWindowAndDisabledSplitterSurvivePageChanges();
+    void restoredUnreadDotsAppearWithoutSelectionAndClearOnRead();
     void contactUnreadDotsAreIndependentAndClearOnView();
     void contactFilterAllowsRegisteredCustomUsers();
     void readReceiptsRespectVisibilityAndPersist();
+    void connectedOutboxHistoryIsSingleFlightPerPeer();
+    void deliveryStatesRenderAndAckIsNotRead();
+
+private:
+    static int unreadTotal(const MainWindow &window);
 };
+
+int SessionTabsTest::unreadTotal(const MainWindow &window)
+{
+    return std::accumulate(window.m_unreadByPeer.cbegin(), window.m_unreadByPeer.cend(), 0,
+                           [](int total, int count) { return total + count; });
+}
 
 void SessionTabsTest::isolatesDirectoriesTokensAndObjects()
 {
@@ -224,6 +233,161 @@ void SessionTabsTest::simulatorRootLoginShowsOnlyStressPage()
     QVERIFY(server.requests.first().contains("\"username\":\"ROOT\""));
     QVERIFY(server.requests.first().contains("\"password\":\"123456\""));
     QVERIFY(!server.requests.first().contains("real-root-token"));
+    window.close();
+}
+
+void SessionTabsTest::integratedRootLoginIsolatesSessionAndReturnsToNormalLogin()
+{
+    ScopedEnvironment stressUrl("SECURE_IM_STRESS_SERVER");
+    ScopedEnvironment projectRoot("SECURE_IM_PROJECT_ROOT");
+    QTemporaryDir root;
+    qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qunsetenv("SECURE_IM_STRESS_SERVER");
+    QCOMPARE(StressRunConfig::forProject(root.path()).server,
+             QStringLiteral("http://127.0.0.1:18080"));
+
+    HoldingServer normalServer;
+    HoldingServer stressServer;
+    QVERIFY(normalServer.start());
+    QVERIFY(stressServer.start());
+    qputenv("SECURE_IM_STRESS_SERVER", stressServer.url().toString().toUtf8());
+    auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")),
+                                                    normalServer.url());
+    QVERIFY(context->open());
+    SingleUserWindow window(std::move(context));
+    window.show();
+    const QSize fixedSize(560, 390);
+    QCOMPARE(window.size(), fixedSize);
+
+    // ROOT authentication must leave the normal session and any legacy user files untouched.
+    const AuthSession normal = session(QStringLiteral("ALICE"), QStringLiteral("normal-token"));
+    QVERIFY(window.sessionPage()->context()->store()->saveSession(normal));
+    const auto readFile = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+    };
+    const QString normalSessionPath = window.sessionPage()->context()->store()->path(
+        QStringLiteral("config/session.json"));
+    const QString normalAccountsPath = window.sessionPage()->context()->store()->path(
+        QStringLiteral("config/known_accounts.json"));
+    QFile legacyAccounts(normalAccountsPath);
+    QVERIFY(legacyAccounts.open(QIODevice::WriteOnly));
+    const QByteArray savedAccounts = R"([{"id":"legacy-id","username":"LEGACY"}])";
+    QCOMPARE(legacyAccounts.write(savedAccounts), savedAccounts.size());
+    legacyAccounts.close();
+    const QByteArray savedSession = readFile(normalSessionPath);
+    QVERIFY(!savedSession.isEmpty());
+    QCOMPARE(readFile(normalAccountsPath), savedAccounts);
+
+    auto *username = window.findChild<QLineEdit *>(QStringLiteral("usernameEdit"));
+    auto *password = window.findChild<QLineEdit *>(QStringLiteral("passwordEdit"));
+    auto *login = window.findChild<QPushButton *>(QStringLiteral("loginButton"));
+    auto *status = window.findChild<QLabel *>(QStringLiteral("loginStatus"));
+    QVERIFY(username && password && login && status);
+    stressServer.enqueue(401, QByteArray("{\"error\":{\"message\":\"bad root password\"}}"));
+    username->setText(QStringLiteral("root"));
+    password->setText(QStringLiteral("bad123"));
+    login->click();
+    QTRY_COMPARE_WITH_TIMEOUT(stressServer.requests.size(), 1, 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(login->isEnabled(), 3000);
+    QVERIFY(status->text().contains(QStringLiteral("bad root password")));
+    QVERIFY(!window.sessionPage()->systemTestPage());
+    QVERIFY(!window.sessionPage()->isAuthenticated());
+    QCOMPARE(window.size(), fixedSize);
+    QCOMPARE(normalServer.requests.size(), 0);
+    QCOMPARE(readFile(normalSessionPath), savedSession);
+    QCOMPARE(readFile(normalAccountsPath), savedAccounts);
+
+    stressServer.enqueue(200, QByteArray(R"({"data":{"user":{"id":"root-id","username":"ROOT","display_name":"ROOT"},"tokens":{"access_token":"integrated-root-token","refresh_token":"integrated-root-refresh"}}})"));
+    auto *openSystemTest = window.findChild<QPushButton *>(QStringLiteral("openSystemTestButton"));
+    QVERIFY(openSystemTest);
+    openSystemTest->click();
+    QTRY_VERIFY_WITH_TIMEOUT(window.sessionPage()->systemTestPage(), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(stressServer.requests.size(), 2, 3000);
+    SystemTestPage *stressPage = window.sessionPage()->systemTestPage();
+    QVERIFY(stressPage->findChild<QPushButton *>(QStringLiteral("stressTestButton")));
+    QCOMPARE(stressPage->controller()->config().server, stressServer.url().toString());
+    QCOMPARE(window.sessionPage()->context()->api()->accessToken(), QString{});
+    QCOMPARE(window.sessionPage()->context()->session().accessToken, QString{});
+    QCOMPARE(readFile(normalSessionPath), savedSession);
+    QCOMPARE(readFile(normalAccountsPath), savedAccounts);
+    QVERIFY(QFileInfo::exists(window.sessionPage()->context()->store()->path(
+        QStringLiteral("root-stress/config/session.json"))));
+    QVERIFY(!window.sessionPage()->chatPage());
+    QVERIFY(window.width() >= 960 && window.height() >= 640);
+    QVERIFY(window.maximumWidth() > fixedSize.width());
+    QScreen *stressScreen = QGuiApplication::screenAt(window.frameGeometry().center());
+    QVERIFY(stressScreen);
+    const QRect stressAvailable = stressScreen->availableGeometry();
+    if (stressAvailable.width() >= window.frameGeometry().width()
+        && stressAvailable.height() >= window.frameGeometry().height()) {
+        const QPoint centerDelta = window.frameGeometry().center() - stressAvailable.center();
+        QVERIFY(centerDelta.manhattanLength() <= 2);
+    }
+    QCOMPARE(normalServer.requests.size(), 0);
+    for (const QByteArray &request : stressServer.requests) {
+        QVERIFY(request.startsWith("POST /api/v1/auth/login "));
+        QVERIFY(request.contains("\"username\":\"ROOT\""));
+    }
+    QVERIFY(stressServer.requests.at(0).contains("\"password\":\"bad123\""));
+    QVERIFY(stressServer.requests.at(1).contains("\"password\":\"123456\""));
+
+    auto *back = window.findChild<QPushButton *>(QStringLiteral("returnToLoginButton"));
+    QVERIFY(back);
+    back->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!window.sessionPage()->systemTestPage(), 3000);
+    QCOMPARE(window.size(), fixedSize);
+    QCOMPARE(window.minimumSize(), fixedSize);
+    QCOMPARE(window.maximumSize(), fixedSize);
+    QCOMPARE(readFile(normalSessionPath), savedSession);
+    QCOMPARE(readFile(normalAccountsPath), savedAccounts);
+
+    normalServer.enqueue(200, QByteArray(R"({"data":{"user":{"id":"alice-id","username":"ALICE","display_name":"ALICE"},"tokens":{"access_token":"normal-after-root","refresh_token":"normal-after-root-refresh"}}})"));
+    username->setText(QStringLiteral("alice"));
+    password->setText(QStringLiteral("123456"));
+    login->click();
+    QTRY_VERIFY_WITH_TIMEOUT(window.sessionPage()->isAuthenticated(), 3000);
+    QTRY_VERIFY_WITH_TIMEOUT(!normalServer.requests.isEmpty(), 3000);
+    QVERIFY(normalServer.requests.first().startsWith("POST /api/v1/auth/login "));
+    QVERIFY(normalServer.requests.first().contains("\"username\":\"ALICE\""));
+    QCOMPARE(window.sessionPage()->context()->api()->accessToken(),
+             QStringLiteral("normal-after-root"));
+    QCOMPARE(window.size(), fixedSize);
+    window.close();
+}
+
+void SessionTabsTest::integratedRootLoginFailureStaysOnNormalLogin()
+{
+    ScopedEnvironment stressUrl("SECURE_IM_STRESS_SERVER");
+    ScopedEnvironment projectRoot("SECURE_IM_PROJECT_ROOT");
+    QTemporaryDir root;
+    qputenv("SECURE_IM_PROJECT_ROOT", root.path().toUtf8());
+    qputenv("SECURE_IM_STRESS_SERVER", "http://127.0.0.1:1");
+    HoldingServer normalServer;
+    QVERIFY(normalServer.start());
+    auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")),
+                                                    normalServer.url());
+    QVERIFY(context->open());
+    SingleUserWindow window(std::move(context));
+    window.show();
+    auto *username = window.findChild<QLineEdit *>(QStringLiteral("usernameEdit"));
+    auto *password = window.findChild<QLineEdit *>(QStringLiteral("passwordEdit"));
+    auto *login = window.findChild<QPushButton *>(QStringLiteral("loginButton"));
+    auto *status = window.findChild<QLabel *>(QStringLiteral("loginStatus"));
+    QVERIFY(username && password && login && status);
+    username->setText(QStringLiteral("ROOT"));
+    password->setText(QStringLiteral("123456"));
+    login->click();
+    QTRY_VERIFY_WITH_TIMEOUT(login->isEnabled()
+        && !status->text().isEmpty()
+        && status->text() != QStringLiteral("正在登录…"), 10000);
+    QVERIFY(!window.sessionPage()->systemTestPage());
+    QVERIFY(!window.sessionPage()->isAuthenticated());
+    QVERIFY(window.findChild<QLineEdit *>(QStringLiteral("usernameEdit"))->isVisible());
+    QCOMPARE(window.size(), QSize(560, 390));
+    QCOMPARE(normalServer.requests.size(), 0);
+    QVERIFY(!QFileInfo::exists(window.sessionPage()->context()->store()->path(
+        QStringLiteral("config/session.json"))));
     window.close();
 }
 
@@ -451,6 +615,7 @@ void SessionTabsTest::loginUsesNormalAuthenticationAndUppercaseUsername()
     login->click();
     QCOMPARE(username->text(), QStringLiteral("ALICE"));
     QTRY_VERIFY_WITH_TIMEOUT(page.isAuthenticated(), 3000);
+    QCOMPARE(password->text(), QStringLiteral("123456"));
     QCOMPARE(page.context()->session().accessToken, QStringLiteral("real-alice-token"));
     QTRY_VERIFY_WITH_TIMEOUT(!server.requests.isEmpty(), 3000);
     QVERIFY(server.requests.first().startsWith("POST /api/v1/auth/login "));
@@ -555,6 +720,97 @@ void SessionTabsTest::transferCardActionsRemainAvailable()
     context.shutdown();
 }
 
+void SessionTabsTest::fixedWindowAndDisabledSplitterSurvivePageChanges()
+{
+    QTemporaryDir root;
+    auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")),
+        QUrl(QStringLiteral("http://127.0.0.1:1")));
+    QVERIFY(context->open());
+    SingleUserWindow window(std::move(context));
+    window.show();
+    const QSize fixedSize(560, 390);
+    QCOMPARE(window.size(), fixedSize);
+    QCOMPARE(window.minimumSize(), fixedSize);
+    QCOMPARE(window.maximumSize(), fixedSize);
+    QVERIFY(!window.sessionPage()->isAuthenticated());
+    auto *username = window.findChild<QLineEdit *>(QStringLiteral("usernameEdit"));
+    auto *password = window.findChild<QLineEdit *>(QStringLiteral("passwordEdit"));
+    QVERIFY(username && password);
+    QVERIFY(username->height() >= 36 && password->height() >= 36);
+
+    window.sessionPage()->startSession(session(QStringLiteral("alice"), QStringLiteral("token")), false);
+    QCoreApplication::processEvents();
+    QCOMPARE(window.size(), fixedSize);
+    QCOMPARE(window.minimumSize(), fixedSize);
+    QCOMPARE(window.maximumSize(), fixedSize);
+    window.resize(900, 700);
+    QCOMPARE(window.size(), fixedSize);
+
+    auto *splitter = window.sessionPage()->chatPage()->findChild<QSplitter *>(
+        QStringLiteral("chatSplitter"));
+    QVERIFY(splitter);
+    QCOMPARE(splitter->handleWidth(), 0);
+    QVERIFY(splitter->handle(1));
+    QVERIFY(!splitter->handle(1)->isEnabled());
+    QCOMPARE(splitter->sizes().size(), 2);
+    QVERIFY(splitter->sizes().at(0) > 0);
+    QVERIFY(splitter->sizes().at(1) > 0);
+    window.close();
+}
+
+void SessionTabsTest::restoredUnreadDotsAppearWithoutSelectionAndClearOnRead()
+{
+    HoldingServer server;
+    QVERIFY(server.start());
+    server.enqueue(200, QByteArray(R"({"data":{"unread":[{"peer_id":"peer-id","unread_count":2,"last_message_at":1760000000123}]}})"));
+    server.enqueue(200, QByteArray(R"({"data":{"online_user_ids":[]}})"));
+    server.enqueue(200, QByteArray(R"({"data":{"users":[{"id":"alice-id","username":"ALICE"},{"id":"peer-id","username":"BOB"}]}})"));
+
+    QTemporaryDir root;
+    auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")), server.url());
+    QVERIFY(context->open());
+    const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
+    QVERIFY(context->store()->saveSession(auth));
+    ChatMessage local;
+    local.id = QStringLiteral("offline-local");
+    local.cursor = QStringLiteral("7");
+    local.senderId = QStringLiteral("peer-id");
+    local.recipientId = auth.user.id;
+    local.content = QStringLiteral("offline");
+    QVERIFY(context->store()->appendMessage(QStringLiteral("peer-id"), local));
+
+    SessionPage page(std::move(context));
+    page.show();
+    QVERIFY(page.isAuthenticated());
+    MainWindow *window = page.chatPage();
+    QTRY_VERIFY_WITH_TIMEOUT(window->m_users->count() == 1, 3000);
+    QCOMPARE(window->m_peerId, QString{});
+    QTRY_COMPARE_WITH_TIMEOUT(window->m_unreadByPeer.value(QStringLiteral("peer-id")), 2, 3000);
+    QCOMPARE(unreadTotal(*window), 2);
+    auto *dot = window->m_users->itemWidget(window->m_users->item(0))
+        ->findChild<QLabel *>(QStringLiteral("contactUnreadDot"));
+    QVERIFY(dot && !dot->isHidden());
+    QTRY_VERIFY_WITH_TIMEOUT(server.requests.size() >= 3, 3000);
+    QVERIFY(server.requests.first().startsWith("GET /api/v1/messages/unread "));
+
+    server.enqueue(200, QByteArray(R"({"data":{"messages":[]}})"));
+    server.enqueue(200, QByteArray(R"({"data":{}})"));
+    window->m_users->setCurrentItem(window->m_users->item(0));
+    QTRY_VERIFY_WITH_TIMEOUT(unreadTotal(*window) == 0, 3000);
+    QVERIFY(dot->isHidden());
+    QTRY_VERIFY_WITH_TIMEOUT(server.requests.size() >= 6, 3000);
+    bool readRequested = false;
+    for (const QByteArray &request : server.requests) {
+        if (request.startsWith("POST /api/v1/messages/read ")) {
+            readRequested = true;
+            QVERIFY(request.contains("\"peer_id\":\"peer-id\""));
+            QVERIFY(request.contains("\"cursor\":7"));
+        }
+    }
+    QVERIFY(readRequested);
+    page.shutdown();
+}
+
 void SessionTabsTest::contactUnreadDotsAreIndependentAndClearOnView()
 {
     QTemporaryDir root;
@@ -629,38 +885,38 @@ void SessionTabsTest::contactUnreadDotsAreIndependentAndClearOnView()
     receive(second);
     QCOMPARE(window.m_unreadByPeer.value(first.id), 1);
     QCOMPARE(window.m_unreadByPeer.value(second.id), 3);
-    QCOMPARE(window.m_unreadCount, 4);
+    QCOMPARE(unreadTotal(window), 4);
     QVERIFY(dotFor(first.id) && !dotFor(first.id)->isHidden());
     QVERIFY(dotFor(second.id) && !dotFor(second.id)->isHidden());
 
     window.applyUsers({second, first});
     QCOMPARE(window.m_peerId, first.id);
-    QCOMPARE(window.m_unreadCount, 4);
+    QCOMPARE(unreadTotal(window), 4);
     QVERIFY(!dotFor(first.id)->isHidden());
     QVERIFY(!dotFor(second.id)->isHidden());
     window.m_search->setText(second.id);
     QVERIFY(window.m_users->item(0)->isHidden() || window.m_users->item(1)->isHidden());
-    QCOMPARE(window.m_unreadCount, 4);
+    QCOMPARE(unreadTotal(window), 4);
     window.m_search->clear();
-    QCOMPARE(window.m_unreadCount, 4);
+    QCOMPARE(unreadTotal(window), 4);
 
     window.setActive(true);
     QCOMPARE(window.m_unreadByPeer.value(first.id), 0);
     QCOMPARE(window.m_unreadByPeer.value(second.id), 3);
-    QCOMPARE(window.m_unreadCount, 3);
+    QCOMPARE(unreadTotal(window), 3);
     QVERIFY(dotFor(first.id)->isHidden());
     QVERIFY(!dotFor(second.id)->isHidden());
 
     window.showTransfersView();
     receive(first);
     QCOMPARE(window.m_unreadByPeer.value(first.id), 1);
-    QCOMPARE(window.m_unreadCount, 4);
+    QCOMPARE(unreadTotal(window), 4);
     window.showChatView();
     QCOMPARE(window.m_unreadByPeer.value(first.id), 0);
-    QCOMPARE(window.m_unreadCount, 3);
+    QCOMPARE(unreadTotal(window), 3);
     window.m_users->setCurrentItem(window.m_users->item(0));
     QCOMPARE(window.m_peerId, second.id);
-    QCOMPARE(window.m_unreadCount, 0);
+    QCOMPARE(unreadTotal(window), 0);
     QVERIFY(dotFor(first.id)->isHidden());
     QVERIFY(dotFor(second.id)->isHidden());
 
@@ -672,36 +928,14 @@ void SessionTabsTest::contactFilterAllowsRegisteredCustomUsers()
 {
     QTemporaryDir root;
     const QUrl serverUrl(QStringLiteral("http://127.0.0.1:1"));
-    const AuthSession good = session(QStringLiteral("GOOD"), QStringLiteral("good-secret"));
-    const QString firstRegistry = root.filePath(QStringLiteral("alice/config/known_accounts.json"));
-
-    {
-        auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")), serverUrl);
-        QVERIFY(context->open());
-        SessionPage page(std::move(context));
-        page.startSession(good);
-        QVERIFY(page.context()->store()->knownAccountIds().contains(good.user.id));
-        QVERIFY(page.context()->store()->saveSession(good));
-    }
-
-    // Restoring a session rebuilds only that user's private account registry.
-    QVERIFY(QFile::remove(firstRegistry));
-    {
-        auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("alice")), serverUrl);
-        QVERIFY(context->open());
-        SessionPage restored(std::move(context));
-        QVERIFY(restored.isAuthenticated());
-        QVERIFY(restored.context()->store()->knownAccountIds().contains(good.user.id));
-    }
-
     auto context = std::make_unique<SessionContext>(root.filePath(QStringLiteral("bob")), serverUrl);
     QVERIFY(context->open());
     SessionPage observer(std::move(context));
-    observer.startSession(session(QStringLiteral("CURRENT"), QStringLiteral("current-secret")));
+    observer.startSession(session(QStringLiteral("CURRENT"), QStringLiteral("current-secret")), false);
     MainWindow *window = observer.chatPage();
     QVERIFY(window);
-    QVERIFY(!observer.context()->store()->knownAccountIds().contains(good.user.id));
 
+    const AuthSession good = session(QStringLiteral("GOOD"), QStringLiteral("good-secret"));
     User simulator;
     simulator.id = QStringLiteral("simulator-id");
     simulator.username = QStringLiteral("USER_2");
@@ -709,22 +943,7 @@ void SessionTabsTest::contactFilterAllowsRegisteredCustomUsers()
     unknownAlice.id = QStringLiteral("unknown-alice-id");
     unknownAlice.username = QStringLiteral("ALICE");
     window->applyUsers({good.user, unknownAlice, simulator});
-    QCOMPARE(window->m_users->count(), 1);
-    QCOMPARE(window->m_users->item(0)->data(Qt::UserRole).toString(), simulator.id);
-
-    QVERIFY(observer.context()->store()->rememberAccount(good.user));
-    window->applyUsers({good.user, unknownAlice, simulator});
-    QCOMPARE(window->m_users->count(), 2);
-    const QString secondRegistry = observer.context()->store()->path(QStringLiteral("config/known_accounts.json"));
-    QVERIFY(QFileInfo::exists(secondRegistry));
-    QVERIFY(!QFileInfo::exists(root.filePath(QStringLiteral("known_accounts.json"))));
-    QFile registry(secondRegistry);
-    QVERIFY(registry.open(QIODevice::ReadOnly));
-    const QByteArray json = registry.readAll();
-    QVERIFY(json.contains("GOOD"));
-    QVERIFY(!json.contains("good-secret"));
-    QVERIFY(!json.contains("current-secret"));
-    QVERIFY(!json.contains("token"));
+    QCOMPARE(window->m_users->count(), 3);
     observer.shutdown();
 }
 
@@ -752,7 +971,7 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     legacyUser.id = QStringLiteral("legacy-test-id");
     legacyUser.username = QStringLiteral("ALICE");
     window.applyUsers({peer, integrationUser, legacyUser});
-    QCOMPARE(window.m_users->count(), 1); // Only USER_<number> demo accounts appear.
+    QCOMPARE(window.m_users->count(), 3); // All registered users appear; only the current account is hidden.
     window.m_users->setCurrentItem(window.m_users->item(0));
     window.m_peerId = peer.id;
     window.updateConversationLabel();
@@ -770,7 +989,6 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
 
     ChatMessage own;
     own.id = QStringLiteral("own-1");
-    own.cursor = QStringLiteral("1");
     own.senderId = auth.user.id;
     own.recipientId = peer.id;
     own.content = QStringLiteral("own message");
@@ -780,8 +998,12 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     WireMessage ack;
     ack.type = WireMessage::Type::Ack;
     ack.messageId = own.id;
+    ack.cursor = QStringLiteral("1");
     window.handleWireMessage(ack);
     QCOMPARE(context.store()->messages(peer.id).first().readAt, qint64(0));
+    QVERIFY(context.store()->messages(peer.id).first().acked);
+    QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("已确认未读")));
+    QCOMPARE(window.m_sync.cursor(peer.id), QString{});
 
     WireMessage read;
     read.type = WireMessage::Type::Read;
@@ -792,7 +1014,7 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     window.handleWireMessage(read);
     QCOMPARE(context.store()->messages(peer.id).first().readAt, read.readAt);
     QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("已读")));
-    QCOMPARE(window.m_unreadCount, 0);
+    QCOMPARE(unreadTotal(window), 0);
     QVERIFY(window.m_downloadIds.isEmpty());
     ChatMessage duplicate = own;
     duplicate.readAt = 0;
@@ -813,7 +1035,7 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     QVERIFY2(MessagePayloadCodec::encode(text, &incoming.payload, &payloadError), qPrintable(payloadError));
     window.handleWireMessage(incoming);
     QCoreApplication::processEvents();
-    QCOMPARE(window.m_unreadCount, 1);
+    QCOMPARE(unreadTotal(window), 1);
     QCOMPARE(server.requests.size(), 0);
     window.handleWireMessage(read);
     QCOMPARE(window.m_sync.cursor(peer.id), QStringLiteral("2"));
@@ -841,6 +1063,92 @@ void SessionTabsTest::readReceiptsRespectVisibilityAndPersist()
     QVERIFY(server.requests.first().startsWith("POST /api/v1/messages/read "));
     QVERIFY(server.requests.first().contains("\"peer_id\":\"peer-id\""));
     QVERIFY(server.requests.first().contains("\"cursor\":2"));
+    window.shutdown();
+    context.shutdown();
+}
+
+void SessionTabsTest::deliveryStatesRenderAndAckIsNotRead()
+{
+    QTemporaryDir root;
+    SessionContext context(root.filePath(QStringLiteral("user")),
+                           QUrl(QStringLiteral("http://127.0.0.1:1")));
+    QVERIFY(context.open());
+    const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
+    context.setSession(auth);
+    MainWindow window(context.api(), context.store(), context.codec(), auth, false);
+    const QString peer = QStringLiteral("peer");
+    window.m_peerId = peer;
+    ChatMessage message;
+    message.id = QStringLiteral("states");
+    message.cursor = QStringLiteral("7");
+    message.senderId = auth.user.id;
+    message.recipientId = peer;
+    message.content = QStringLiteral("hello");
+    message.pending = true;
+    window.appendChat(peer, message);
+    QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("等待发送")));
+    message.attemptCount = 1;
+    message.nextAttemptAt = 100;
+    window.appendChat(peer, message);
+    QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("等待ACK")));
+    message.pending = false;
+    message.failed = true;
+    message.deliveryError = QStringLiteral("no ack");
+    window.appendChat(peer, message);
+    QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("失败")));
+
+    WireMessage ack;
+    ack.type = WireMessage::Type::Ack;
+    ack.messageId = message.id;
+    window.handleWireMessage(ack);
+    QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("已确认未读")));
+    QVERIFY(!window.m_chat->toPlainText().contains(QStringLiteral("已读 ")));
+    WireMessage read;
+    read.type = WireMessage::Type::Read;
+    read.senderId = peer;
+    read.recipientId = auth.user.id;
+    read.cursor = QStringLiteral("7");
+    read.readAt = 1700000000123LL;
+    window.handleWireMessage(read);
+    QVERIFY(window.m_chat->toPlainText().contains(QStringLiteral("已读")));
+    window.shutdown();
+    context.shutdown();
+}
+
+void SessionTabsTest::connectedOutboxHistoryIsSingleFlightPerPeer()
+{
+    HoldingServer server;
+    QVERIFY(server.start());
+    QTemporaryDir root;
+    SessionContext context(root.filePath(QStringLiteral("user")), server.url());
+    QVERIFY(context.open());
+    const AuthSession auth = session(QStringLiteral("alice"), QStringLiteral("token"));
+    context.setSession(auth);
+    for (const QString &peer : {QStringLiteral("peer-a"), QStringLiteral("peer-b")}) {
+        ChatMessage pending;
+        pending.id = QStringLiteral("pending-") + peer;
+        pending.senderId = auth.user.id;
+        pending.recipientId = peer;
+        pending.content = QStringLiteral("offline");
+        pending.pending = true;
+        QVERIFY(context.store()->appendMessage(peer, pending));
+    }
+    MainWindow window(context.api(), context.store(), context.codec(), auth, false);
+    window.m_online = true;
+    window.m_delivery->onConnected();
+    window.m_delivery->onConnected();
+    QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(), 2, 3000);
+    QTest::qWait(50);
+    QCOMPARE(server.requests.size(), 2);
+    QStringList paths;
+    for (const QByteArray &request : server.requests)
+        paths.append(QString::fromLatin1(request.left(request.indexOf(" HTTP/"))));
+    QVERIFY(paths.at(0).contains(QStringLiteral("GET /api/v1/messages?")));
+    QVERIFY(paths.at(1).contains(QStringLiteral("GET /api/v1/messages?")));
+    QVERIFY(paths.at(0).contains(QStringLiteral("peer_id=peer-a"))
+            || paths.at(1).contains(QStringLiteral("peer_id=peer-a")));
+    QVERIFY(paths.at(0).contains(QStringLiteral("peer_id=peer-b"))
+            || paths.at(1).contains(QStringLiteral("peer_id=peer-b")));
     window.shutdown();
     context.shutdown();
 }

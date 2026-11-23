@@ -15,6 +15,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSizePolicy>
 #include <QSpinBox>
 #include <QStyle>
 #include <QTreeWidget>
@@ -47,6 +48,39 @@ QString decimalText(double value, int precision = 1)
     return QLocale().toString(value, 'f', precision);
 }
 
+QString phaseDisplayText(const QString &phase)
+{
+    if (phase == QLatin1String("rampup"))
+        return QStringLiteral("连接爬坡");
+    if (phase == QLatin1String("stable"))
+        return QStringLiteral("稳定测试");
+    if (phase == QLatin1String("drain"))
+        return QStringLiteral("收尾排空");
+    if (phase == QLatin1String("cleanup"))
+        return QStringLiteral("清理数据");
+    if (phase == QLatin1String("preflight"))
+        return QStringLiteral("准备环境");
+    if (phase == QLatin1String("idle"))
+        return QStringLiteral("待命");
+    return phase;
+}
+
+QString statusDisplayText(const QString &status)
+{
+    const QString normalized = status.trimmed().toLower();
+    if (normalized == QLatin1String("success") || normalized == QLatin1String("passed")
+        || normalized == QLatin1String("pass") || normalized == QLatin1String("ok"))
+        return QStringLiteral("成功");
+    if (normalized == QLatin1String("fluctuation") || normalized == QLatin1String("warning")
+        || normalized == QLatin1String("warn") || normalized == QLatin1String("unstable")
+        || normalized == QLatin1String("degraded"))
+        return QStringLiteral("波动");
+    if (normalized == QLatin1String("failure") || normalized == QLatin1String("failed")
+        || normalized == QLatin1String("fail") || normalized == QLatin1String("error"))
+        return QStringLiteral("失败");
+    return status;
+}
+
 QFrame *makeCard(QWidget *parent)
 {
     auto *card = new QFrame(parent);
@@ -54,11 +88,6 @@ QFrame *makeCard(QWidget *parent)
     return card;
 }
 } // namespace
-
-SystemTestPage::SystemTestPage(QWidget *parent)
-    : SystemTestPage(StressRunConfig::forProject(), parent)
-{
-}
 
 SystemTestPage::SystemTestPage(const StressRunConfig &config, QWidget *parent)
     : QWidget(parent), m_controller(new StressRunController(config, this))
@@ -85,6 +114,7 @@ SystemTestPage::SystemTestPage(const StressRunConfig &config, QWidget *parent)
     connect(m_controller, &StressRunController::runStarted, this, [this] {
         setRunning(true);
         m_phase->setText(QStringLiteral("准备环境"));
+        m_chunkSlots->setText(QStringLiteral("未知"));
     });
     connect(m_controller, &StressRunController::progressReceived,
             this, &SystemTestPage::updateProgress);
@@ -122,17 +152,20 @@ void SystemTestPage::buildUi()
 
     auto *header = new QHBoxLayout;
     auto *titles = new QVBoxLayout;
+    titles->setSpacing(4);
     auto *title = new QLabel(QStringLiteral("系统压力测试"), content);
     title->setObjectName(QStringLiteral("stressTitle"));
     titles->addWidget(title);
     auto *subtitle = new QLabel(QStringLiteral("验证大规模在线、消息 ACK、文件传输与后端资源边界"), content);
     subtitle->setObjectName(QStringLiteral("mutedLabel"));
+    subtitle->setWordWrap(true);
     titles->addWidget(subtitle);
     header->addLayout(titles);
     header->addStretch();
     m_phase = new QLabel(QStringLiteral("待命"), content);
     m_phase->setObjectName(QStringLiteral("stressPhaseLabel"));
-    header->addWidget(m_phase);
+    m_phase->setAlignment(Qt::AlignCenter);
+    header->addWidget(m_phase, 0, Qt::AlignTop);
     layout->addLayout(header);
 
     auto *configuration = makeCard(content);
@@ -144,10 +177,22 @@ void SystemTestPage::buildUi()
     controls->addWidget(new QLabel(QStringLiteral("总人数"), configuration));
     m_target = new QSpinBox(configuration);
     m_target->setObjectName(QStringLiteral("stressTargetSpinBox"));
-    m_target->setRange(1, 100000);
+    m_target->setRange(1000, 100000);
+    m_target->setSingleStep(1000);
     m_target->setValue(1000);
     m_target->setSuffix(QStringLiteral(" 人"));
-    m_target->setMinimumWidth(130);
+    m_target->setGroupSeparatorShown(true);
+    m_target->setAlignment(Qt::AlignCenter);
+    m_target->setMinimumSize(150, 40);
+    m_target->setButtonSymbols(QSpinBox::PlusMinus);
+    m_target->setStyleSheet(QStringLiteral(
+        "QSpinBox { font-size: 16px; font-weight: 600; padding: 6px 10px; }"
+        "QSpinBox::up-button, QSpinBox::down-button {"
+        " background: #e0e9ff; border: 1px solid #aebee8; width: 26px; color: #3658d2; }"
+        "QSpinBox::up-button:hover, QSpinBox::down-button:hover {"
+        " background: #c7d6fb; }"
+        "QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {"
+        " background: #aebfdc; }"));
     controls->addWidget(m_target);
     const QList<QPair<QString, int>> shortcuts{
         {QStringLiteral("1k"), 1000}, {QStringLiteral("5k"), 5000},
@@ -176,7 +221,7 @@ void SystemTestPage::buildUi()
     configLayout->addWidget(m_distribution);
     auto *resources = new QLabel(QStringLiteral(
         "固定资源：后端 6 CPU / 3 GiB ｜ 文件预算 500 MiB ｜ 分块 5 MiB ｜ "
-        "96 个文件任务 ｜ 单文件 100 MiB ｜ 稳定运行 5 分钟"), configuration);
+        "96 个分块通道 ｜ 单文件 100 MiB ｜ 稳定运行 5 分钟"), configuration);
     resources->setObjectName(QStringLiteral("stressResourceLabel"));
     resources->setWordWrap(true);
     configLayout->addWidget(resources);
@@ -208,20 +253,25 @@ void SystemTestPage::buildUi()
                                   QLabel **value, QLabel **detail = nullptr) {
         auto *card = makeCard(content);
         card->setObjectName(QStringLiteral("stressMetricCard"));
+        card->setMinimumHeight(76);
+        card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         auto *box = new QVBoxLayout(card);
-        box->setContentsMargins(16, 12, 16, 12);
-        box->setSpacing(4);
+        box->setContentsMargins(14, 10, 14, 10);
+        box->setSpacing(3);
         auto *caption = new QLabel(titleText, card);
         caption->setObjectName(QStringLiteral("mutedLabel"));
+        caption->setWordWrap(true);
         box->addWidget(caption);
         *value = new QLabel(QStringLiteral("—"), card);
         (*value)->setObjectName(name);
         (*value)->setProperty("metricValue", true);
+        (*value)->setWordWrap(true);
         box->addWidget(*value);
         if (detail) {
             *detail = new QLabel(QStringLiteral("等待实时数据"), card);
             (*detail)->setObjectName(name + QStringLiteral("Detail"));
             (*detail)->setObjectName(QStringLiteral("mutedLabel"));
+            (*detail)->setWordWrap(true);
             box->addWidget(*detail);
         }
         return card;
@@ -238,12 +288,16 @@ void SystemTestPage::buildUi()
                               &m_throughput, &m_bytes), 1, 0);
     metrics->addWidget(metric(QStringLiteral("后端 RSS / CPU"), QStringLiteral("stressBackendValue"),
                               &m_backend), 1, 1);
-    metrics->addWidget(metric(QStringLiteral("Go 堆 / Goroutines"), QStringLiteral("stressGoValue"),
+    metrics->addWidget(metric(QStringLiteral("Go 堆 / 协程数"), QStringLiteral("stressGoValue"),
                               &m_go), 1, 2);
     metrics->addWidget(metric(QStringLiteral("文件预算"), QStringLiteral("stressBudgetValue"),
-                              &m_budget), 1, 3);
+                              &m_budget, &m_chunkSlots), 1, 3);
+    m_chunkSlots->setObjectName(QStringLiteral("stressChunkSlotsValue"));
+    m_chunkSlots->setText(QStringLiteral("—"));
     for (int column = 0; column < 4; ++column)
         metrics->setColumnStretch(column, 1);
+    for (int row = 0; row < 2; ++row)
+        metrics->setRowStretch(row, 1);
     layout->addLayout(metrics);
 
     auto *result = makeCard(content);
@@ -253,7 +307,8 @@ void SystemTestPage::buildUi()
     m_conclusion = new QLabel(QStringLiteral("尚未运行"), result);
     m_conclusion->setObjectName(QStringLiteral("stressConclusionLabel"));
     m_conclusion->setProperty("state", QStringLiteral("idle"));
-    resultLayout->addWidget(m_conclusion);
+    m_conclusion->setAlignment(Qt::AlignCenter);
+    resultLayout->addWidget(m_conclusion, 0, Qt::AlignTop);
     m_advice = new QLabel(QStringLiteral("选择人数后开始；报告和瓶颈建议会显示在这里。"), result);
     m_advice->setObjectName(QStringLiteral("stressAdviceLabel"));
     m_advice->setWordWrap(true);
@@ -264,6 +319,7 @@ void SystemTestPage::buildUi()
     auto *historyLayout = new QVBoxLayout(historyCard);
     historyLayout->setContentsMargins(18, 12, 18, 14);
     auto *historyHeader = new QHBoxLayout;
+    historyHeader->setSpacing(8);
     auto *historyTitle = new QLabel(QStringLiteral("历史报告"), historyCard);
     historyTitle->setObjectName(QStringLiteral("sectionTitle"));
     historyHeader->addWidget(historyTitle);
@@ -314,6 +370,8 @@ void SystemTestPage::setRunning(bool running)
     m_target->setEnabled(!running);
     m_start->setEnabled(!running);
     m_stop->setEnabled(running);
+    if (!running)
+        m_chunkSlots->setText(QStringLiteral("—"));
     const auto buttons = findChildren<QPushButton *>();
     for (QPushButton *button : buttons) {
         if (button->objectName().startsWith(QStringLiteral("stressTarget")))
@@ -346,7 +404,7 @@ void SystemTestPage::updateProgress(const StressProgress &progress)
         updateCountdown();
     }
     m_lastProgress = progress;
-    m_phase->setText(progress.phase.isEmpty() ? QStringLiteral("运行中") : progress.phase);
+    m_phase->setText(progress.phase.isEmpty() ? QStringLiteral("运行中") : phaseDisplayText(progress.phase));
     m_online->setText(QStringLiteral("%1 / %2").arg(
         integerText(progress.online), integerText(progress.target)));
     m_messages->setText(QStringLiteral("%1 / %2").arg(
@@ -370,6 +428,10 @@ void SystemTestPage::updateProgress(const StressProgress &progress)
         .arg(decimalText(progress.goHeapMib), integerText(progress.goroutines)));
     m_budget->setText(QStringLiteral("%1 / %2 MiB")
         .arg(decimalText(progress.fileBudgetUsedMib), decimalText(progress.fileBudgetLimitMib)));
+    m_chunkSlots->setText(progress.fileChunkSlotsKnown
+        ? QStringLiteral("分块通道 %1 / %2").arg(integerText(progress.fileChunkSlotsUsed),
+                                      integerText(progress.fileChunkSlotsLimit))
+        : QStringLiteral("分块通道未知"));
     if (!m_hasFinal)
         m_advice->setText(bottleneckAdvice());
 }
@@ -441,11 +503,11 @@ QString SystemTestPage::bottleneckAdvice() const
     if (m_lastProgress.filesFailed > 0
         || (m_lastProgress.fileBudgetLimitMib > 0
             && m_lastProgress.fileBudgetUsedMib >= m_lastProgress.fileBudgetLimitMib * 0.9))
-        return QStringLiteral("瓶颈建议：文件失败或预算接近上限，检查 500 MiB 配额、64 任务限制及存储吞吐。");
+        return QStringLiteral("瓶颈建议：文件失败或预算接近上限，检查 500 MiB 配额、96 通道限制及存储吞吐。");
     if (m_lastProgress.target > 0 && m_lastProgress.online < m_lastProgress.target)
         return QStringLiteral("瓶颈建议：在线人数未达目标，优先检查连接建立、账号准备和后端连接容量。");
     if (m_lastProgress.ackP99Ms >= 2000.0)
-        return QStringLiteral("瓶颈建议：ACK P99 偏高，检查后端 CPU、Go 堆和 goroutine 是否持续增长。");
+        return QStringLiteral("瓶颈建议：ACK P99 偏高，检查后端 CPU、Go 堆和协程数是否持续增长。");
     if (m_lastProgress.backendCpuPercent >= 85.0 || m_lastProgress.backendRssMib >= 3584.0)
         return QStringLiteral("瓶颈建议：后端资源接近 6 CPU / 3 GiB 边界，降低人数并对比资源峰值。");
     if (m_lastProgress.messagesDelivered < m_lastProgress.messagesSent)
@@ -476,9 +538,11 @@ QList<SystemTestPage::HistoryEntry> SystemTestPage::readHistory() const
         entry.directory = directory.absoluteFilePath();
         entry.target = static_cast<qint64>(summary.value(QStringLiteral("target")).toDouble());
         const QJsonObject result = summary.value(QStringLiteral("result")).toObject();
-        entry.conclusion = summary.value(QStringLiteral("conclusion")).toString();
+        entry.conclusion = result.value(QStringLiteral("status")).toString();
         if (entry.conclusion.isEmpty())
             entry.conclusion = summary.value(QStringLiteral("status")).toString();
+        if (entry.conclusion.isEmpty())
+            entry.conclusion = summary.value(QStringLiteral("conclusion")).toString();
         entry.reason = summary.value(QStringLiteral("reason")).toString();
         if (entry.reason.isEmpty())
             entry.reason = result.value(QStringLiteral("reason")).toString();
@@ -526,7 +590,7 @@ void SystemTestPage::refreshHistory()
         auto *item = new QTreeWidgetItem(m_history);
         item->setText(0, entry.timestamp.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
         item->setText(1, integerText(entry.target));
-        item->setText(2, entry.conclusion.isEmpty() ? QStringLiteral("—") : entry.conclusion);
+        item->setText(2, entry.conclusion.isEmpty() ? QStringLiteral("—") : statusDisplayText(entry.conclusion));
         item->setText(3, entry.reason);
         item->setToolTip(3, entry.reason);
         item->setData(0, Qt::UserRole, entry.directory);

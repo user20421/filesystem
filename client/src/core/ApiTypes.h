@@ -20,6 +20,12 @@ struct AuthSession {
     User user;
 };
 
+struct UnreadSummary {
+    QString peerId;
+    int unreadCount = 0;
+    qint64 lastMessageAt = 0;
+};
+
 struct ChatMessage {
     QString id;
     QString cursor;
@@ -33,6 +39,14 @@ struct ChatMessage {
     qint64 fileSize = 0;
     qint64 timestamp = 0;
     qint64 readAt = 0;
+
+    // Transport delivery is independent from the peer's READ receipt.
+    bool pending = false;
+    bool acked = false;
+    bool failed = false;
+    int attemptCount = 0;
+    qint64 nextAttemptAt = 0;
+    QString deliveryError;
 
     bool isFile() const { return kind == QStringLiteral("file") || !fileId.isEmpty(); }
 };

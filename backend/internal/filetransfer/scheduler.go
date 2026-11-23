@@ -35,6 +35,14 @@ func newChunkScheduler(limit int) *chunkScheduler {
 	return &chunkScheduler{limit: limit, activeByKey: make(map[string]int)}
 }
 
+// Stats returns a consistent snapshot of the currently granted slots and cap.
+func (s *chunkScheduler) Stats() (active, limit int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.active, s.limit
+}
+
+// acquire 为分块操作申请槽位。等待、已授权和已结束状态均受 mu 保护；取消与授权同时发生时必须立即归还未使用槽位。
 func (s *chunkScheduler) acquire(ctx context.Context, fileKey string) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -65,6 +73,7 @@ func (s *chunkScheduler) acquire(ctx context.Context, fileKey string) (func(), e
 			req.state = chunkRequestDone
 			s.dispatchLocked()
 		case chunkRequestGranted:
+			// 取消与授权可能同时发生；已授权但未使用的槽位必须立即归还并唤醒后续请求。
 			// Cancellation can race with a grant. Return the unused slot rather
 			// than leaking it or running the canceled operation.
 			s.releaseLocked(req)
@@ -111,6 +120,7 @@ func (s *chunkScheduler) dispatchLocked() {
 		competing := len(keys) > 1
 
 		selected := -1
+		// 多文件竞争时避开刚完成的文件，优先让其他空闲文件获得下一轮；FIFO 仅用于同优先级之间决胜。
 		// After a chunk finishes, prefer another inactive file over the
 		// finished file's backlog. This is the per-file round-robin turn;
 		// FIFO order breaks ties between different eligible files.

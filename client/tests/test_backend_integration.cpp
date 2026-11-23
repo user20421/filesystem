@@ -77,6 +77,7 @@ private slots:
     void realBackendFlow();
 };
 
+// 依赖 CLIENT_BACKEND_URL 的真实后端，随机创建两个账号并覆盖认证、实时消息、重复帧幂等、已读、文件和注销清理。
 void BackendIntegrationTest::realBackendFlow()
 {
     const QByteArray server = qgetenv("CLIENT_BACKEND_URL");
@@ -181,6 +182,7 @@ void BackendIntegrationTest::realBackendFlow()
     const QString realtimeId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString realtimeText = QStringLiteral("realtime-") + suffix;
     bool ackReceived = false;
+    QStringList ackCursors;
     bool messageReceived = false;
     bool readReceived = false;
     bool recipientReadReceived = false;
@@ -189,8 +191,10 @@ void BackendIntegrationTest::realBackendFlow()
     WireMessage recipientReadReceipt;
     QObject::connect(&senderSocket, &WebSocketClient::messageReceived, &senderSocket,
                      [&](const WireMessage &message) {
-        if (message.type == WireMessage::Type::Ack && message.messageId == realtimeId)
+        if (message.type == WireMessage::Type::Ack && message.messageId == realtimeId) {
             ackReceived = true;
+            ackCursors.append(message.cursor);
+        }
         if (message.type == WireMessage::Type::Read) {
             readReceipt = message;
             readReceived = true;
@@ -230,6 +234,13 @@ void BackendIntegrationTest::realBackendFlow()
     QVERIFY2(MessagePayloadCodec::decode(receivedMessage.payload, &receivedPayload, &sendError),
              qPrintable(sendError));
     QCOMPARE(receivedPayload.content, realtimeText);
+
+    // Repeating the exact Protobuf frame exercises idempotent server storage:
+    // the second ACK must identify the original row, not create a new cursor.
+    QVERIFY2(senderSocket.send(outgoing, &sendError), qPrintable(sendError));
+    QTRY_COMPARE_WITH_TIMEOUT(ackCursors.size(), 2, 15000);
+    QCOMPARE(ackCursors.at(1), ackCursors.at(0));
+    QVERIFY(!ackCursors.at(0).isEmpty());
 
     QList<ChatMessage> realtimeHistory;
     QString historyError;
@@ -397,8 +408,8 @@ void BackendIntegrationTest::realBackendFlow()
     bool deleteDone = false;
     api.deleteFile(file.fileId, [&](bool, const QString &) { deleteDone = true; });
     QTRY_VERIFY_WITH_TIMEOUT(deleteDone, 10000);
-    senderSocket.close();
-    recipientSocket.close();
+    senderSocket.shutdown();
+    recipientSocket.shutdown();
 
     bool deleteAccountDone = false;
     bool deleteAccountOk = false;

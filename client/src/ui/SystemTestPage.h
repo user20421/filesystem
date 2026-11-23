@@ -14,10 +14,11 @@ class QSpinBox;
 class QTimer;
 class QTreeWidget;
 
+// SystemTestPage 展示压测配置、实时指标、结论和历史报告，不负责后端负载生成。
+// 关闭页面时必须停止计时器与 runner，避免后台进程继续运行。
 class SystemTestPage final : public QWidget {
     Q_OBJECT
 public:
-    explicit SystemTestPage(QWidget *parent = nullptr);
     explicit SystemTestPage(const StressRunConfig &config, QWidget *parent = nullptr);
 
     void shutdown();
@@ -68,6 +69,7 @@ private:
     QLabel *m_backend = nullptr;
     QLabel *m_go = nullptr;
     QLabel *m_budget = nullptr;
+    QLabel *m_chunkSlots = nullptr;
     QLabel *m_bytes = nullptr;
     QTreeWidget *m_history = nullptr;
     QProgressBar *m_countdownBar = nullptr;

@@ -106,6 +106,7 @@ private slots:
     void parsesNestedError();
     void adaptsRealFileShapes();
     void decodesHistoryEnvelopeAndCursor();
+    void parsesUnreadSummary();
     void presenceAndReadReceiptRequests();
     void deletesCurrentAccountOnlyOnNoContent();
     void concurrentUnauthorizedRequestsShareOneRefreshAndPersistBothTokens();
@@ -256,6 +257,43 @@ void ApiClientTest::decodesHistoryEnvelopeAndCursor()
     QCOMPARE(messages.first().content, QStringLiteral("hello"));
     QCOMPARE(messages.first().readAt, qint64(123999));
     QVERIFY(server.requests.first().path.contains("after_id=41"));
+}
+
+void ApiClientTest::parsesUnreadSummary()
+{
+    FakeServer server;
+    QVERIFY(server.start());
+    server.enqueue(200, {{QStringLiteral("data"), QJsonObject{
+        {QStringLiteral("unread"), QJsonArray{
+            QJsonObject{{QStringLiteral("peer_id"), QStringLiteral("peer-a")},
+                        {QStringLiteral("unread_count"), 3},
+                        {QStringLiteral("last_message_at"), 1760000000123LL}},
+            QJsonObject{{QStringLiteral("peer_id"), QStringLiteral("peer-b")},
+                        {QStringLiteral("unread_count"), QStringLiteral("2")},
+                        {QStringLiteral("last_message_at"), QStringLiteral("1760000000456")}}
+        }}}}});
+    ApiClient api;
+    api.setServerUrl(server.url());
+    api.setAccessToken(QStringLiteral("access-token"));
+    bool done = false;
+    QList<UnreadSummary> summaries;
+    api.unread([&](bool ok, const QList<UnreadSummary> &result, const QString &error) {
+        QVERIFY2(ok, qPrintable(error));
+        summaries = result;
+        done = true;
+    });
+    QTRY_VERIFY_WITH_TIMEOUT(done, 3000);
+    QCOMPARE(summaries.size(), 2);
+    QCOMPARE(summaries.at(0).peerId, QStringLiteral("peer-a"));
+    QCOMPARE(summaries.at(0).unreadCount, 3);
+    QCOMPARE(summaries.at(0).lastMessageAt, 1760000000123LL);
+    QCOMPARE(summaries.at(1).peerId, QStringLiteral("peer-b"));
+    QCOMPARE(summaries.at(1).unreadCount, 2);
+    QCOMPARE(summaries.at(1).lastMessageAt, 1760000000456LL);
+    QCOMPARE(server.requests.size(), 1);
+    QCOMPARE(server.requests.first().method, QByteArray("GET"));
+    QCOMPARE(server.requests.first().path, QByteArray("/api/v1/messages/unread"));
+    QCOMPARE(server.requests.first().authorization, QByteArray("Bearer access-token"));
 }
 
 void ApiClientTest::presenceAndReadReceiptRequests()

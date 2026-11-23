@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Secure IM 压测报告 - {{.Summary.RunID}}</title>
+<style>
+@page{size:A4;margin:12mm 11mm}
+*{box-sizing:border-box}
+body{max-width:1000px;margin:0 auto;padding:20px;color:#202124;background:#fff;font-family:"Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;font-size:14px;line-height:1.45}
+header{margin-bottom:12px;padding-bottom:10px;border-bottom:2px solid #3658d2}
+h1{margin:0 0 6px;font-size:22px;line-height:1.3}
+.meta{margin:3px 0;color:#4b5563}
+h2{margin:14px 0 6px;font-size:17px;line-height:1.35;break-after:avoid;page-break-after:avoid}
+.status{display:inline-block;margin:10px 0 4px;padding:4px 10px;border-radius:4px;font-weight:700}
+.conclusion{margin:4px 0 8px;overflow-wrap:anywhere}
+.success{color:#087f23;background:#edf8ef}
+.failure{color:#b3261e;background:#fff0ef}
+.fluctuation{color:#8a5a00;background:#fff7df}
+table{width:100%;margin:0 0 8px;border-collapse:collapse;table-layout:fixed}
+thead{display:table-header-group}
+tr{break-inside:avoid;page-break-inside:avoid}
+tbody tr:nth-child(even){background:#f5f7fa}
+th,td{padding:6px 8px;border:1px solid #ccd2da;text-align:left;vertical-align:top;line-height:1.45;overflow-wrap:anywhere;word-break:break-word}
+th{background:#eaf0f8;font-weight:600}
+tbody tr:nth-child(even) th{background:#e3eaf3}
+.rules th:first-child{width:76%}
+.rules td:last-child{font-weight:700}
+code,.run-id{overflow-wrap:anywhere;word-break:break-all}
+.attachments{margin:10px 0 0;font-size:13px}
+a{color:#2748a8}
+@media print{
+body{max-width:none;padding:0;font-size:14px}
+header{margin-bottom:10px}
+h2{margin-top:12px}
+a{color:inherit;text-decoration:none}
+.attachments{break-inside:avoid;page-break-inside:avoid}
+}
+</style>
+</head>
+<body>
+<header>
+<h1>Secure IM 压测报告</h1>
+<p class="meta">运行编号：<code class="run-id">{{.Summary.RunID}}</code></p>
+<p class="meta">生成时间：{{.Generated.Format "2006-01-02T15:04:05Z07:00"}}</p>
+</header>
+<main>
+<h2 class="status {{.Summary.Status}}">{{status .Summary.Status}}</h2>
+<p class="conclusion">{{.Summary.Result.Conclusion}}</p>
+<section>
+<h2>负载配置</h2>
+<table>
+<tbody>
+<tr><th>目标连接数</th><td>{{.Summary.Target}}</td><th>用户分配（挂机/聊天/文件）</th><td>{{.Summary.Allocation.Idle}} / {{.Summary.Allocation.Chat}} / {{.Summary.Allocation.File}}</td></tr>
+<tr><th>稳定时长</th><td>{{.Config.StableDuration}}</td><th>聊天速率</th><td>{{.Config.ChatRate}} 条/秒/用户</td></tr>
+<tr><th>单文件大小/分块大小</th><td>{{.Config.FileSize}} 字节 / {{.Config.ChunkSize}} 字节</td><th>文件工作线程/内存预算</th><td>{{.Config.FileWorkers}} / {{.Config.FileBudgetMiB}} MiB</td></tr>
+</tbody>
+</table>
+</section>
+<section>
+<h2>判定规则</h2>
+<table class="rules">
+<thead><tr><th>规则</th><th>结果</th></tr></thead>
+<tbody>{{range $name,$ok := .Summary.Result.Criteria}}<tr><td>{{criterion $name}}</td><td>{{if $ok}}通过{{else}}未通过{{end}}</td></tr>{{end}}</tbody>
+</table>
+</section>
+<section>
+<h2>指标汇总</h2>
+<table>
+<tbody>
+<tr><th>消息发送/送达/丢失/重复</th><td colspan="3">{{.Summary.Totals.MessagesSent}} / {{.Summary.Totals.MessagesDelivered}} / {{.Summary.Totals.MessageLost}} / {{.Summary.Totals.MessageDuplicates}}</td></tr>
+<tr><th>ACK P95/P99（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.AckP95MS}} / {{printf "%.3f" .Summary.Totals.AckP99MS}}</td><th>投递P95（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.DeliveryP95MS}}</td></tr>
+<tr><th>文件完成/失败/字节数</th><td>{{.Summary.Totals.FilesCompleted}} / {{.Summary.Totals.FilesFailed}} / {{.Summary.Totals.BytesCompleted}}</td><th>文件排队P95（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.FileQueueP95MS}}</td></tr>
+<tr><th>后端RSS峰值（MiB）/CPU峰值（%）</th><td>{{optional .Summary.BackendRSSMaxMiB}} / {{optional .Summary.BackendCPUMax}}</td><th>文件预算峰值/上限（MiB）</th><td>{{if .Summary.Totals.FileBudgetKnown}}{{printf "%.3f" .Summary.Totals.FileBudgetHighMiB}} / {{printf "%.3f" .Summary.Totals.FileBudgetLimitMiB}}{{else}}未知{{end}}</td></tr>
+<tr><th>稳定在线平均/最低</th><td>{{printf "%.2f" .Summary.Totals.StableOnlineAverage}} / {{.Summary.Totals.StableOnlineMin}}</td><th>重连/连接失败/健康检查失败</th><td>{{.Summary.Totals.Reconnects}} / {{.Summary.Totals.ConnectionFailed}} / {{.Summary.Totals.HealthFailures}}</td></tr>
+<tr><th>分块通道已用/上限（最后有效采样）</th><td colspan="3">{{optionalInt64 .ChunkSlotsUsed}} / {{optionalInt64 .ChunkSlotsLimit}}</td></tr>
+</tbody>
+</table>
+</section>
+</main>
+<p class="attachments">详细每秒数据见 <a href="metrics.csv">metrics.csv</a>；原始汇总见 <a href="summary.json">summary.json</a>。</p>
+</body>
+</html>

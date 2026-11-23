@@ -65,7 +65,7 @@ func TestTransferUsesInitChunkLayout(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	pool := NewFilePool(cfg, NewAPIClient(server.URL), NewMetrics("layout", 500), 1, func(err error) { t.Error(err) })
+	pool := NewFilePool(cfg, NewAPIClient(server.URL), NewMetrics("layout", 500), 1, func(err error) { t.Error(err) }, nil)
 	if err := pool.transfer(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestTransferCompletedStatusSkipsUploadWithoutInstant(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	pool := NewFilePool(cfg, NewAPIClient(server.URL), NewMetrics("completed", 500), 1, func(err error) { t.Error(err) })
+	pool := NewFilePool(cfg, NewAPIClient(server.URL), NewMetrics("completed", 500), 1, func(err error) { t.Error(err) }, nil)
 	if err := pool.transfer(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}

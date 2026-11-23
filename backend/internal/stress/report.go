@@ -1,6 +1,7 @@
 package stress
 
 import (
+	_ "embed"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -29,11 +30,12 @@ type Result struct {
 	Bottlenecks []string        `json:"bottlenecks"`
 }
 
+// Evaluate 按连接、消息、文件、延迟、资源和数据完整性判定成功、波动或失败，未知指标不会被伪造为正常值。
 func Evaluate(cfg Config, t Totals, f RunFacts) Result {
 	connections := t.StableSamples > 0 && t.StableOnlineAverage >= float64(cfg.Target)*.99
 	messages := t.MessagesSent == 0 || float64(t.MessagesDelivered)/float64(t.MessagesSent) >= .999
 	allocation, _ := Allocate(cfg.Target, cfg.IdlePercent, cfg.ChatPercent, cfg.FilePercent)
-	files := t.FilesFailed == 0 && (allocation.File == 0 || t.FilesCompleted > 0) && f.Drained
+	files := t.FilesFailed == 0 && (allocation.File == 0 || t.FilesCompleted == int64(allocation.File)) && f.Drained
 	budget := !t.FileBudgetKnown || t.FileBudgetHighMiB <= float64(cfg.FileBudgetMiB)
 	latency := t.AckP95MS <= 2000 && t.AckP99MS <= 5000
 	resource := f.BackendRSSMaxMiB == nil || *f.BackendRSSMaxMiB <= float64(cfg.BackendMemoryLimitMiB)
@@ -102,10 +104,19 @@ func Evaluate(cfg Config, t Totals, f RunFacts) Result {
 	if t.Reconnects > 0 {
 		r.Bottlenecks = append(r.Bottlenecks, "检查慢消费者断连、代理超时和后端WebSocket错误")
 	}
-	if t.FilesFailed > 0 {
+	reason := strings.ToLower(f.FailureReason)
+	downloadTimeout := strings.Contains(reason, "download") && strings.Contains(reason, "i/o timeout")
+	messageRejected := strings.Contains(reason, "message_rejected")
+	if downloadTimeout {
+		r.Bottlenecks = append(r.Bottlenecks, "文件下载发生i/o timeout：按文件ID检查下载读/写空闲超时、客户端断开及MinIO读取，不要按总下载时长强制断连")
+	}
+	if messageRejected {
+		r.Bottlenecks = append(r.Bottlenecks, "消息被服务端message_rejected：按ERROR中的message_id关联后端日志，检查recipient校验、会话查询/创建、消息写入或重复查询阶段及原始SQL错误")
+	}
+	if t.FilesFailed > 0 && !downloadTimeout {
 		r.Bottlenecks = append(r.Bottlenecks, "检查文件active限制、分块校验和对象存储错误")
 	}
-	if t.MessageLost > 0 {
+	if t.MessageLost > 0 && !messageRejected {
 		r.Bottlenecks = append(r.Bottlenecks, "检查ACK/推送丢失、连接重连和消息唯一索引")
 	}
 	if len(r.Bottlenecks) == 0 {
@@ -114,7 +125,7 @@ func Evaluate(cfg Config, t Totals, f RunFacts) Result {
 	if f.BackendRSSMaxMiB == nil || !t.FileBudgetKnown {
 		r.Bottlenecks = append(r.Bottlenecks, "后端/docker资源或文件预算数据未知，不纳入伪造统计；请提供/debug/stats及docker权限")
 	}
-	r.Conclusion = fmt.Sprintf("状态=%s；%s。建议：%s", r.Status, r.Reason, strings.Join(r.Bottlenecks, "；"))
+	r.Conclusion = fmt.Sprintf("状态=%s；%s。建议：%s", statusText(r.Status), r.Reason, strings.Join(r.Bottlenecks, "；"))
 	return r
 }
 
@@ -133,12 +144,13 @@ type Summary struct {
 }
 
 type Report struct {
-	mu      sync.Mutex
-	Dir     string
-	runID   string
-	started time.Time
-	csvFile *os.File
-	csv     *csv.Writer
+	mu                                      sync.Mutex
+	Dir                                     string
+	runID                                   string
+	started                                 time.Time
+	csvFile                                 *os.File
+	csv                                     *csv.Writer
+	lastChunkSlotsUsed, lastChunkSlotsLimit *int64
 }
 
 func NewReport(root, runID string, cfg Config) (*Report, error) {
@@ -166,7 +178,7 @@ func NewReport(root, runID string, cfg Config) (*Report, error) {
 }
 
 func (r *Report) writeHeader() error {
-	return r.csv.Write([]string{"timestamp", "phase", "target", "online", "connection_failed", "reconnects", "messages_sent", "messages_delivered", "message_duplicates", "message_lost", "ack_p95_ms", "ack_p99_ms", "delivery_p95_ms", "files_queued", "files_active", "files_completed", "files_failed", "bytes_completed", "file_mib_per_sec", "file_queue_p95_ms", "backend_rss_mib", "backend_cpu_percent", "go_heap_mib", "goroutines", "file_budget_used_mib", "file_budget_limit_mib"})
+	return r.csv.Write([]string{"timestamp", "phase", "target", "online", "connection_failed", "reconnects", "messages_sent", "messages_delivered", "message_duplicates", "message_lost", "ack_p95_ms", "ack_p99_ms", "delivery_p95_ms", "files_queued", "files_active", "files_completed", "files_failed", "bytes_completed", "file_mib_per_sec", "file_queue_p95_ms", "backend_rss_mib", "backend_cpu_percent", "go_heap_mib", "goroutines", "file_budget_used_mib", "file_budget_limit_mib", "file_chunk_slots_used", "file_chunk_slots_limit"})
 }
 
 func optional(v *float64) string {
@@ -183,10 +195,21 @@ func optionalInt(v *int) string {
 	return strconv.Itoa(*v)
 }
 
+func optionalInt64(v *int64) string {
+	if v == nil {
+		return "unknown"
+	}
+	return strconv.FormatInt(*v, 10)
+}
+
 func (r *Report) AddProgress(p Progress) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	err := r.csv.Write([]string{p.Timestamp.Format(time.RFC3339Nano), p.Phase, strconv.Itoa(p.Target), strconv.FormatInt(p.Online, 10), strconv.FormatInt(p.ConnectionFailed, 10), strconv.FormatInt(p.Reconnects, 10), strconv.FormatInt(p.MessagesSent, 10), strconv.FormatInt(p.MessagesDelivered, 10), strconv.FormatInt(p.MessageDuplicates, 10), strconv.FormatInt(p.MessageLost, 10), number(p.AckP95MS), number(p.AckP99MS), number(p.DeliveryP95MS), strconv.FormatInt(p.FilesQueued, 10), strconv.FormatInt(p.FilesActive, 10), strconv.FormatInt(p.FilesCompleted, 10), strconv.FormatInt(p.FilesFailed, 10), strconv.FormatInt(p.BytesCompleted, 10), number(p.FileMiBPerSec), number(p.FileQueueP95MS), optional(p.BackendRSSMiB), optional(p.BackendCPUPercent), optional(p.GoHeapMiB), optionalInt(p.Goroutines), optional(p.FileBudgetUsedMiB), optional(p.FileBudgetLimitMiB)})
+	if p.FileChunkSlotsUsed != nil && p.FileChunkSlotsLimit != nil {
+		r.lastChunkSlotsUsed = cloneInt64(p.FileChunkSlotsUsed)
+		r.lastChunkSlotsLimit = cloneInt64(p.FileChunkSlotsLimit)
+	}
+	err := r.csv.Write([]string{p.Timestamp.Format(time.RFC3339Nano), p.Phase, strconv.Itoa(p.Target), strconv.FormatInt(p.Online, 10), strconv.FormatInt(p.ConnectionFailed, 10), strconv.FormatInt(p.Reconnects, 10), strconv.FormatInt(p.MessagesSent, 10), strconv.FormatInt(p.MessagesDelivered, 10), strconv.FormatInt(p.MessageDuplicates, 10), strconv.FormatInt(p.MessageLost, 10), number(p.AckP95MS), number(p.AckP99MS), number(p.DeliveryP95MS), strconv.FormatInt(p.FilesQueued, 10), strconv.FormatInt(p.FilesActive, 10), strconv.FormatInt(p.FilesCompleted, 10), strconv.FormatInt(p.FilesFailed, 10), strconv.FormatInt(p.BytesCompleted, 10), number(p.FileMiBPerSec), number(p.FileQueueP95MS), optional(p.BackendRSSMiB), optional(p.BackendCPUPercent), optional(p.GoHeapMiB), optionalInt(p.Goroutines), optional(p.FileBudgetUsedMiB), optional(p.FileBudgetLimitMiB), optionalInt64(p.FileChunkSlotsUsed), optionalInt64(p.FileChunkSlotsLimit)})
 	r.csv.Flush()
 	if err == nil {
 		err = r.csv.Error()
@@ -216,10 +239,11 @@ func (r *Report) Finalize(cfg Config, allocation Allocation, totals Totals, fact
 	}
 	var page strings.Builder
 	err = reportTemplate.Execute(&page, struct {
-		Summary   Summary
-		Config    Config
-		Generated time.Time
-	}{summary, cfg, time.Now().UTC()})
+		Summary                         Summary
+		Config                          Config
+		Generated                       time.Time
+		ChunkSlotsUsed, ChunkSlotsLimit *int64
+	}{summary, cfg, time.Now().UTC(), r.lastChunkSlotsUsed, r.lastChunkSlotsLimit})
 	if err != nil {
 		return summary, err
 	}
@@ -239,18 +263,58 @@ func (r *Report) Close() {
 	r.mu.Unlock()
 }
 
-var reportTemplate = template.Must(template.New("report").Funcs(template.FuncMap{"optional": optional}).Parse(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>Stress {{.Summary.RunID}}</title>
-<style>body{font-family:system-ui;margin:2rem;color:#202124}table{border-collapse:collapse;margin:1rem 0}td,th{border:1px solid #ccc;padding:.45rem .7rem;text-align:left}.success{color:#087f23}.failure{color:#b3261e}.fluctuation{color:#9a6700}code{word-break:break-all}</style></head>
-<body><h1>Secure IM 压测报告</h1><p>Run ID: <code>{{.Summary.RunID}}</code></p><p>生成时间: {{.Generated.Format "2006-01-02T15:04:05Z07:00"}}</p>
-<h2 class="{{.Summary.Status}}">{{.Summary.Status}}</h2><p>{{.Summary.Result.Conclusion}}</p>
-<h2>负载</h2><table><tr><th>目标</th><td>{{.Summary.Target}}</td><th>挂机/聊天/文件</th><td>{{.Summary.Allocation.Idle}} / {{.Summary.Allocation.Chat}} / {{.Summary.Allocation.File}}</td></tr>
-<tr><th>稳定时长</th><td>{{.Config.StableDuration}}</td><th>聊天速率</th><td>{{.Config.ChatRate}} 条/s/user</td></tr>
-<tr><th>文件</th><td>{{.Config.FileSize}} bytes / {{.Config.ChunkSize}} bytes chunks</td><th>worker/预算</th><td>{{.Config.FileWorkers}} / {{.Config.FileBudgetMiB}} MiB</td></tr></table>
-<h2>判定</h2><table><tr><th>规则</th><th>结果</th></tr>{{range $name,$ok := .Summary.Result.Criteria}}<tr><td>{{$name}}</td><td>{{if $ok}}PASS{{else}}FAIL{{end}}</td></tr>{{end}}</table>
-<h2>指标</h2><table><tr><th>消息 sent/delivered/lost/duplicates</th><td>{{.Summary.Totals.MessagesSent}} / {{.Summary.Totals.MessagesDelivered}} / {{.Summary.Totals.MessageLost}} / {{.Summary.Totals.MessageDuplicates}}</td></tr>
-<tr><th>ACK P95/P99 ms</th><td>{{printf "%.3f" .Summary.Totals.AckP95MS}} / {{printf "%.3f" .Summary.Totals.AckP99MS}}</td><th>投递 P95 ms</th><td>{{printf "%.3f" .Summary.Totals.DeliveryP95MS}}</td></tr>
-<tr><th>文件 completed/failed/bytes</th><td>{{.Summary.Totals.FilesCompleted}} / {{.Summary.Totals.FilesFailed}} / {{.Summary.Totals.BytesCompleted}}</td><th>排队 P95 ms</th><td>{{printf "%.3f" .Summary.Totals.FileQueueP95MS}}</td></tr>
-<tr><th>后端 RSS max MiB / CPU max %</th><td>{{optional .Summary.BackendRSSMaxMiB}} / {{optional .Summary.BackendCPUMax}}</td><th>文件预算 high/limit MiB</th><td>{{if .Summary.Totals.FileBudgetKnown}}{{printf "%.3f" .Summary.Totals.FileBudgetHighMiB}} / {{printf "%.3f" .Summary.Totals.FileBudgetLimitMiB}}{{else}}unknown{{end}}</td></tr>
-<tr><th>稳定在线 avg/min</th><td>{{printf "%.2f" .Summary.Totals.StableOnlineAverage}} / {{.Summary.Totals.StableOnlineMin}}</td><th>重连/连接失败/健康失败</th><td>{{.Summary.Totals.Reconnects}} / {{.Summary.Totals.ConnectionFailed}} / {{.Summary.Totals.HealthFailures}}</td></tr></table>
-<p>详细每秒数据见 <a href="metrics.csv">metrics.csv</a>；原始汇总见 <a href="summary.json">summary.json</a>。</p></body></html>`))
+func statusText(status string) string {
+	switch status {
+	case "success":
+		return "成功"
+	case "fluctuation":
+		return "波动"
+	case "failure":
+		return "失败"
+	default:
+		return status
+	}
+}
+
+var criterionNames = map[string]string{
+	"stable_duration":        "稳定时长完整且未中断",
+	"connections_99_percent": "稳定期在线连接达到目标的99%",
+	"messages_99_9_percent":  "消息投递率达到99.9%",
+	"files_100_percent":      "计划文件全部完成且队列排空",
+	"ack_latency":            "ACK延迟达标",
+	"no_health_failure":      "无后端健康检查失败",
+	"no_abnormal_duplicates": "无异常重复消息",
+	"backend_memory_limit":   "后端内存未超限",
+	"file_budget":            "文件内存预算未超限",
+	"data_integrity":         "数据完整性校验通过",
+	"cleanup":                "测试数据清理成功",
+}
+
+func criterionText(name string) string {
+	if text := criterionNames[name]; text != "" {
+		return text
+	}
+	return name
+}
+
+func displayOptional(value *float64) string {
+	if value == nil {
+		return "未知"
+	}
+	return optional(value)
+}
+
+func displayOptionalInt64(value *int64) string {
+	if value == nil {
+		return "未知"
+	}
+	return optionalInt64(value)
+}
+
+//go:embed report.html.tmpl
+var reportHTML string
+
+var reportTemplate = template.Must(template.New("report").Funcs(template.FuncMap{
+	"status": statusText, "criterion": criterionText,
+	"optional": displayOptional, "optionalInt64": displayOptionalInt64,
+}).Parse(reportHTML))

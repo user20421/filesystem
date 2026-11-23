@@ -24,12 +24,8 @@ type Handler struct {
 	slots    chan struct{}
 }
 
-func NewHandler(service *Service, tickets *TicketStore, hub *Hub, log *slog.Logger, maxConnections ...int) *Handler {
-	limit := 1000
-	if len(maxConnections) > 0 && maxConnections[0] > 0 {
-		limit = maxConnections[0]
-	}
-	h := &Handler{service: service, tickets: tickets, hub: hub, log: log, slots: make(chan struct{}, limit)}
+func NewHandler(service *Service, tickets *TicketStore, hub *Hub, log *slog.Logger, maxConnections int) *Handler {
+	h := &Handler{service: service, tickets: tickets, hub: hub, log: log, slots: make(chan struct{}, maxConnections)}
 	h.upgrader = websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
 		if origin == "" {
@@ -80,6 +76,15 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	h.hub.Publish(receipt.PeerID, event)
 	h.hub.Publish(readerID, event)
 	httpx.Data(w, 200, receipt)
+}
+
+func (h *Handler) Unread(w http.ResponseWriter, r *http.Request) {
+	items, err := h.service.Unread(r.Context(), auth.UserID(r.Context()))
+	if err != nil {
+		httpx.Fail(w, r, err)
+		return
+	}
+	httpx.Data(w, 200, map[string]any{"unread": items})
 }
 
 func (h *Handler) History(w http.ResponseWriter, r *http.Request) {
@@ -139,13 +144,13 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if kind != websocket.BinaryMessage {
-			h.sendError(c, "invalid_frame", "binary protobuf frames required")
+			h.sendError(c, "invalid_frame", "binary protobuf frames required", "")
 			continue
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(75 * time.Second))
 		e := &impb.Envelope{}
 		if err := proto.Unmarshal(data, e); err != nil {
-			h.sendError(c, "invalid_envelope", "invalid protobuf envelope")
+			h.sendError(c, "invalid_envelope", "invalid protobuf envelope", "")
 			continue
 		}
 		if e.Type == impb.Envelope_PING {
@@ -156,8 +161,8 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 		saved, err := h.service.SaveMessage(ctx, userID, e)
 		cancel()
 		if err != nil {
-			h.sendError(c, "message_rejected", "message rejected")
-			h.log.Warn("message rejected", "user_id", userID, "error", err)
+			h.sendError(c, "message_rejected", "message rejected", e.MessageId)
+			h.log.Warn("message rejected", "user_id", userID, "message_id", e.MessageId, "error", err)
 			continue
 		}
 		if !saved.Duplicate {
@@ -168,7 +173,8 @@ func (h *Handler) WebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
-func (h *Handler) sendError(c *client, code, message string) {
+func (h *Handler) sendError(c *client, code, message, messageID string) {
 	payload, _ := proto.Marshal(&impb.ErrorPayload{Code: code, Message: message})
-	c.enqueue(&impb.Envelope{Version: protocolVersion, Type: impb.Envelope_ERROR, Timestamp: time.Now().UnixMilli(), Payload: payload})
+	e := &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_ERROR, MessageId: messageID, Timestamp: time.Now().UnixMilli(), Payload: payload}
+	c.enqueue(e)
 }

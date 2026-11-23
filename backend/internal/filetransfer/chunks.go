@@ -32,8 +32,6 @@ func (s *Service) UploadChunk(ctx context.Context, id, user string, index int, e
 	// while completion is reading them. Different contents remain independent.
 	unlockContent := s.lock("content:" + f.ContentID)
 	defer unlockContent()
-	unlock := s.lock(fmt.Sprintf("chunk:%s:%d", f.ContentID, index))
-	defer unlock()
 	f, err = s.getFile(ctx, id)
 	if err != nil {
 		return err
@@ -78,6 +76,9 @@ func (s *Service) UploadChunk(ctx context.Context, id, user string, index int, e
 	if !hashesEqual(SHA256(plain), expectedSHA) {
 		return httpx.Error(400, "chunk_checksum_mismatch", "chunk SHA256 does not match X-Chunk-SHA256")
 	}
+	// Publish a fresh object before swapping its key into metadata. Failed
+	// transactions remove only the unreferenced new key; the old key remains
+	// valid until commit, and is removed afterward while the content lock is held.
 	key := fmt.Sprintf("contents/%s/%08d-%s", f.ContentID, index, uuid.NewString())
 	if err := s.objects.Put(ctx, key, bytes.NewReader(plain), int64(len(plain))); err != nil {
 		return err
@@ -97,7 +98,7 @@ func (s *Service) UploadChunk(ctx context.Context, id, user string, index int, e
 	defer tx.Rollback()
 	var contentStatus, fileStatus string
 	err = tx.QueryRowContext(ctx, `SELECT c.status,f.status FROM files f JOIN file_contents c ON c.id=f.content_id WHERE f.id=? AND f.content_id=? FOR UPDATE`, id, f.ContentID).Scan(&contentStatus, &fileStatus)
-	if errorsIsNoRows(err) {
+	if err == sql.ErrNoRows {
 		return httpx.Error(404, "file_not_found", "file not found")
 	}
 	if err != nil {
@@ -134,8 +135,6 @@ func (s *Service) UploadChunk(ctx context.Context, id, user string, index int, e
 	return nil
 }
 
-func errorsIsNoRows(err error) bool { return err == sql.ErrNoRows }
-
 func (s *Service) chunks(ctx context.Context, contentID string) ([]Chunk, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT chunk_index,object_key,plaintext_size,sha256 FROM file_chunks WHERE content_id=? ORDER BY chunk_index`, contentID)
 	if err != nil {
@@ -162,6 +161,8 @@ func (s *Service) readChunk(ctx context.Context, fileKey string, c Chunk) (plain
 		releaseSlot()
 		return nil, nil, err
 	}
+	// Success transfers both reservations to the caller, which releases them
+	// after consuming plain. Every error path releases them here instead.
 	release = func() {
 		releaseMemory()
 		releaseSlot()

@@ -10,8 +10,7 @@
 
 class SessionPage;
 
-// Owns every piece of per-user state. No ApiClient, token, store, codec or lock
-// is shared between tabs or with another SessionContext.
+// SessionContext 独立持有一个用户的目录锁、令牌、存储、API 和编解码器，任何资源都不得跨用户共享。
 class SessionContext final : public QObject {
     Q_OBJECT
 public:
@@ -21,7 +20,6 @@ public:
 
     bool open(QString *error = nullptr);
     bool isOpen() const { return m_open; }
-    bool isClosing() const { return m_closing; }
     QString dataDir() const { return m_store->root().absolutePath(); }
     QString preferredUsername() const { return m_preferredUsername; }
     LocalStore *store() const { return m_store; }
@@ -29,7 +27,6 @@ public:
     WireCodec *codec() const { return m_codec.get(); }
     const AuthSession &session() const { return m_session; }
     void setSession(const AuthSession &session);
-    SessionPage *page() const { return m_page; }
     void shutdown();
 
 private:

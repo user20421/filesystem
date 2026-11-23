@@ -28,6 +28,7 @@ func newMemoryBudget(limit int64) *memoryBudget {
 // acquire reserves weight bytes without ever allowing used to exceed limit.
 // The returned release function is idempotent and must be called when all
 // buffers covered by the reservation are no longer in use.
+// acquire 按分块权重预留内存，绝不超过预算；返回的释放函数幂等，并负责唤醒等待中的分块操作。
 func (b *memoryBudget) acquire(ctx context.Context, weight int64) (func(), error) {
 	if weight < 0 {
 		return nil, fmt.Errorf("negative file memory reservation")

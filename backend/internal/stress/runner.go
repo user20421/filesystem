@@ -59,6 +59,7 @@ func (r *Runner) badData(err error) {
 	r.factMu.Unlock()
 }
 
+// Run 执行完整压测生命周期，任何失败仍尽量生成报告并清理本 run 数据。
 func (r *Runner) Run(ctx context.Context) Final {
 	report, err := NewReport(r.cfg.ReportRoot, r.cfg.RunID, r.cfg)
 	if err != nil {
@@ -230,7 +231,8 @@ launchLoop:
 		}
 		if r.allocation.File > 0 {
 			pool = NewFilePool(r.cfg, api, r.metrics, len(users), r.badData, r.fileFailure)
-			pool.Start(runCtx, loadCtx, users)
+			// File production continues through drain; only run cancellation (drain timeout or active stop) aborts it.
+			pool.Start(runCtx, users)
 		}
 		stableTimer := time.NewTimer(r.cfg.StableDuration)
 		select {

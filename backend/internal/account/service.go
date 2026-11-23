@@ -29,6 +29,8 @@ func NewService(db *sql.DB, files fileDeleter, closeUser, revokeTickets func(str
 
 // Delete removes external objects before deleting metadata. If any step fails,
 // the user row remains and the same request can safely resume the deletion.
+// Delete 按“先外部文件、后用户元数据”的顺序注销账号。
+// 任何一步失败都保留用户以便重试；成功后才关闭实时连接、撤销票据并删除凭据。
 func (s *Service) Delete(ctx context.Context, userID string) error {
 	ids, err := s.repo.FileIDs(ctx, userID)
 	if err != nil {

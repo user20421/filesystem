@@ -528,6 +528,7 @@ void ApiClient::cancelRequest(ApiRequestHandle *handle, bool deliverCallback)
         handle->m_reply->disconnect();
 }
 
+// beginRefresh 让同一认证 epoch 的并发 401 共享一次刷新，避免多个请求同时轮换 Refresh Token。
 void ApiClient::beginRefresh()
 {
     if (m_refreshing || m_closing)
@@ -537,6 +538,7 @@ void ApiClient::beginRefresh()
         return;
     }
     m_refreshing = true;
+    // refresh 捕获当前 epoch；显式登录或退出推进 epoch 后，迟到结果不能再覆盖新会话。
     const quint64 epoch = m_authEpoch;
     m_refreshRequest = startRefresh(m_refreshToken, [this, epoch](bool ok, const AuthSession &session,
                                                                  const QString &error) {
@@ -548,6 +550,7 @@ void ApiClient::beginRefresh()
     }
 }
 
+// completeRefresh 只接受当前 epoch 的结果，随后原子保存双令牌并允许原请求重放一次；退出或重新登录后的迟到结果必须丢弃。
 void ApiClient::completeRefresh(bool ok, const AuthSession &session, const QString &error,
                                 quint64 epoch)
 {
@@ -580,6 +583,7 @@ void ApiClient::completeRefresh(bool ok, const AuthSession &session, const QStri
     }
 }
 
+// failAuthentication 使当前 epoch 的请求失效并返回登录页，防止失败回调递归或旧请求重新写回会话。
 void ApiClient::failAuthentication(const QString &error)
 {
     if (m_authFailureInProgress || m_closing)
@@ -686,6 +690,7 @@ ApiRequestHandle *ApiClient::startRefresh(const QString &refreshToken, AuthCallb
     }, false);
 }
 
+// logout 先使旧刷新和等待请求失效，再撤销当前 Refresh Token；若自身遇 401，重放时必须使用轮换后的新令牌。
 ApiRequestHandle *ApiClient::logout(OperationCallback callback)
 {
     if (m_closing || m_loggingOut)
@@ -841,6 +846,30 @@ ApiRequestHandle *ApiClient::messages(const QString &peerId, const QString &afte
             if (message.readAt == 0)
                 message.readAt = integerField(item, {"read_at"});
             result.append(message);
+        }
+        callback(true, result, {});
+    });
+}
+
+ApiRequestHandle *ApiClient::unread(UnreadCallback callback)
+{
+    return jsonRequest(QStringLiteral("GET"), QStringLiteral("/api/v1/messages/unread"), {},
+                       [callback](bool ok, const QByteArray &body, const QString &error) {
+        if (!ok) {
+            callback(false, {}, error);
+            return;
+        }
+        const QJsonArray array = payloadObject(QJsonDocument::fromJson(body).object())
+            .value(QStringLiteral("unread")).toArray();
+        QList<UnreadSummary> result;
+        for (const QJsonValue &value : array) {
+            const QJsonObject item = value.toObject();
+            UnreadSummary summary;
+            summary.peerId = stringField(item, {"peer_id"});
+            summary.unreadCount = static_cast<int>(integerField(item, {"unread_count"}));
+            summary.lastMessageAt = integerField(item, {"last_message_at"});
+            if (!summary.peerId.isEmpty() && summary.unreadCount > 0)
+                result.append(summary);
         }
         callback(true, result, {});
     });

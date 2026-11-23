@@ -27,6 +27,9 @@ struct StressProgress {
     qint64 goroutines = 0;
     double fileBudgetUsedMib = 0.0;
     double fileBudgetLimitMib = 0.0;
+    qint64 fileChunkSlotsUsed = 0;
+    qint64 fileChunkSlotsLimit = 0;
+    bool fileChunkSlotsKnown = false;
 };
 
 struct StressFinal {
@@ -55,10 +58,11 @@ struct StressRunConfig {
     static StressRunConfig forProject(const QString &projectRoot = {});
 };
 
+// StressRunController 管理环境准备与 runner 两阶段进程生命周期。
+// 它负责 NDJSON 粘包解析、停止/终止、最终报告收集和只发一次的结束信号。
 class StressRunController final : public QObject {
     Q_OBJECT
 public:
-    explicit StressRunController(QObject *parent = nullptr);
     explicit StressRunController(const StressRunConfig &config, QObject *parent = nullptr);
     ~StressRunController() override;
 
@@ -66,9 +70,7 @@ public:
     void stop();
     bool isRunning() const;
     bool hasFinal() const { return m_hasFinal; }
-    StressFinal finalResult() const { return m_final; }
     StressRunConfig config() const { return m_config; }
-    QString runnerArgumentsForTests() const;
 
 signals:
     void runStarted();

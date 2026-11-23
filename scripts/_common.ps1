@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -6,6 +6,7 @@ $script:DeployDirectory = Join-Path $script:ProjectRoot 'deploy'
 $script:ComposeFile = Join-Path $script:DeployDirectory 'docker-compose.yml'
 $script:ComposeProject = 'secure-im'
 
+# 优先返回项目根目录 .env，其次返回 deploy/.env；均不存在时返回 $null。
 function Get-EnvironmentFile {
     $rootEnv = Join-Path $script:ProjectRoot '.env'
     $deployEnv = Join-Path $script:DeployDirectory '.env'
@@ -19,6 +20,7 @@ function Get-EnvironmentFile {
     return $null
 }
 
+# 依次检查 Docker CLI、守护进程与 Compose v2，环境不可用时立即报错。
 function Assert-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         throw 'Docker CLI was not found on PATH. Start Docker Desktop and try again.'
@@ -35,6 +37,7 @@ function Assert-Docker {
     }
 }
 
+# 组装正常环境 Compose 参数，并要求存在本地环境文件。
 function Get-DockerComposeArguments {
     param([string[]]$AdditionalArguments)
 
@@ -46,6 +49,7 @@ function Get-DockerComposeArguments {
     return @('compose', '--env-file', $envFile, '-f', $script:ComposeFile, '-p', $script:ComposeProject) + $AdditionalArguments
 }
 
+# 执行 Compose 命令，非零退出码转换为异常，避免启动流程继续误判。
 function Invoke-DockerCompose {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ComposeArguments)
 
@@ -56,6 +60,7 @@ function Invoke-DockerCompose {
     }
 }
 
+# 查询服务容器 ID；-All 同时包含已停止容器。
 function Get-ComposeContainerId {
     param(
         [Parameter(Mandatory = $true)][string]$ServiceName,
@@ -72,6 +77,7 @@ function Get-ComposeContainerId {
     return $containerId
 }
 
+# 返回服务健康状态，容器不存在或无法判断时返回 missing/unknown。
 function Get-ServiceHealth {
     param([Parameter(Mandatory = $true)][string]$ServiceName)
 
@@ -87,6 +93,7 @@ function Get-ServiceHealth {
     return $health
 }
 
+# 轮询 MySQL/MinIO 健康状态，超时后抛出各服务当前状态。
 function Wait-ServiceHealth {
     param([int]$TimeoutSeconds = 180)
 
@@ -112,6 +119,7 @@ function Wait-ServiceHealth {
     throw "Timed out waiting for healthy services: $($statuses -join ', ')."
 }
 
+# 复用运行中 MinIO 镜像的临时客户端，避免额外下载 mc 镜像。
 function Invoke-MinioClient {
     param([Parameter(Mandatory = $true)][string]$Command)
 
@@ -127,6 +135,7 @@ function Invoke-MinioClient {
     }
 }
 
+# 幂等创建私有 Bucket，并验证存在性和匿名访问拒绝。
 function Initialize-MinioBucket {
     Invoke-MinioClient -Command 'mc mb --ignore-existing local/secure-im-files && mc anonymous set none local/secure-im-files'
     Test-MinioBucket
@@ -134,6 +143,7 @@ function Initialize-MinioBucket {
     Write-Host 'MinIO bucket secure-im-files exists and is private.'
 }
 
+# 验证 Bucket 存在且当前凭据可访问。
 function Test-MinioBucket {
     try {
         Invoke-MinioClient -Command 'mc stat local/secure-im-files >/dev/null'
@@ -143,6 +153,7 @@ function Test-MinioBucket {
     }
 }
 
+# 从所选 env 文件读取指定值，文件或键不存在时返回默认值。
 function Get-EnvironmentValue {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -160,6 +171,7 @@ function Get-EnvironmentValue {
     return $DefaultValue
 }
 
+# 匿名访问必须返回 HTTP 403，其他结果均视为 Bucket 权限配置失败。
 function Test-MinioAnonymousAccessDenied {
     $port = Get-EnvironmentValue -Name 'MINIO_API_PORT' -DefaultValue '19000'
     $uri = "http://127.0.0.1:$port/secure-im-files/"
@@ -175,10 +187,12 @@ function Test-MinioAnonymousAccessDenied {
     }
 }
 
+# 返回固定的压测环境文件路径。
 function Get-StressEnvironmentFile {
     return (Join-Path $script:DeployDirectory '.env.stress')
 }
 
+# 读取压测环境变量，缺失时返回调用方提供的默认值。
 function Get-StressEnvironmentValue {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -195,6 +209,7 @@ function Get-StressEnvironmentValue {
     return $DefaultValue
 }
 
+# 按基础 env、压测 env 的顺序组装双环境 Compose 参数。
 function Get-StressDockerComposeArguments {
     param([string[]]$AdditionalArguments)
 
@@ -210,6 +225,7 @@ function Get-StressDockerComposeArguments {
     return @('compose', '--env-file', $envFile, '--env-file', $stressEnv, '-f', $composeFile, '-p', 'secure-im-stress') + $AdditionalArguments
 }
 
+# 执行压测 Compose 并检查退出码，失败时终止后续压测流程。
 function Invoke-StressDockerCompose {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ComposeArguments)
 

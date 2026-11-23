@@ -32,11 +32,6 @@ void WebSocketClient::open(const QUrl &url)
     m_socket.open(url);
 }
 
-void WebSocketClient::close()
-{
-    m_socket.close();
-}
-
 void WebSocketClient::shutdown()
 {
     disconnect(&m_socket, nullptr, this, nullptr);

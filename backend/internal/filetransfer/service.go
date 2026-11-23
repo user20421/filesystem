@@ -15,6 +15,8 @@ type lockEntry struct {
 	mu   sync.Mutex
 	refs int
 }
+
+// Service 协调文件元数据、MinIO 对象、分块调度与内存预算，所有状态仅在单进程内统一管理。
 type Service struct {
 	db                *sql.DB
 	objects           ObjectStore
@@ -37,6 +39,11 @@ func NewServiceWithMemoryBudget(db *sql.DB, objects ObjectStore, maxActive int, 
 func (s *Service) MemoryStats() (used, limit int64) {
 	return s.memory.stats()
 }
+func (s *Service) ChunkSlotStats() (used, limit int) {
+	return s.scheduler.Stats()
+}
+
+// lock 提供带引用计数的键锁，最后一个使用者释放后才删除键，返回的函数必须调用以解除锁。
 func (s *Service) lock(key string) func() {
 	s.lockMu.Lock()
 	entry := s.locks[key]
@@ -66,6 +73,8 @@ type InitInput struct {
 	ChunkSize   int64
 }
 
+// Init 创建逻辑文件引用并复用已有内容：(size,sha256) 是内容身份，引用增加和文件创建必须在同一事务完成。
+// 只有 ready 内容才直接秒传；提交后重新读取最终状态，因为其他引用可能恰好完成内容。
 func (s *Service) Init(ctx context.Context, owner string, in InitInput) (File, error) {
 	if !validateName(in.Name) {
 		return File{}, httpx.Error(400, "invalid_filename", "filename must be a clean 1-255 byte base name")
@@ -101,15 +110,16 @@ func (s *Service) Init(ctx context.Context, owner string, in InitInput) (File, e
 		return File{}, err
 	}
 	defer tx.Rollback()
+	// The insert and row lock serialize creators of the same content identity.
+	// Keep that lock through reference insertion so instant reuse and ref_count
+	// are committed from one consistent content state.
 	contentID := uuid.NewString()
 	_, err = tx.ExecContext(ctx, `INSERT INTO file_contents(id,size,sha256,chunk_size,chunk_count) VALUES(?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id`, contentID, in.Size, in.SHA256, in.ChunkSize, int((in.Size+in.ChunkSize-1)/in.ChunkSize))
 	if err != nil {
 		return File{}, err
 	}
 	var status string
-	var storedChunkSize int64
-	var storedChunkCount int
-	err = tx.QueryRowContext(ctx, `SELECT id,status,chunk_size,chunk_count FROM file_contents WHERE size=? AND sha256=? FOR UPDATE`, in.Size, in.SHA256).Scan(&contentID, &status, &storedChunkSize, &storedChunkCount)
+	err = tx.QueryRowContext(ctx, `SELECT id,status FROM file_contents WHERE size=? AND sha256=? FOR UPDATE`, in.Size, in.SHA256).Scan(&contentID, &status)
 	if err != nil {
 		return File{}, err
 	}
@@ -139,6 +149,8 @@ func (s *Service) Init(ctx context.Context, owner string, in InitInput) (File, e
 	if err != nil {
 		return f, err
 	}
+	// 秒传标记必须取提交后的最终状态：同一事务只新增逻辑引用，只有 ready 内容才能跳过分块上传。
+	// Derive instant from the final committed file state, not the earlier lock probe.
 	f.Instant = f.Status == "completed"
 	return f, nil
 }

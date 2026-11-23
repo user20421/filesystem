@@ -31,7 +31,7 @@ QLabel#stressTitle { color: #263c72; font-size: 25px; font-weight: 700; }
 QLabel#stressPhaseLabel { color: #4666dd; background: #edf2ff; border: 1px solid #d9e2fb; border-radius: 11px; padding: 6px 12px; font-weight: 600; }
 QLabel#stressDistributionLabel { color: #536784; font-size: 12px; }
 QLabel#stressResourceLabel { color: #73829a; background: #f7f9fc; border-radius: 7px; padding: 7px 9px; font-size: 12px; }
-QLabel[metricValue="true"] { color: #253c67; font-size: 20px; font-weight: 650; }
+QLabel[metricValue="true"] { color: #253c67; font-size: 18px; font-weight: 650; }
 QLabel#stressConclusionLabel { border-radius: 9px; padding: 7px 13px; font-size: 15px; font-weight: 650; }
 QLabel#stressConclusionLabel[state="idle"] { color: #64748b; background: #f0f3f7; }
 QLabel#stressConclusionLabel[state="running"] { color: #3564c8; background: #eaf1ff; }
@@ -97,12 +97,6 @@ QProgressBar#transferProgress[state="paused"]::chunk { background: #d8a43e; }
 QProgressBar#transferProgress[state="completed"]::chunk { background: #42ad84; }
 QProgressBar#transferProgress[state="failed"]::chunk { background: #dd7070; }
 QProgressBar#transferProgress[state="cancelled"]::chunk { background: #a5afbd; }
-QTabWidget::pane { border: none; background: #f4f7fb; }
-QTabBar { background: #f4f7fb; }
-QTabBar::tab { background: #e9eef6; color: #65758f; border: 1px solid #e0e6f0; border-bottom: none; border-top-left-radius: 9px; border-top-right-radius: 9px; padding: 10px 18px; margin-right: 4px; min-width: 105px; }
-QTabBar::tab:hover { background: #f5f7ff; color: #4666dd; }
-QTabBar::tab:selected { background: #ffffff; color: #3658d2; font-weight: 600; }
-QToolButton#addTabButton { font-size: 20px; font-weight: 400; padding: 3px 11px; margin: 3px; }
 QSplitter::handle { background: transparent; width: 8px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #cbd4e2; border-radius: 4px; min-height: 28px; }

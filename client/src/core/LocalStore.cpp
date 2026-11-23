@@ -22,7 +22,13 @@ QJsonObject messageToJson(const ChatMessage &message)
             {QStringLiteral("file_name"), message.fileName},
             {QStringLiteral("size"), message.fileSize},
             {QStringLiteral("timestamp"), message.timestamp},
-            {QStringLiteral("read_at"), message.readAt}};
+            {QStringLiteral("read_at"), message.readAt},
+            {QStringLiteral("pending"), message.pending},
+            {QStringLiteral("acked"), message.acked},
+            {QStringLiteral("failed"), message.failed},
+            {QStringLiteral("attempt_count"), message.attemptCount},
+            {QStringLiteral("next_attempt_at"), message.nextAttemptAt},
+            {QStringLiteral("delivery_error"), message.deliveryError}};
 }
 
 ChatMessage messageFromJson(const QJsonObject &object)
@@ -40,7 +46,72 @@ ChatMessage messageFromJson(const QJsonObject &object)
     message.fileSize = object.value(QStringLiteral("size")).toVariant().toLongLong();
     message.timestamp = object.value(QStringLiteral("timestamp")).toVariant().toLongLong();
     message.readAt = object.value(QStringLiteral("read_at")).toVariant().toLongLong();
+    message.pending = object.value(QStringLiteral("pending")).toBool(false);
+    message.acked = object.value(QStringLiteral("acked")).toBool(false);
+    message.failed = object.value(QStringLiteral("failed")).toBool(false);
+    message.attemptCount = object.value(QStringLiteral("attempt_count")).toInt(0);
+    message.nextAttemptAt = object.value(QStringLiteral("next_attempt_at")).toVariant().toLongLong();
+    message.deliveryError = object.value(QStringLiteral("delivery_error")).toString();
     return message;
+}
+
+ChatMessage mergeMessage(const ChatMessage &existing, const ChatMessage &incoming)
+{
+    ChatMessage update = incoming;
+    bool incomingCursorOk = false;
+    bool existingCursorOk = false;
+    const qulonglong incomingCursor = incoming.cursor.toULongLong(&incomingCursorOk);
+    const qulonglong existingCursor = existing.cursor.toULongLong(&existingCursorOk);
+    if (update.cursor.isEmpty()
+        || (incomingCursorOk && existingCursorOk && existingCursor > incomingCursor))
+        update.cursor = existing.cursor;
+    if (update.conversationId.isEmpty())
+        update.conversationId = existing.conversationId;
+    if (update.senderId.isEmpty())
+        update.senderId = existing.senderId;
+    if (update.recipientId.isEmpty())
+        update.recipientId = existing.recipientId;
+    if (update.kind.isEmpty()
+        || (existing.isFile() && incoming.fileId.isEmpty() && incoming.content.isEmpty()))
+        update.kind = existing.kind;
+    if (update.content.isEmpty())
+        update.content = existing.content;
+    if (update.fileId.isEmpty())
+        update.fileId = existing.fileId;
+    if (update.fileName.isEmpty())
+        update.fileName = existing.fileName;
+    if (update.fileSize == 0)
+        update.fileSize = existing.fileSize;
+    if (update.timestamp == 0)
+        update.timestamp = existing.timestamp;
+    update.readAt = qMax(update.readAt, existing.readAt);
+    update.attemptCount = qMax(update.attemptCount, existing.attemptCount);
+
+    // ACK is terminal for transport retries. ERROR is terminal until an
+    // explicit restart recovery, a late ACK, or an authoritative history row.
+    if (existing.acked || incoming.acked) {
+        update.acked = true;
+        update.pending = false;
+        update.failed = false;
+        update.nextAttemptAt = 0;
+        update.deliveryError.clear();
+    } else if (existing.failed || incoming.failed) {
+        update.acked = false;
+        update.pending = false;
+        update.failed = true;
+        update.nextAttemptAt = 0;
+        if (!incoming.failed || incoming.deliveryError.isEmpty())
+            update.deliveryError = existing.deliveryError;
+    } else {
+        update.acked = false;
+        update.failed = false;
+        update.pending = existing.pending || incoming.pending;
+        if (incoming.nextAttemptAt <= 0 || incoming.attemptCount < existing.attemptCount)
+            update.nextAttemptAt = existing.nextAttemptAt;
+        if (incoming.deliveryError.isEmpty())
+            update.deliveryError = existing.deliveryError;
+    }
+    return update;
 }
 } // namespace
 
@@ -87,7 +158,13 @@ bool LocalStore::writeJson(const QString &filePath, const QJsonObject &object, Q
             *error = file.errorString();
         return false;
     }
-    if (file.write(QJsonDocument(object).toJson(QJsonDocument::Compact)) < 0 || !file.commit()) {
+    const QByteArray json = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    if (file.write(json) != json.size()) {
+        if (error)
+            *error = file.errorString();
+        return false;
+    }
+    if (!file.commit()) {
         if (error)
             *error = file.errorString();
         return false;
@@ -130,83 +207,6 @@ void LocalStore::clearSession()
     QFile::remove(path(QStringLiteral("config/session.json")));
 }
 
-QString LocalStore::knownAccountsPath() const
-{
-    return path(QStringLiteral("config/known_accounts.json"));
-}
-
-QJsonArray LocalStore::readKnownAccounts() const
-{
-    QFile file(knownAccountsPath());
-    if (!file.open(QIODevice::ReadOnly))
-        return {};
-    const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
-    return document.isArray() ? document.array() : QJsonArray{};
-}
-
-bool LocalStore::writeKnownAccounts(const QJsonArray &accounts, QString *error) const
-{
-    QSaveFile file(knownAccountsPath());
-    if (!file.open(QIODevice::WriteOnly)) {
-        if (error)
-            *error = file.errorString();
-        return false;
-    }
-    if (file.write(QJsonDocument(accounts).toJson(QJsonDocument::Compact)) < 0 || !file.commit()) {
-        if (error)
-            *error = file.errorString();
-        return false;
-    }
-    QFile::setPermissions(knownAccountsPath(), QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-    return true;
-}
-
-QSet<QString> LocalStore::knownAccountIds() const
-{
-    QSet<QString> result;
-    const QJsonArray accounts = readKnownAccounts();
-    for (const QJsonValue &value : accounts) {
-        const QString id = value.toObject().value(QStringLiteral("id")).toString();
-        if (!id.isEmpty())
-            result.insert(id);
-    }
-    return result;
-}
-
-bool LocalStore::rememberAccount(const User &user, QString *error) const
-{
-    if (user.id.isEmpty() || user.username.isEmpty()) {
-        if (error)
-            *error = QStringLiteral("已知账号必须包含用户 ID 和用户名");
-        return false;
-    }
-    QJsonArray accounts = readKnownAccounts();
-    const QJsonObject account{{QStringLiteral("id"), user.id},
-                              {QStringLiteral("username"), user.username}};
-    for (int index = 0; index < accounts.size(); ++index) {
-        if (accounts.at(index).toObject().value(QStringLiteral("id")).toString() != user.id)
-            continue;
-        if (accounts.at(index).toObject() == account)
-            return true;
-        accounts.replace(index, account);
-        return writeKnownAccounts(accounts, error);
-    }
-    accounts.append(account);
-    return writeKnownAccounts(accounts, error);
-}
-
-bool LocalStore::forgetAccount(const QString &userId, QString *error) const
-{
-    QJsonArray accounts = readKnownAccounts();
-    for (int index = 0; index < accounts.size(); ++index) {
-        if (accounts.at(index).toObject().value(QStringLiteral("id")).toString() != userId)
-            continue;
-        accounts.removeAt(index);
-        return writeKnownAccounts(accounts, error);
-    }
-    return true;
-}
-
 QString LocalStore::messagesPath() const
 {
     return path(QStringLiteral("config/messages.json"));
@@ -220,65 +220,64 @@ QJsonObject LocalStore::readMessageDocument() const
     return QJsonDocument::fromJson(file.readAll()).object();
 }
 
-bool LocalStore::appendMessage(const QString &peerId, const ChatMessage &message)
+bool LocalStore::appendMessage(const QString &peerId, const ChatMessage &message,
+                               QString *error)
 {
-    if (peerId.isEmpty())
+    if (error)
+        error->clear();
+    if (peerId.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("消息缺少联系人 ID");
         return false;
+    }
     QJsonObject root = readMessageDocument();
     QJsonArray array = root.value(peerId).toArray();
     if (!message.id.isEmpty()) {
         for (int index = 0; index < array.size(); ++index) {
-            QJsonObject existing = array.at(index).toObject();
+            const QJsonObject existing = array.at(index).toObject();
             if (existing.value(QStringLiteral("message_id")).toString() != message.id)
                 continue;
-            const ChatMessage merged = messageFromJson(existing);
-            ChatMessage update = message;
-            if (update.cursor.isEmpty())
-                update.cursor = merged.cursor;
-            if (update.conversationId.isEmpty())
-                update.conversationId = merged.conversationId;
-            if (update.senderId.isEmpty())
-                update.senderId = merged.senderId;
-            if (update.recipientId.isEmpty())
-                update.recipientId = merged.recipientId;
-            if (update.kind.isEmpty())
-                update.kind = merged.kind;
-            if (update.content.isEmpty())
-                update.content = merged.content;
-            if (update.fileId.isEmpty())
-                update.fileId = merged.fileId;
-            if (update.fileName.isEmpty())
-                update.fileName = merged.fileName;
-            if (update.fileSize == 0)
-                update.fileSize = merged.fileSize;
-            if (update.timestamp == 0)
-                update.timestamp = merged.timestamp;
-            update.readAt = qMax(update.readAt, merged.readAt);
+            const ChatMessage update = mergeMessage(messageFromJson(existing), message);
             const QJsonObject replacement = messageToJson(update);
             if (replacement == existing)
                 return false;
             array.replace(index, replacement);
             root.insert(peerId, array);
-            writeJson(messagesPath(), root);
-            return true;
+            return writeJson(messagesPath(), root, error);
         }
     }
     array.append(messageToJson(message));
-    // Bound local history so a long-running client does not grow without limit.
-    while (array.size() > 2000)
-        array.removeFirst();
+    // Bound acknowledged history without ever dropping work that still needs
+    // transport recovery. An all-pending conversation may exceed the cap.
+    while (array.size() > 2000) {
+        int removable = -1;
+        for (int index = 0; index < array.size(); ++index) {
+            const ChatMessage candidate = messageFromJson(array.at(index).toObject());
+            if (!candidate.pending && !candidate.failed) {
+                removable = index;
+                break;
+            }
+        }
+        if (removable < 0)
+            break;
+        array.removeAt(removable);
+    }
     root.insert(peerId, array);
-    writeJson(messagesPath(), root);
-    return true;
+    return writeJson(messagesPath(), root, error);
 }
 
 bool LocalStore::markMessagesRead(const QString &peerId, const QString &senderId,
-                                  const QString &cursor, qint64 readAt)
+                                  const QString &cursor, qint64 readAt, QString *error)
 {
+    if (error)
+        error->clear();
     bool cursorOk = false;
     const qulonglong readCursor = cursor.toULongLong(&cursorOk);
-    if (peerId.isEmpty() || senderId.isEmpty() || !cursorOk)
+    if (peerId.isEmpty() || senderId.isEmpty() || !cursorOk) {
+        if (error)
+            *error = QStringLiteral("已读回执缺少有效的联系人、发送者或 cursor");
         return false;
+    }
     QJsonObject root = readMessageDocument();
     QJsonArray array = root.value(peerId).toArray();
     bool changed = false;
@@ -301,8 +300,8 @@ bool LocalStore::markMessagesRead(const QString &peerId, const QString &senderId
     if (!changed)
         return false;
     root.insert(peerId, array);
-    writeJson(messagesPath(), root);
-    return true;
+    // READ changes read_at only; transport ACK/pending/failed stay untouched.
+    return writeJson(messagesPath(), root, error);
 }
 
 QList<ChatMessage> LocalStore::messages(const QString &peerId, const QString &afterId) const
@@ -318,6 +317,101 @@ QList<ChatMessage> LocalStore::messages(const QString &peerId, const QString &af
             afterSeen = true;
     }
     return result;
+}
+
+QList<ChatMessage> LocalStore::outbox(const QString &senderId) const
+{
+    QList<ChatMessage> result;
+    if (senderId.isEmpty())
+        return result;
+    const QJsonObject root = readMessageDocument();
+    for (auto peer = root.constBegin(); peer != root.constEnd(); ++peer) {
+        const QJsonArray array = peer.value().toArray();
+        for (const QJsonValue &value : array) {
+            const ChatMessage message = messageFromJson(value.toObject());
+            if (message.senderId == senderId && !message.acked)
+                result.append(message);
+        }
+    }
+    return result;
+}
+
+bool LocalStore::findMessage(const QString &messageId, const QString &senderId,
+                             ChatMessage *message, QString *peerId) const
+{
+    if (messageId.isEmpty())
+        return false;
+    const QJsonObject root = readMessageDocument();
+    for (auto peer = root.constBegin(); peer != root.constEnd(); ++peer) {
+        const QJsonArray array = peer.value().toArray();
+        for (const QJsonValue &value : array) {
+            const ChatMessage candidate = messageFromJson(value.toObject());
+            if (candidate.id != messageId
+                || (!senderId.isEmpty() && candidate.senderId != senderId))
+                continue;
+            if (message)
+                *message = candidate;
+            if (peerId)
+                *peerId = peer.key();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool LocalStore::recoverOutbox(const QString &senderId, qint64 nextAttemptAt,
+                               QString *error)
+{
+    if (error)
+        error->clear();
+    if (senderId.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("无法恢复没有发送者 ID 的 outbox");
+        return false;
+    }
+    QJsonObject root = readMessageDocument();
+    bool changed = false;
+    for (auto peer = root.begin(); peer != root.end(); ++peer) {
+        QJsonArray array = peer.value().toArray();
+        bool peerChanged = false;
+        for (int index = 0; index < array.size(); ++index) {
+            ChatMessage message = messageFromJson(array.at(index).toObject());
+            if (message.senderId != senderId || message.acked)
+                continue;
+            if (!message.cursor.isEmpty()) {
+                // Pre-outbox rows used the server cursor as their only proof
+                // of persistence. Migrate that proof to the explicit ACK bit.
+                message.acked = true;
+                message.pending = false;
+                message.failed = false;
+                message.nextAttemptAt = 0;
+                message.deliveryError.clear();
+            } else {
+                const bool restartFailed = message.failed;
+                message.pending = true;
+                message.failed = false;
+                message.acked = false;
+                if (restartFailed) {
+                    // An explicitly recovered terminal failure starts a new
+                    // delivery cycle. Ordinary pending retries keep their
+                    // persisted attempt budget across process restarts.
+                    message.attemptCount = 0;
+                    message.nextAttemptAt = nextAttemptAt;
+                    message.deliveryError.clear();
+                } else if (message.nextAttemptAt <= 0) {
+                    message.nextAttemptAt = nextAttemptAt;
+                }
+            }
+            array.replace(index, messageToJson(message));
+            changed = true;
+            peerChanged = true;
+        }
+        if (peerChanged)
+            peer.value() = array;
+    }
+    if (!changed)
+        return false;
+    return writeJson(messagesPath(), root, error);
 }
 
 QString LocalStore::sanitizeFileName(const QString &originalName)

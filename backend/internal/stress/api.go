@@ -22,7 +22,7 @@ type APIClient struct {
 func NewAPIClient(base string) *APIClient {
 	return &APIClient{Base: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: 15 * time.Minute, Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 128, IdleConnTimeout: 90 * time.Second}}}
 }
-func (a *APIClient) JSON(ctx context.Context, method, path, token string, input, output any, expected ...int) error {
+func (a *APIClient) JSON(ctx context.Context, method, path, token string, input, output any, expected int) error {
 	var body io.Reader
 	if input != nil {
 		raw, err := json.Marshal(input)
@@ -46,13 +46,7 @@ func (a *APIClient) JSON(ctx context.Context, method, path, token string, input,
 		return err
 	}
 	defer resp.Body.Close()
-	ok := len(expected) == 0 && resp.StatusCode >= 200 && resp.StatusCode < 300
-	for _, status := range expected {
-		if resp.StatusCode == status {
-			ok = true
-		}
-	}
-	if !ok {
+	if resp.StatusCode != expected {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}

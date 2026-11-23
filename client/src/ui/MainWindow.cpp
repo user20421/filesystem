@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 
+#include "Format.h"
 #include "LocalStore.h"
+#include "MessageDelivery.h"
 #include "MessagePayloadCodec.h"
 #include "TransferTaskCard.h"
 
@@ -20,21 +22,21 @@
 #include <QPointer>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QRegularExpression>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QTextBrowser>
 #include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
-#include <QUuid>
 
 namespace {
-QString conversationId(const QString &first, const QString &second)
+int execCenteredMessageBox(QMessageBox &dialog, QWidget *parent)
 {
-    QStringList ids{first, second};
-    ids.sort();
-    return ids.join(QLatin1Char(':'));
+    dialog.adjustSize();
+    QWidget *window = parent ? parent->window() : nullptr;
+    if (window)
+        dialog.move(window->frameGeometry().center() - dialog.rect().center());
+    return dialog.exec();
 }
 
 QString formatTime(qint64 timestamp)
@@ -53,17 +55,6 @@ bool cursorAtMost(const QString &value, const QString &limit)
     const qulonglong left = value.toULongLong(&valueOk);
     const qulonglong right = limit.toULongLong(&limitOk);
     return valueOk && limitOk && left <= right;
-}
-
-QString formatBytes(qint64 bytes)
-{
-    if (bytes < 1024)
-        return QStringLiteral("%1 B").arg(bytes);
-    if (bytes < 1024 * 1024)
-        return QStringLiteral("%1 KiB").arg(bytes / 1024.0, 0, 'f', 1);
-    if (bytes < 1024LL * 1024 * 1024)
-        return QStringLiteral("%1 MiB").arg(bytes / (1024.0 * 1024.0), 0, 'f', 1);
-    return QStringLiteral("%1 GiB").arg(bytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 2);
 }
 
 QFrame *card(QWidget *parent)
@@ -106,7 +97,6 @@ public:
 
     void setUnread(int count)
     {
-        setProperty("unreadCount", count);
         m_unreadDot->setVisible(count > 0);
         m_unreadDot->setToolTip(QStringLiteral("%1 条未读消息").arg(count));
     }
@@ -173,11 +163,13 @@ MainWindow::MainWindow(ApiClient *api, LocalStore *store, WireCodec *codec,
     });
     connect(m_socket, &WebSocketClient::connected, this, [this] {
         setConnectionState(QStringLiteral("已连接"));
+        m_delivery->onConnected();
     });
     connect(m_socket, &WebSocketClient::disconnected, this, [this] {
         if (m_closing)
             return;
         setConnectionState(QStringLiteral("已断开"));
+        m_delivery->onDisconnected();
         scheduleReconnect();
     });
     connect(m_socket, &WebSocketClient::errorOccurred, this, [this](const QString &error) {
@@ -190,7 +182,22 @@ MainWindow::MainWindow(ApiClient *api, LocalStore *store, WireCodec *codec,
     });
     connect(m_socket, &WebSocketClient::messageReceived, this, &MainWindow::handleWireMessage);
 
+    m_delivery = new MessageDelivery(m_store, m_session.user.id,
+        [this](const WireMessage &wire, QString *error) { return m_socket->send(wire, error); },
+        [this] { return m_socket->isConnected(); }, this);
+    connect(m_delivery, &MessageDelivery::messageChanged, this,
+            [this](const QString &peerId, const QString &) {
+        if (!m_closing && peerId == m_peerId)
+            renderConversation();
+    });
+    connect(m_delivery, &MessageDelivery::historyRequested,
+            this, &MainWindow::requestHistory);
+    connect(m_delivery, &MessageDelivery::errorOccurred,
+            this, &MainWindow::showNotice);
+    m_delivery->recover();
+
     if (online) {
+        loadUnreadSummary();
         loadUsers();
         m_usersTimer->start();
         m_historyTimer->start();
@@ -208,16 +215,17 @@ MainWindow::~MainWindow()
 void MainWindow::buildUi()
 {
     auto *outer = new QVBoxLayout(this);
-    outer->setContentsMargins(18, 18, 18, 18);
+    outer->setContentsMargins(12, 12, 12, 12);
     outer->setSpacing(12);
 
     auto *splitter = new QSplitter(this);
+    splitter->setObjectName(QStringLiteral("chatSplitter"));
     splitter->setChildrenCollapsible(false);
     outer->addWidget(splitter, 1);
 
     auto *left = card(splitter);
-    left->setMinimumWidth(230);
-    left->setMaximumWidth(330);
+    left->setMinimumWidth(180);
+    left->setMaximumWidth(230);
     auto *leftLayout = new QVBoxLayout(left);
     leftLayout->setContentsMargins(16, 16, 16, 16);
     leftLayout->setSpacing(12);
@@ -239,7 +247,7 @@ void MainWindow::buildUi()
 
     auto *right = card(splitter);
     auto *layout = new QVBoxLayout(right);
-    layout->setContentsMargins(20, 16, 20, 18);
+    layout->setContentsMargins(12, 12, 12, 12);
     layout->setSpacing(12);
     auto *top = new QHBoxLayout;
     auto *titles = new QVBoxLayout;
@@ -256,12 +264,10 @@ void MainWindow::buildUi()
     m_exitButton = new QPushButton(QStringLiteral("退出"), right);
     m_exitButton->setObjectName(QStringLiteral("exitButton"));
     m_exitButton->setToolTip(QStringLiteral("撤销当前登录凭据并退出，不删除服务器账号或历史文件"));
-    top->addWidget(m_exitButton);
     connect(m_exitButton, &QPushButton::clicked, this, &MainWindow::requestExit);
     m_deleteAccountButton = new QPushButton(QStringLiteral("注销"), right);
     m_deleteAccountButton->setObjectName(QStringLiteral("deleteAccountButton"));
     m_deleteAccountButton->setToolTip(QStringLiteral("永久删除服务器账号及关联消息和文件，不可恢复"));
-    top->addWidget(m_deleteAccountButton);
     connect(m_deleteAccountButton, &QPushButton::clicked,
             this, &MainWindow::requestAccountDeletion);
     layout->addLayout(top);
@@ -276,6 +282,8 @@ void MainWindow::buildUi()
     }
     m_chatNav->setChecked(true);
     navigation->addStretch();
+    navigation->addWidget(m_exitButton);
+    navigation->addWidget(m_deleteAccountButton);
     layout->addLayout(navigation);
 
     m_views = new QStackedWidget(right);
@@ -390,7 +398,9 @@ void MainWindow::buildUi()
     m_views->addWidget(transferView);
     splitter->addWidget(left);
     splitter->addWidget(right);
-    splitter->setSizes({260, 820});
+    splitter->setHandleWidth(0);
+    splitter->handle(1)->setEnabled(false);
+    splitter->setSizes({190, 346});
 
     m_notice = new QLabel(right);
     m_notice->setObjectName(QStringLiteral("noticeLabel"));
@@ -427,11 +437,11 @@ void MainWindow::requestExit()
     QMessageBox prompt(QMessageBox::Question, QStringLiteral("退出"),
         QStringLiteral("确定要退出 %1 吗？将清除本地登录会话并关闭窗口，不会删除服务器账号。")
             .arg(m_session.user.username.toUpper()),
-        QMessageBox::Yes | QMessageBox::No, nullptr);
+        QMessageBox::Yes | QMessageBox::No, this);
     prompt.button(QMessageBox::Yes)->setText(QStringLiteral("是"));
     prompt.button(QMessageBox::No)->setText(QStringLiteral("否"));
     prompt.setDefaultButton(QMessageBox::No);
-    const auto answer = static_cast<QMessageBox::StandardButton>(prompt.exec());
+    const auto answer = static_cast<QMessageBox::StandardButton>(execCenteredMessageBox(prompt, this));
     if (!guarded)
         return;
     if (answer != QMessageBox::Yes || m_closing) {
@@ -464,11 +474,11 @@ void MainWindow::requestAccountDeletion()
     QMessageBox prompt(QMessageBox::Warning, QStringLiteral("永久注销账号"),
         QStringLiteral("确定要永久删除服务器账号 %1 及其关联消息和文件吗？此操作不可恢复。")
             .arg(m_session.user.username.toUpper()),
-        QMessageBox::Yes | QMessageBox::No, nullptr);
+        QMessageBox::Yes | QMessageBox::No, this);
     prompt.button(QMessageBox::Yes)->setText(QStringLiteral("永久删除"));
     prompt.button(QMessageBox::No)->setText(QStringLiteral("否"));
     prompt.setDefaultButton(QMessageBox::No);
-    const auto answer = static_cast<QMessageBox::StandardButton>(prompt.exec());
+    const auto answer = static_cast<QMessageBox::StandardButton>(execCenteredMessageBox(prompt, this));
     if (!guarded)
         return;
     if (answer != QMessageBox::Yes || m_closing) {
@@ -487,17 +497,14 @@ void MainWindow::requestAccountDeletion()
             return;
         }
         m_store->clearSession();
-        m_store->forgetAccount(m_session.user.id);
         emit exitRequested(); // Only a 204 response reaches this point.
     });
 }
 
 void MainWindow::setConnectionState(const QString &state)
 {
-    m_connectionState = state;
     if (m_socketLabel)
         m_socketLabel->setText(QStringLiteral("●  ") + state);
-    emit connectionStateChanged(state);
 }
 
 void MainWindow::showNotice(const QString &notice)
@@ -506,7 +513,6 @@ void MainWindow::showNotice(const QString &notice)
         return;
     m_notice->setText(notice);
     m_notice->setVisible(!notice.isEmpty());
-    emit noticeChanged(notice);
 }
 
 void MainWindow::setActive(bool active)
@@ -565,6 +571,40 @@ void MainWindow::loadPresence()
     });
 }
 
+// loadUnreadSummary 使用请求开始时的版本快照接受未读摘要，实时来信或本地阅读发生后，旧摘要不得覆盖新状态。
+void MainWindow::loadUnreadSummary()
+{
+    if (m_closing)
+        return;
+    const QMap<QString, quint64> requestedVersions = m_unreadVersions;
+    QPointer<MainWindow> guarded(this);
+    m_api->unread([this, guarded, requestedVersions](
+                      bool ok, const QList<UnreadSummary> &summaries, const QString &error) {
+        if (!guarded || m_closing)
+            return;
+        if (!ok) {
+            showNotice(QStringLiteral("未读摘要：") + error);
+            return;
+        }
+        QMap<QString, int> counts;
+        QSet<QString> peers;
+        for (const UnreadSummary &summary : summaries) {
+            counts.insert(summary.peerId, summary.unreadCount);
+            peers.insert(summary.peerId);
+        }
+        for (auto it = requestedVersions.cbegin(); it != requestedVersions.cend(); ++it)
+            peers.insert(it.key());
+        for (const QString &peerId : peers) {
+            // 按联系人比较版本，丢弃请求期间已被实时消息或本地已读推进的旧未读快照。
+            // A realtime message or a local read action after the request started
+            // is newer than this snapshot and must not be overwritten by it.
+            if (m_unreadVersions.value(peerId) != requestedVersions.value(peerId))
+                continue;
+            setPeerUnread(peerId, counts.value(peerId));
+        }
+    });
+}
+
 void MainWindow::applyUsers(const QList<User> &users)
 {
     const QString selected = m_peerId;
@@ -573,15 +613,8 @@ void MainWindow::applyUsers(const QList<User> &users)
     m_userNames.clear();
     m_contacts.clear();
     QListWidgetItem *select = nullptr;
-    const QSet<QString> knownAccountIds = m_store->knownAccountIds();
     for (User user : users) {
-        // Keep simulator accounts and accounts authenticated on this workstation.
-        // Unknown integration fixtures and arbitrary historical accounts stay hidden.
-        static const QRegularExpression visibleUserPattern(QStringLiteral("^USER_[0-9]+$"));
-        const bool currentAccount = user.id == m_session.user.id;
-        const bool eligible = currentAccount || knownAccountIds.contains(user.id)
-            || visibleUserPattern.match(user.username.toUpper()).hasMatch();
-        if (!eligible || currentAccount)
+        if (user.id == m_session.user.id)
             continue;
         user.presenceKnown = m_presenceKnown;
         user.online = m_presenceKnown && m_onlineUserIds.contains(user.id);
@@ -612,6 +645,7 @@ void MainWindow::setPeerUnread(const QString &peerId, int count)
     if (peerId.isEmpty() || m_closing)
         return;
     count = qMax(0, count);
+    m_unreadVersions.insert(peerId, ++m_unreadVersion);
     if (count == 0)
         m_unreadByPeer.remove(peerId);
     else
@@ -623,13 +657,6 @@ void MainWindow::setPeerUnread(const QString &peerId, int count)
         if (auto *widget = static_cast<ContactItemWidget *>(m_users->itemWidget(item)))
             widget->setUnread(count);
         break;
-    }
-    int total = 0;
-    for (auto it = m_unreadByPeer.cbegin(); it != m_unreadByPeer.cend(); ++it)
-        total += it.value();
-    if (total != m_unreadCount) {
-        m_unreadCount = total;
-        emit unreadCountChanged(total);
     }
 }
 
@@ -693,23 +720,31 @@ void MainWindow::selectPeer()
 
 void MainWindow::loadHistory()
 {
-    if (m_closing || !m_online || m_peerId.isEmpty())
+    requestHistory(m_peerId);
+}
+
+void MainWindow::requestHistory(const QString &peerId)
+{
+    if (m_closing || !m_online || peerId.isEmpty() || m_historyRequests.contains(peerId))
         return;
-    const QString peer = m_peerId;
+    m_historyRequests.insert(peerId);
     QPointer<MainWindow> guarded(this);
-    m_api->messages(peer, m_sync.cursor(peer),
-                    [this, peer, guarded](bool ok, const QList<ChatMessage> &messages, const QString &error) {
+    m_api->messages(peerId, m_sync.cursor(peerId),
+                    [this, peerId, guarded](bool ok, const QList<ChatMessage> &messages,
+                                            const QString &error) {
         if (!guarded || m_closing)
             return;
+        m_historyRequests.remove(peerId);
         if (!ok) {
             showNotice(QStringLiteral("消息同步：") + error);
             return;
         }
         m_synchronizingHistory = true;
         for (const ChatMessage &message : messages)
-            appendChat(peer, message);
+            appendChat(peerId, message);
         m_synchronizingHistory = false;
-        markLatestIncomingRead(peer);
+        m_delivery->onHistorySynced();
+        markLatestIncomingRead(peerId);
     });
 }
 
@@ -749,31 +784,16 @@ bool MainWindow::sendPayload(const QString &peerId, const ChatMessage &message)
 {
     if (m_closing || peerId.isEmpty())
         return false;
-    WireMessage wire;
-    wire.messageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    wire.conversationId = conversationId(m_session.user.id, peerId);
-    wire.senderId = m_session.user.id;
-    wire.recipientId = peerId;
-    wire.deviceId = QStringLiteral("desktop");
-    wire.timestamp = QDateTime::currentMSecsSinceEpoch();
+    ChatMessage pending;
     QString error;
-    if (!MessagePayloadCodec::encode(message, &wire.payload, &error)) {
+    // outbox 先持久化发送意图再尝试写 socket；断线恢复沿用同一 messageId，只有 ACK 才结束待确认状态。
+    if (!m_delivery->enqueue(peerId, message, &pending, &error)) {
         showNotice(QStringLiteral("发送失败：") + error);
         return false;
     }
-    if (!m_socket->send(wire, &error)) {
-        if (error.isEmpty())
-            error = QStringLiteral("WebSocket 未接受完整帧");
-        showNotice(QStringLiteral("发送失败：") + error);
-        return false;
-    }
-    ChatMessage sent = message;
-    sent.id = wire.messageId;
-    sent.conversationId = wire.conversationId;
-    sent.senderId = wire.senderId;
-    sent.recipientId = wire.recipientId;
-    sent.timestamp = wire.timestamp;
-    appendChat(peerId, sent);
+    // enqueue returns success for durable offline intent as well as an accepted
+    // socket write. Only ACK can clear the pending transport state.
+    m_sync.accept(peerId, pending);
     return true;
 }
 
@@ -801,8 +821,11 @@ void MainWindow::chooseFile()
     const QString source = QFileDialog::getOpenFileName(this, QStringLiteral("发送文件"));
     if (source.isEmpty())
         return;
-    if (!m_transfers->addUpload(m_peerId, source))
-        QMessageBox::warning(this, QStringLiteral("发送文件"), QStringLiteral("文件不可读"));
+    if (!m_transfers->addUpload(m_peerId, source)) {
+        QMessageBox prompt(QMessageBox::Warning, QStringLiteral("发送文件"),
+                           QStringLiteral("文件不可读"), QMessageBox::Ok, this);
+        execCenteredMessageBox(prompt, this);
+    }
 }
 
 void MainWindow::handleWireMessage(const WireMessage &wire)
@@ -813,7 +836,16 @@ void MainWindow::handleWireMessage(const WireMessage &wire)
         handleReadReceipt(wire);
         return;
     }
-    // ACK confirms transport only; it never means that the peer has read it.
+    if (wire.type == WireMessage::Type::Ack) {
+        // ACK cursor belongs to this message only. It must not advance the
+        // peer's incremental history cursor in MessageSyncState.
+        m_delivery->handleAck(wire);
+        return;
+    }
+    if (wire.type == WireMessage::Type::Error) {
+        m_delivery->handleError(wire);
+        return;
+    }
     if (wire.type != WireMessage::Type::Message)
         return;
     ChatMessage message;
@@ -833,6 +865,7 @@ void MainWindow::handleWireMessage(const WireMessage &wire)
     appendChat(peer, message);
 }
 
+// handleReadReceipt 处理双方广播的 READ：只有原作者为当前用户时才更新自己的已读游标和时间，不能误标读者自己的消息。
 void MainWindow::handleReadReceipt(const WireMessage &wire)
 {
     if (wire.cursor.isEmpty())
@@ -852,8 +885,12 @@ void MainWindow::handleReadReceipt(const WireMessage &wire)
             m_readTimes.insert(peer, qMax(readAt, m_readTimes.value(peer)));
         }
     }
-    if (m_store->markMessagesRead(peer, authorId, wire.cursor, readAt)
-        && peer == m_peerId)
+    QString storeError;
+    const bool changed = m_store->markMessagesRead(peer, authorId, wire.cursor, readAt,
+                                                   &storeError);
+    if (!storeError.isEmpty())
+        showNotice(QStringLiteral("已读状态写盘失败：") + storeError);
+    if (changed && peer == m_peerId)
         renderConversation();
     // Older servers may omit read_at on READ; history is authoritative then.
     if (wire.readAt <= 0)
@@ -865,11 +902,18 @@ void MainWindow::appendChat(const QString &peerId, const ChatMessage &message)
     if (m_closing)
         return;
     ChatMessage stored = message;
+    if (m_synchronizingHistory)
+        stored = m_delivery->historyProjection(stored);
     if (stored.senderId == m_session.user.id && stored.readAt <= 0
         && cursorAtMost(stored.cursor, m_readCursors.value(peerId)))
         stored.readAt = m_readTimes.value(peerId);
     const bool accepted = m_sync.accept(peerId, stored);
-    const bool changed = m_store->appendMessage(peerId, stored);
+    QString storeError;
+    const bool changed = m_store->appendMessage(peerId, stored, &storeError);
+    if (!storeError.isEmpty()) {
+        showNotice(QStringLiteral("消息写盘失败：") + storeError);
+        return;
+    }
     if (!accepted) {
         if (changed && peerId == m_peerId)
             renderConversation();
@@ -950,13 +994,24 @@ void MainWindow::renderMessage(const ChatMessage &message)
         : m_userNames.value(message.senderId, message.senderId.toUpper());
     QString time = formatTime(message.timestamp);
     if (own) {
-        const QString readState = message.readAt > 0
-            ? QStringLiteral("已读 %1").arg(formatTime(message.readAt)) : QStringLiteral("未读");
-        time = time.isEmpty() ? readState : QStringLiteral("%1 · %2").arg(time, readState);
+        QString deliveryState;
+        if (message.readAt > 0)
+            deliveryState = QStringLiteral("已读 %1").arg(formatTime(message.readAt));
+        else if (message.failed)
+            deliveryState = QStringLiteral("失败");
+        else if (message.pending && message.attemptCount == 0)
+            deliveryState = QStringLiteral("等待发送");
+        else if (message.pending)
+            deliveryState = QStringLiteral("等待ACK");
+        else if (message.acked)
+            deliveryState = QStringLiteral("已确认未读");
+        else
+            deliveryState = QStringLiteral("未读"); // legacy local projection
+        time = time.isEmpty() ? deliveryState : QStringLiteral("%1 · %2").arg(time, deliveryState);
     }
     const QString body = message.isFile()
         ? QStringLiteral("📎 %1 <span style='color:#64748b'>%2</span>")
-            .arg(message.fileName.toHtmlEscaped(), formatBytes(message.fileSize))
+            .arg(message.fileName.toHtmlEscaped(), Format::bytes(message.fileSize))
         : message.content.toHtmlEscaped();
     const QString color = own ? QStringLiteral("#e8efff") : QStringLiteral("#f1f5f9");
     m_chat->append(QStringLiteral(
@@ -1076,6 +1131,8 @@ void MainWindow::shutdown()
     m_closing = true;
     m_ticketPending = false;
     m_readRequests.clear();
+    m_historyRequests.clear();
+    m_delivery->shutdown();
     m_usersTimer->stop();
     m_historyTimer->stop();
     m_reconnectTimer->stop();

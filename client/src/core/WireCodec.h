@@ -31,12 +31,4 @@ public:
     virtual bool decode(const QByteArray &frame, WireMessage *message, QString *error) const = 0;
 };
 
-class UnsupportedWireCodec final : public WireCodec {
-public:
-    bool available() const override { return false; }
-    QString unavailableReason() const override;
-    bool encode(const WireMessage &, QByteArray *, QString *error) const override;
-    bool decode(const QByteArray &, WireMessage *, QString *error) const override;
-};
-
 std::unique_ptr<WireCodec> createDefaultWireCodec();

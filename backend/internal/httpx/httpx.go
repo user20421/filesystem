@@ -18,6 +18,7 @@ type contextKey int
 
 const requestIDKey contextKey = 1
 
+// APIError 是可安全返回给客户端的业务错误，HTTP 状态只用于响应头，不进入 JSON 字段。
 type APIError struct {
 	Status  int    `json:"-"`
 	Code    string `json:"code"`
@@ -29,14 +30,19 @@ func Error(status int, code, message string) *APIError {
 	return &APIError{Status: status, Code: code, Message: message}
 }
 
+// JSON 按指定状态写出 UTF-8 JSON；编码失败不会被包装成第二次成功响应。
 func JSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
+
+// Data 使用统一的 data 信封返回成功结果。
 func Data(w http.ResponseWriter, status int, value any) {
 	JSON(w, status, map[string]any{"data": value})
 }
+
+// Fail 将 APIError 转为稳定错误响应，其他内部错误统一隐藏为 500，并携带请求 ID 便于排查。
 func Fail(w http.ResponseWriter, r *http.Request, err error) {
 	var api *APIError
 	if !errors.As(err, &api) {
@@ -44,6 +50,8 @@ func Fail(w http.ResponseWriter, r *http.Request, err error) {
 	}
 	JSON(w, api.Status, map[string]any{"error": map[string]string{"code": api.Code, "message": api.Message, "request_id": RequestID(r.Context())}})
 }
+
+// Decode 限制请求体为 1 MiB、拒绝未知字段，并确保请求只包含一个 JSON 值。
 func Decode(w http.ResponseWriter, r *http.Request, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	dec := json.NewDecoder(r.Body)
@@ -65,6 +73,7 @@ func ClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// RequestContext 透传合法请求 ID 或生成新 ID，同时设置 nosniff 防止内容类型嗅探。
 func RequestContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-ID")
@@ -78,6 +87,7 @@ func RequestContext(next http.Handler) http.Handler {
 	})
 }
 
+// Recover 记录 panic 堆栈并返回统一 500，避免把内部实现细节暴露给调用方。
 func Recover(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {

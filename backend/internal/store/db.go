@@ -15,6 +15,7 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
+// Open 创建 MySQL 连接池并执行启动 ping，池大小和连接生命周期是当前单实例部署的默认配置。
 func Open(ctx context.Context, dsn string) (*sql.DB, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -32,6 +33,7 @@ func Open(ctx context.Context, dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
+// Migrate 按文件名顺序执行嵌入式迁移，使用 GET_LOCK 防止并发升级并通过 schema_migrations 防重。
 func Migrate(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY, applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)) ENGINE=InnoDB`); err != nil {
 		return err
@@ -87,6 +89,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// guardLegacyFileReset 在旧加密文件仍有数据时拒绝破坏性升级，防止旧对象被误当作明文分块。
 func guardLegacyFileReset(ctx context.Context, conn *sql.Conn) error {
 	var legacy int
 	if err := conn.QueryRowContext(ctx, `SELECT COUNT(1) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='files' AND column_name='wrapped_dek'`).Scan(&legacy); err != nil {
@@ -105,6 +108,7 @@ func guardLegacyFileReset(ctx context.Context, conn *sql.Conn) error {
 	return nil
 }
 
+// Audit 以尽力而为方式写审计日志，写入失败会被忽略，因此审计不能替代业务状态或可观测性错误处理。
 func Audit(ctx context.Context, db *sql.DB, userID, action, resourceID, ip string) {
 	_, _ = db.ExecContext(ctx, `INSERT INTO audit_logs(user_id,action,resource_id,ip_address) VALUES(NULLIF(?,''),?,?,?)`, userID, action, resourceID, ip)
 }

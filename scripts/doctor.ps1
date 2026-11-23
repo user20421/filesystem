@@ -1,10 +1,11 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 . (Join-Path $PSScriptRoot '_common.ps1')
 
 $failures = 0
 
+# 统一输出检查结果，失败项累计到全局失败数，便于最后返回非零退出码。
 function Write-Check {
     param(
         [string]$Name,

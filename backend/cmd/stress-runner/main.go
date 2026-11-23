@@ -16,6 +16,7 @@ import (
 	"secure-im/backend/internal/stress"
 )
 
+// main 启动真实压测工具，默认读取隔离环境并生成连接、消息、文件及资源报告。
 func main() {
 	cfg := stress.DefaultConfig()
 	defaults := cfg

@@ -22,10 +22,12 @@ type Metrics struct {
 	backendRSSMiB, backendCPUPercent                                      *float64
 	backendGoHeapMiB                                                      *float64
 	backendGoroutines                                                     *int
+	backendChunkSlotsUsed, backendChunkSlotsLimit                         *int64
+	configuredBudgetLimitMiB                                              float64
 }
 
-func NewMetrics(runID string, _ int64) *Metrics {
-	return &Metrics{runID: runID, started: time.Now(), pendingAck: make(map[string]time.Time),
+func NewMetrics(runID string, fileBudgetMiB int64) *Metrics {
+	return &Metrics{runID: runID, started: time.Now(), configuredBudgetLimitMiB: float64(fileBudgetMiB), pendingAck: make(map[string]time.Time),
 		pendingDelivery: make(map[string]time.Time), delivered: make(map[string]struct{})}
 }
 
@@ -121,6 +123,15 @@ func (m *Metrics) BackendBudget(usedBytes, limitBytes *int64) {
 		m.backendBudgetHighMiB = clone(&used)
 	}
 }
+func (m *Metrics) BackendChunkSlots(used, limit *int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if used == nil || limit == nil {
+		m.backendChunkSlotsUsed, m.backendChunkSlotsLimit = nil, nil
+		return
+	}
+	m.backendChunkSlotsUsed, m.backendChunkSlotsLimit = cloneInt64(used), cloneInt64(limit)
+}
 func (m *Metrics) StableSample() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -144,6 +155,13 @@ func cloneInt(v *int) *int {
 	c := *v
 	return &c
 }
+func cloneInt64(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	return &c
+}
 func value(v *float64) float64 {
 	if v == nil {
 		return 0
@@ -153,34 +171,36 @@ func value(v *float64) float64 {
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
 type Progress struct {
-	Type               string    `json:"type"`
-	RunID              string    `json:"run_id"`
-	Phase              string    `json:"phase"`
-	Target             int       `json:"target"`
-	Online             int64     `json:"online"`
-	ConnectionFailed   int64     `json:"connection_failed"`
-	Reconnects         int64     `json:"reconnects"`
-	MessagesSent       int64     `json:"messages_sent"`
-	MessagesDelivered  int64     `json:"messages_delivered"`
-	MessageDuplicates  int64     `json:"message_duplicates"`
-	MessageLost        int64     `json:"message_lost"`
-	AckP95MS           float64   `json:"ack_p95_ms"`
-	AckP99MS           float64   `json:"ack_p99_ms"`
-	DeliveryP95MS      float64   `json:"delivery_p95_ms"`
-	FilesQueued        int64     `json:"files_queued"`
-	FilesActive        int64     `json:"files_active"`
-	FilesCompleted     int64     `json:"files_completed"`
-	FilesFailed        int64     `json:"files_failed"`
-	BytesCompleted     int64     `json:"bytes_completed"`
-	FileMiBPerSec      float64   `json:"file_mib_per_sec"`
-	FileQueueP95MS     float64   `json:"file_queue_p95_ms"`
-	BackendRSSMiB      *float64  `json:"backend_rss_mib"`
-	BackendCPUPercent  *float64  `json:"backend_cpu_percent"`
-	GoHeapMiB          *float64  `json:"go_heap_mib"`
-	Goroutines         *int      `json:"goroutines"`
-	FileBudgetUsedMiB  *float64  `json:"file_budget_used_mib"`
-	FileBudgetLimitMiB *float64  `json:"file_budget_limit_mib"`
-	Timestamp          time.Time `json:"timestamp"`
+	Type                string    `json:"type"`
+	RunID               string    `json:"run_id"`
+	Phase               string    `json:"phase"`
+	Target              int       `json:"target"`
+	Online              int64     `json:"online"`
+	ConnectionFailed    int64     `json:"connection_failed"`
+	Reconnects          int64     `json:"reconnects"`
+	MessagesSent        int64     `json:"messages_sent"`
+	MessagesDelivered   int64     `json:"messages_delivered"`
+	MessageDuplicates   int64     `json:"message_duplicates"`
+	MessageLost         int64     `json:"message_lost"`
+	AckP95MS            float64   `json:"ack_p95_ms"`
+	AckP99MS            float64   `json:"ack_p99_ms"`
+	DeliveryP95MS       float64   `json:"delivery_p95_ms"`
+	FilesQueued         int64     `json:"files_queued"`
+	FilesActive         int64     `json:"files_active"`
+	FilesCompleted      int64     `json:"files_completed"`
+	FilesFailed         int64     `json:"files_failed"`
+	BytesCompleted      int64     `json:"bytes_completed"`
+	FileMiBPerSec       float64   `json:"file_mib_per_sec"`
+	FileQueueP95MS      float64   `json:"file_queue_p95_ms"`
+	BackendRSSMiB       *float64  `json:"backend_rss_mib"`
+	BackendCPUPercent   *float64  `json:"backend_cpu_percent"`
+	GoHeapMiB           *float64  `json:"go_heap_mib"`
+	Goroutines          *int      `json:"goroutines"`
+	FileBudgetUsedMiB   *float64  `json:"file_budget_used_mib"`
+	FileBudgetLimitMiB  *float64  `json:"file_budget_limit_mib"`
+	FileChunkSlotsUsed  *int64    `json:"file_chunk_slots_used"`
+	FileChunkSlotsLimit *int64    `json:"file_chunk_slots_limit"`
+	Timestamp           time.Time `json:"timestamp"`
 }
 
 type Totals struct {
@@ -210,7 +230,8 @@ func (m *Metrics) Snapshot(target int, phase string, throughput float64) Progres
 		FilesQueued: m.filesQueued, FilesActive: m.filesActive, FilesCompleted: m.filesCompleted, FilesFailed: m.filesFailed,
 		BytesCompleted: m.bytesCompleted, FileMiBPerSec: throughput, FileQueueP95MS: Percentile(m.fileQueueLatency, .95),
 		BackendRSSMiB: clone(m.backendRSSMiB), BackendCPUPercent: clone(m.backendCPUPercent), GoHeapMiB: clone(m.backendGoHeapMiB), Goroutines: cloneInt(m.backendGoroutines),
-		FileBudgetUsedMiB: clone(m.backendBudgetUsedMiB), FileBudgetLimitMiB: clone(m.backendBudgetLimitMiB), Timestamp: time.Now().UTC()}
+		FileBudgetUsedMiB: clone(m.backendBudgetUsedMiB), FileBudgetLimitMiB: clone(m.backendBudgetLimitMiB),
+		FileChunkSlotsUsed: cloneInt64(m.backendChunkSlotsUsed), FileChunkSlotsLimit: cloneInt64(m.backendChunkSlotsLimit), Timestamp: time.Now().UTC()}
 }
 
 func (m *Metrics) Totals() Totals {
@@ -224,9 +245,13 @@ func (m *Metrics) Totals() Totals {
 	if m.stableSamples > 0 {
 		average = float64(m.stableOnlineSum) / float64(m.stableSamples)
 	}
+	budgetLimit := value(m.backendBudgetLimitMiB)
+	if budgetLimit <= 0 {
+		budgetLimit = m.configuredBudgetLimitMiB
+	}
 	return Totals{MessagesSent: m.messagesSent, MessagesDelivered: m.messagesDelivered, MessageDuplicates: m.messageDuplicates, MessageLost: lost,
 		AckP95MS: Percentile(m.ackLatency, .95), AckP99MS: Percentile(m.ackLatency, .99), DeliveryP95MS: Percentile(m.deliveryLatency, .95),
 		FilesCompleted: m.filesCompleted, FilesFailed: m.filesFailed, BytesCompleted: m.bytesCompleted, FileQueueP95MS: Percentile(m.fileQueueLatency, .95),
 		ConnectionFailed: m.connectionFailed, Reconnects: m.reconnects, HealthFailures: m.healthFailures, StableSamples: m.stableSamples,
-		StableOnlineMin: m.stableOnlineMin, StableOnlineAverage: average, FileBudgetHighMiB: value(m.backendBudgetHighMiB), FileBudgetLimitMiB: value(m.backendBudgetLimitMiB), FileBudgetKnown: m.backendBudgetHighMiB != nil}
+		StableOnlineMin: m.stableOnlineMin, StableOnlineAverage: average, FileBudgetHighMiB: value(m.backendBudgetHighMiB), FileBudgetLimitMiB: budgetLimit, FileBudgetKnown: m.backendBudgetHighMiB != nil}
 }

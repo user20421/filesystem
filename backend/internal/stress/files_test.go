@@ -28,7 +28,7 @@ func TestUploadChunkRetriesTransientServerError(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":{"uploaded":true,"index":0}}`))
 	}))
 	defer server.Close()
-	pool := NewFilePool(DefaultConfig(), NewAPIClient(server.URL), NewMetrics("retry", 500), 1, func(error) {})
+	pool := NewFilePool(DefaultConfig(), NewAPIClient(server.URL), NewMetrics("retry", 500), 1, func(error) {}, nil)
 	if err := pool.uploadChunk(context.Background(), "token", "file-id", 0, []byte("chunk-content"), "sum"); err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestUploadChunkDoesNotRetryClientError(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(http.StatusBadRequest) }))
 	defer server.Close()
-	pool := NewFilePool(DefaultConfig(), NewAPIClient(server.URL), NewMetrics("no-retry", 500), 1, func(error) {})
+	pool := NewFilePool(DefaultConfig(), NewAPIClient(server.URL), NewMetrics("no-retry", 500), 1, func(error) {}, nil)
 	if err := pool.uploadChunk(context.Background(), "token", "file-id", 0, []byte("x"), "sum"); err == nil {
 		t.Fatal("expected HTTP 400")
 	}
@@ -72,7 +72,7 @@ func TestTransferInstantSkipsUploadAndComplete(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	pool := NewFilePool(cfg, NewAPIClient(server.URL), NewMetrics("instant", 500), 1, func(err error) { t.Error(err) })
+	pool := NewFilePool(cfg, NewAPIClient(server.URL), NewMetrics("instant", 500), 1, func(err error) { t.Error(err) }, nil)
 	if err := pool.transfer(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}

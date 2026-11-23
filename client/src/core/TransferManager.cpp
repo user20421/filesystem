@@ -155,6 +155,7 @@ int TransferManager::nextMissingChunk(TransferTask *task)
     return -1;
 }
 
+// selectUploadTask 先让尚未获得通道的新文件按 FIFO 开始，其余空闲通道分配给剩余数据最多的文件。
 TransferTask *TransferManager::selectUploadTask() const
 {
     // A newly ready file gets its first channel in FIFO order.  Only after all
@@ -236,7 +237,6 @@ void TransferManager::startUpload(TransferTask *task)
             fail(task, error);
             return;
         }
-        task->m_sha256 = digest;
         task->m_reply = m_api->initFile(task->m_peerId, task->m_fileName, task->m_size, digest,
             [this, guarded, generation](bool success, const FileInitInfo &info, const QString &apiError) {
             if (!guarded)
@@ -314,12 +314,9 @@ void TransferManager::updateUploadedProgress(TransferTask *task)
             task->m_transferred += qMin<qint64>(task->m_chunkSize, task->m_size - offset);
         }
     }
-    task->m_nextChunk = 0;
-    while (task->m_nextChunk < task->m_totalChunks
-           && task->m_uploadedChunks.contains(task->m_nextChunk))
-        ++task->m_nextChunk;
 }
 
+// dispatchChunk 在异步读盘前就占用上传通道，并记录分块 generation，避免暂停或取消后重复分配与回调。
 void TransferManager::dispatchChunk(TransferTask *task)
 {
     const int index = nextMissingChunk(task);
@@ -515,6 +512,7 @@ void TransferManager::startDownload(TransferTask *task)
     drainDownload(task);
 }
 
+// drainDownload 按顺序写盘：队列达到 1 MiB 暂停网络读取，降到半水位后恢复；这与用户主动暂停是两种独立状态。
 void TransferManager::drainDownload(TransferTask *task)
 {
     if (!task || task->m_state != TransferTask::State::Downloading
@@ -691,8 +689,10 @@ void TransferManager::resetCancelledUpload(TransferTask *task)
     task->m_transferred = 0;
 }
 
+// finishCancellation 等待旧分块和 DELETE 全部结束后才允许立即重试，避免新旧上传共享同一内容时发生清理竞态。
 void TransferManager::finishCancellation(TransferTask *task)
 {
+    // 取消上传先等待旧分块回调全部退出，再删除服务端引用；立即重试会等删除完成后才重置 fileId。
     if (hasActiveWork(task))
         return;
     if (!task->m_cancellationFinalized) {

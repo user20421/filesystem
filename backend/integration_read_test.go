@@ -28,6 +28,12 @@ type integrationHistoryItem struct {
 	Envelope string `json:"envelope"`
 }
 
+type integrationUnreadSummary struct {
+	PeerID        string `json:"peer_id"`
+	UnreadCount   int64  `json:"unread_count"`
+	LastMessageAt int64  `json:"last_message_at"`
+}
+
 func (c *integrationClient) verifyReadReceipts(suffix string) {
 	alice := c.register("readalice_"+suffix, "Read Alice")
 	bob := c.register("readbob_"+suffix, "Read Bob")
@@ -78,6 +84,12 @@ func (c *integrationClient) verifyReadReceipts(suffix string) {
 		}
 	}
 
+	c.requestJSON(http.MethodGet, "/api/v1/messages/unread", "", nil, http.StatusUnauthorized)
+	unread := c.unread(bob.Tokens.AccessToken)
+	if len(unread) != 1 || unread[0].PeerID != alice.User.ID || unread[0].UnreadCount != 3 || unread[0].LastMessageAt <= 0 {
+		c.t.Fatalf("unexpected unread summary before READ: %+v", unread)
+	}
+
 	// Missing, third-party, reverse-direction and foreign-peer cursors are all forbidden.
 	for _, attempt := range []struct {
 		token  string
@@ -100,6 +112,11 @@ func (c *integrationClient) verifyReadReceipts(suffix string) {
 	}
 	connections := []*websocket.Conn{aliceOne, aliceTwo, bobOne, bobTwo}
 	assertReadBroadcast(c.t, connections, alice.User.ID, bob.User.ID, receipt)
+
+	unread = c.unread(bob.Tokens.AccessToken)
+	if len(unread) != 1 || unread[0].PeerID != alice.User.ID || unread[0].UnreadCount != 1 || unread[0].LastMessageAt <= 0 {
+		c.t.Fatalf("unexpected unread summary after batched READ: %+v", unread)
+	}
 
 	repeated := c.markRead(bob.Tokens.AccessToken, alice.User.ID, cursors[1])
 	if repeated.ReadAt != receipt.ReadAt || repeated.Updated != 0 || repeated.ConversationID != receipt.ConversationID {
@@ -151,6 +168,15 @@ func (c *integrationClient) markRead(token, peerID string, cursor uint64) integr
 	var receipt integrationReadReceipt
 	decodeData(c.t, body, &receipt)
 	return receipt
+}
+
+func (c *integrationClient) unread(token string) []integrationUnreadSummary {
+	body := c.requestJSON(http.MethodGet, "/api/v1/messages/unread", token, nil, http.StatusOK)
+	var result struct {
+		Unread []integrationUnreadSummary `json:"unread"`
+	}
+	decodeData(c.t, body, &result)
+	return result.Unread
 }
 
 func (c *integrationClient) presence(token string) []string {

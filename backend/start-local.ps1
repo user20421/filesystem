@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ListenAddr = '127.0.0.1:8080'
 )
@@ -55,7 +55,7 @@ if (-not $mysqlPassword -or -not $minioPassword) {
 }
 
 $env:LISTEN_ADDR = $ListenAddr
-$env:MYSQL_DSN = "${mysqlUser}:${mysqlPassword}@tcp(127.0.0.1:${mysqlPort})/secure_im?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s"
+$env:MYSQL_DSN = "${mysqlUser}:${mysqlPassword}@tcp(127.0.0.1:${mysqlPort})/secure_im?parseTime=true&loc=UTC&time_zone=%27%2B00:00%27&charset=utf8mb4&collation=utf8mb4_unicode_ci&timeout=5s"
 $env:MINIO_ENDPOINT = "127.0.0.1:$minioPort"
 $env:MINIO_ACCESS_KEY = $minioUser
 $env:MINIO_SECRET_KEY = $minioPassword
