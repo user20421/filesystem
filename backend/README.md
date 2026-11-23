@@ -17,6 +17,16 @@ go run ./cmd/server
 
 The default listener is `127.0.0.1:8080`. Startup pings MySQL, applies embedded SQL migrations, ensures the MinIO bucket exists, and starts the file cleanup sweeper. `GET /health` is liveness; `GET /ready` checks MySQL and object storage. SIGINT/SIGTERM closes WebSocket clients and gracefully drains HTTP requests. Shutdown cancels the sweeper and waits for its current round before closing MySQL.
 
+## Code organization
+
+- `cmd/server/` is only the composition root: `app.go` assembles dependencies and owns lifecycle, `routes.go` registers routes, `health.go` provides diagnostics, and `logging.go` owns request logging.
+- `internal/apperror/` contains transport-independent business errors. `internal/httpx/` is the only boundary that maps them to HTTP status codes and JSON error envelopes.
+- `auth`, `chat`, `account`, and `filetransfer` own their narrow repositories. SQL and transactions remain in the vertical business package; there is no global generic DAO.
+- File upload, chunk reading, completion, deletion, scheduling, memory budgeting, and cleanup are separate implementation concerns. The stress cleaner uses the deletion-only service rather than constructing unused upload infrastructure.
+- Stress preflight, load phases, progress, cleanup, evaluation, and report artifacts are separated without changing NDJSON or report schemas.
+
+After editing `proto/im/v1/*.proto`, run `powershell -ExecutionPolicy Bypass -File .\scripts\generate-proto.ps1` from the project root. The script uses only the repository's offline protoc/plugin and updates the tracked Go files under `internal/proto/impb/`; never edit generated files manually.
+
 MySQL can be configured with `MYSQL_DSN`, or with `MYSQL_ADDR`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD`; an explicit DSN takes precedence. MinIO defaults to `127.0.0.1:9000` and bucket `secure-im-files`; credentials come from `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`, with `MINIO_USE_SSL` selecting HTTPS.
 
 Current server defaults are `LISTEN_ADDR=127.0.0.1:8080`, `ACCESS_TOKEN_TTL=15m`, `REFRESH_TOKEN_TTL=720h`, `WS_TICKET_TTL=1m`, and `WS_MAX_CONNECTIONS=1000` (allowed range 1–100000). File sizes and memory budgets are bytes: `MAX_ACTIVE_FILES=3` (3–5), `MAX_CHUNK_SIZE=5242880` (64 KiB–16 MiB), `MAX_FILE_SIZE=5368709120`, `UPLOAD_CONCURRENCY=96` (1–256), and `FILE_MEMORY_BUDGET=524288000`. Background file cleanup defaults to `FILE_UPLOAD_IDLE_TTL=24h`, `FILE_DELETING_RETRY_AFTER=5m`, and `FILE_CLEANUP_INTERVAL=1m`; all three durations must be positive. `ENABLE_DEBUG_STATS` defaults to false. Auth limits default to 30 registrations/minute and 10 logins/minute with a 10000-key limiter cache. See `.env.example` for the complete process-environment configuration; malformed optional numeric, boolean, and duration values use their defaults, while values outside validated ranges are rejected.

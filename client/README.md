@@ -19,24 +19,31 @@ Qt 6 Widgets / C++17 桌面客户端。正式程序 `secure-im-client` 采用**�
 - 下载文件名经净化并去除路径部分，阻止路径穿越及 Windows 保留设备名，重名文件自动改名；Windows 上的并发下载路径预留不区分大小写。
 
 ```text
-src/core/ApiClient.*          REST 路径、请求和响应 JSON 的适配层
+src/core/ApiClient*.cpp      transport、refresh/logout、endpoint 与 history 实现拆分
+src/core/ApiClient.h         稳定的公共 API、认证 epoch 与流式请求句柄
+src/core/ApiJsonCodec.*      REST 响应 JSON 与 legacy 字段分支的纯适配逻辑
 src/core/WebSocketClient.*   异步 QWebSocket
 src/core/WireCodec.*         二进制帧接口
 src/core/ProtobufWireCodec.* Protobuf v2 Envelope 与 typed payload 编解码
 src/core/MessagePayloadCodec.* 文本/文件通知 MessagePayload 编解码
-src/core/TransferManager.*   固定独立通道、分块动态调度及传输状态机
+src/core/TransferManager.*   任务与 Manager 公共接口及生命周期
+src/core/Transfer*.cpp       3+3 通道调度、上传、下载、取消重试实现
 src/core/LocalStore.*        每用户目录、会话、配置和历史
+src/core/LocalStoreMessageCodec.* 本地消息 JSON 与合并规则内部组件
 src/core/Workers.*           哈希、文件 I/O 与流式原子写入
 src/core/MessageDelivery.*   持久化 outbox、ACK 超时、重试及恢复
 src/core/MessageSyncState.h  消息去重及数字 cursor 状态
-src/ui/RootStressSession.* 独立 ROOT 认证上下文与压测配置
-src/ui/SessionContext.*    base、按用户激活/隔离、目录锁、旧数据迁移及幂等 shutdown
-src/ui/SessionPage.*       登录页、聊天页与集成 ROOT 压测页切换
+src/app/RootStressSession.* 独立 ROOT 认证上下文与压测配置
+src/app/SessionContext.*    base、按用户激活/隔离、目录锁、旧数据迁移及幂等 shutdown
+src/app/StressRunController.* stress-up 与 runner 两阶段进程生命周期
+src/app/StressNdjsonCodec.* runner NDJSON 单行纯解码
+src/app/StressReportRepository.* 历史 summary.json 读取、schema 适配与排序
+src/app/StressAssessment.*  最终指标与瓶颈建议纯逻辑
+src/ui/SessionPage.*       登录页、聊天页与集成 ROOT 压测页切换及显式关闭顺序
 src/ui/SingleUserWindow.*  正式客户端固定尺寸顶层窗口
-src/ui/MainWindow.*        聊天/传输业务界面
+src/ui/MainWindow*.cpp     UI 构建、联系人未读、聊天历史 READ 与传输视图
 src/ui/SimulatorWindow.*   独立 ROOT 压测窗口
-src/ui/StressRunController.* stress-up、runner 生命周期及 NDJSON 解析
-src/ui/SystemTestPage.*    压测配置、实时指标、结论与历史报告
+src/ui/SystemTestPage.*    压测配置、实时指标、结论与历史报告展示
 src/apps/                  正式单用户入口与 ROOT 压测工具入口
 tests/                     QtTest/CTest 核心及集成测试
 ```
@@ -97,7 +104,7 @@ ROOT 使用当前 base 下独立的 `<base>/root-stress/` 会话目录，不创�
 
 ## 后端对齐点
 
-所有 REST 响应字段适配集中在 `ApiClient.cpp`，UI 不直接读取后端 JSON 字段。
+REST 响应字段适配集中在 `ApiJsonCodec.*`，各 endpoint 和历史同步分别位于 `ApiClientEndpoints.cpp`、`ApiClientHistory.cpp`；UI 不直接读取后端 JSON 字段。
 
 | 接口 | 当前请求/响应约定 |
 |---|---|

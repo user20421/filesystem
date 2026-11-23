@@ -21,7 +21,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// MessagePayload is the only payload carried by a MESSAGE envelope.
+// MessagePayload 是 MESSAGE 帧的业务内容，oneof 保证一帧只包含文本或文件通知中的一种。
 type MessagePayload struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Content:
@@ -104,7 +104,7 @@ func (*MessagePayload_Text) isMessagePayload_Content() {}
 
 func (*MessagePayload_File) isMessagePayload_Content() {}
 
-// FileNotification references a file transferred through the file API.
+// FileNotification 引用文件 API 已生成的文件元数据，文件字节仍通过二进制分块接口传输，不经过 WebSocket JSON。
 type FileNotification struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	FileId        string                 `protobuf:"bytes,1,opt,name=file_id,json=fileId,proto3" json:"file_id,omitempty"`
@@ -165,6 +165,7 @@ func (x *FileNotification) GetSize() int64 {
 	return 0
 }
 
+// AckPayload 表示服务端已持久化的确认，cursor 是已确认的服务端同步游标。
 type AckPayload struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Cursor        uint64                 `protobuf:"varint,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
@@ -209,6 +210,7 @@ func (x *AckPayload) GetCursor() uint64 {
 	return 0
 }
 
+// ErrorPayload 中 code 是供程序分支处理的稳定错误码，message 是供人阅读的说明，不应作为程序判断依据。
 type ErrorPayload struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Code          string                 `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`

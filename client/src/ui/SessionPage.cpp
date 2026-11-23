@@ -17,7 +17,6 @@ SessionPage::SessionPage(std::unique_ptr<SessionContext> context, QWidget *paren
     : QWidget(parent), m_context(std::move(context))
 {
     setObjectName(QStringLiteral("sessionPage"));
-    m_context->m_page = this;
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     m_stack = new QStackedWidget(this);
@@ -59,8 +58,6 @@ SessionPage::SessionPage(std::unique_ptr<SessionContext> context, QWidget *paren
 SessionPage::~SessionPage()
 {
     shutdown();
-    if (m_context)
-        m_context->m_page = nullptr;
 }
 
 void SessionPage::startSession(const AuthSession &session, bool online)
@@ -189,6 +186,7 @@ void SessionPage::shutdown()
     if (m_closing)
         return;
     m_closing = true;
+    // 页面显式拥有关闭顺序：先停各页面，再停 ROOT，最后关闭普通用户 Context。
     if (m_login)
         m_login->shutdown();
     if (m_chat)

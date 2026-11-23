@@ -6,22 +6,15 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = Split-Path -Parent $PSScriptRoot
-$rootEnv = Join-Path $projectRoot '.env'
-$deployEnv = Join-Path $projectRoot 'deploy/.env'
-$envFile = if (Test-Path -LiteralPath $rootEnv) { $rootEnv } else { $deployEnv }
-if (-not (Test-Path -LiteralPath $envFile)) {
+. (Join-Path $PSScriptRoot '../scripts/_common.ps1')
+$envFile = Get-EnvironmentFile
+if (-not $envFile) {
     throw 'No environment file found. Run scripts/dev-up.ps1 first.'
 }
 
 function Get-LocalSetting {
     param([string]$Name, [string]$DefaultValue = '')
-    foreach ($line in [System.IO.File]::ReadLines($envFile)) {
-        if ($line -match ('^\s*' + [regex]::Escape($Name) + '=(.*)$')) {
-            return $matches[1].Trim()
-        }
-    }
-    return $DefaultValue
+    return Get-DotEnvValue -Path $envFile -Name $Name -DefaultValue $DefaultValue
 }
 
 function New-RandomBase64 {

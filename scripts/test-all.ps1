@@ -13,6 +13,7 @@ $script:ProjectRoot = Split-Path -Parent $PSScriptRoot
 $script:BackendDirectory = Join-Path $script:ProjectRoot 'backend'
 $script:ClientDirectory = Join-Path $script:ProjectRoot 'client'
 $script:DeployDirectory = Join-Path $script:ProjectRoot 'deploy'
+. (Join-Path $PSScriptRoot '_common.ps1')
 
 # 输出统一的测试阶段标题，便于快速定位失败步骤。
 function Write-TestStep {
@@ -46,24 +47,6 @@ function Invoke-CheckedCommand {
     if ($exitCode -ne 0) {
         throw "$Description 失败，退出码为 $exitCode。"
     }
-}
-
-# 读取 env 指定项，文件或键不存在时返回默认值，不输出文件中的其他秘密。
-function Get-DotEnvValue {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [AllowEmptyString()][string]$DefaultValue = ''
-    )
-
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        foreach ($line in [System.IO.File]::ReadLines($Path)) {
-            if ($line -match ('^\s*' + [regex]::Escape($Name) + '=(.*)$')) {
-                return $matches[1].Trim()
-            }
-        }
-    }
-    return $DefaultValue
 }
 
 # 默认测试必须保持离线；仅 -Integration 分支会重新注入这些变量。
@@ -136,15 +119,23 @@ try {
 
     Write-TestStep '8/11 检查全仓 PowerShell 语法'
     $syntaxErrors = @()
-    $powerShellFiles = Get-ChildItem -LiteralPath $script:ProjectRoot -Recurse -Force -File -Filter '*.ps1' |
-        Sort-Object -Property FullName
-    foreach ($file in $powerShellFiles) {
+    # 只检查源码清单中的脚本，避免递归扫描 REF、运行数据、缓存和构建目录。
+    $powerShellFiles = @(
+        git ls-files --cached --others --exclude-standard |
+            Where-Object { $_.EndsWith('.ps1', [System.StringComparison]::OrdinalIgnoreCase) } |
+            Sort-Object |
+            ForEach-Object { Join-Path $script:ProjectRoot $_ }
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw 'PowerShell 语法检查失败：无法取得源码脚本清单。'
+    }
+    foreach ($filePath in $powerShellFiles) {
         $tokens = $null
         $errors = $null
         [System.Management.Automation.Language.Parser]::ParseFile(
-            $file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            $filePath, [ref]$tokens, [ref]$errors) | Out-Null
         foreach ($parseError in $errors) {
-            $syntaxErrors += "$($file.FullName):$($parseError.Extent.StartLineNumber)：$($parseError.Message)"
+            $syntaxErrors += "${filePath}:$($parseError.Extent.StartLineNumber)：$($parseError.Message)"
         }
     }
     if ($syntaxErrors.Count -gt 0) {
@@ -172,9 +163,13 @@ try {
         $stressUp = Join-Path $PSScriptRoot 'stress-up.ps1'
         $stressDown = Join-Path $PSScriptRoot 'stress-down.ps1'
         try {
-            # 集成用例覆盖默认的每用户 3 个活跃上传限制。
+            # 集成用例覆盖每用户 3 个活跃上传限制；先移除未知配置的遗留实例，避免 ready 快速路径复用错误上限。
             $env:STRESS_MAX_ACTIVE_FILES = '3'
             Write-Host '正在启动独立压测后端（不运行大规模负载）...'
+            & $stressDown
+            if ($LASTEXITCODE -ne 0) {
+                throw "遗留压测后端清理失败，退出码为 $LASTEXITCODE。"
+            }
             & $stressUp
             if ($LASTEXITCODE -ne 0) {
                 throw "独立压测后端启动失败，退出码为 $LASTEXITCODE。"

@@ -8,8 +8,6 @@
 #include <QObject>
 #include <memory>
 
-class SessionPage;
-
 // SessionContext 的 dataDir 是共享 base；普通用户登录后才绑定 users/<规范化用户名>。
 // Direct 仅供独立 ROOT 压测使用，保持其既有单目录会话布局。
 class SessionContext final : public QObject {
@@ -54,7 +52,6 @@ public:
     void shutdown();
 
 private:
-    friend class SessionPage;
     bool migrateLegacyData(const QString &userDir, QString *error) const;
     bool migratePrefixedUserData(const QString &userDir, const AuthSession &session,
                                  bool hasAnotherSource, QString *error) const;
@@ -67,7 +64,6 @@ private:
     std::unique_ptr<QLockFile> m_lock;
     QString m_preferredUsername;
     AuthSession m_session;
-    SessionPage *m_page = nullptr;
     StorageMode m_mode;
     bool m_open = false;
     bool m_userLocked = false;

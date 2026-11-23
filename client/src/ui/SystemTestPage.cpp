@@ -1,15 +1,13 @@
 #include "SystemTestPage.h"
 
+#include "StressAssessment.h"
+#include "StressReportRepository.h"
+
 #include <QDesktopServices>
-#include <QDir>
-#include <QFile>
-#include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QLabel>
 #include <QLocale>
 #include <QProgressBar>
@@ -32,8 +30,6 @@ QString remainingText(int seconds)
         .arg(seconds % 60, 2, 10, QLatin1Char('0'));
 }
 } // namespace
-
-#include <algorithm>
 
 SystemTestPage::ReportOpener SystemTestPage::s_reportOpener;
 
@@ -357,12 +353,12 @@ void SystemTestPage::buildUi()
 void SystemTestPage::updateDistribution()
 {
     const qint64 target = m_target->value();
-    const qint64 messaging = target * 80 / 100;
-    const qint64 files = target * 18 / 100;
-    const qint64 mixed = target - messaging - files;
+    const qint64 idleUsers = target * 80 / 100;
+    const qint64 messagingUsers = target * 18 / 100;
+    const qint64 fileUsers = target - idleUsers - messagingUsers;
     m_distribution->setText(QStringLiteral(
         "自动分配 80 / 18 / 2：空闲 %1 人 · 消息 %2 人 · 文件 %3 人")
-        .arg(integerText(messaging), integerText(files), integerText(mixed)));
+        .arg(integerText(idleUsers), integerText(messagingUsers), integerText(fileUsers)));
 }
 
 void SystemTestPage::setRunning(bool running)
@@ -494,90 +490,7 @@ void SystemTestPage::finishRun(bool success, const QString &message)
 
 QString SystemTestPage::bottleneckAdvice() const
 {
-    const qsizetype suggestion = m_lastFinal.conclusion.indexOf(QStringLiteral("建议："));
-    if (suggestion >= 0)
-        return QStringLiteral("瓶颈建议：%1").arg(m_lastFinal.conclusion.mid(suggestion + 3));
-    if (!m_lastFinal.reason.trimmed().isEmpty()
-        && m_lastFinal.reason != QStringLiteral("全部成功阈值满足"))
-        return QStringLiteral("瓶颈建议：%1").arg(m_lastFinal.reason);
-    if (m_lastProgress.filesFailed > 0
-        || (m_lastProgress.fileBudgetLimitMib > 0
-            && m_lastProgress.fileBudgetUsedMib >= m_lastProgress.fileBudgetLimitMib * 0.9))
-        return QStringLiteral("瓶颈建议：文件失败或预算接近上限，检查 500 MiB 配额、96 通道限制及存储吞吐。");
-    if (m_lastProgress.target > 0 && m_lastProgress.online < m_lastProgress.target)
-        return QStringLiteral("瓶颈建议：在线人数未达目标，优先检查连接建立、账号准备和后端连接容量。");
-    if (m_lastProgress.ackP99Ms >= 2000.0)
-        return QStringLiteral("瓶颈建议：ACK P99 偏高，检查后端 CPU、Go 堆和协程数是否持续增长。");
-    if (m_lastProgress.backendCpuPercent >= 85.0 || m_lastProgress.backendRssMib >= 3584.0)
-        return QStringLiteral("瓶颈建议：后端资源接近 6 CPU / 3 GiB 边界，降低人数并对比资源峰值。");
-    if (m_lastProgress.messagesDelivered < m_lastProgress.messagesSent)
-        return QStringLiteral("瓶颈建议：消息存在未送达，检查 WebSocket 稳定性、ACK 延迟和错误日志。");
-    if (m_conclusion->text() == QStringLiteral("波动"))
-        return QStringLiteral("瓶颈建议：结果存在波动，请复测并对比在线率、P99、送达率和资源峰值。");
-    return QStringLiteral("瓶颈建议：未观察到明显瓶颈；可逐步增加人数，持续观察 P99、RSS 与文件失败数。");
-}
-
-QList<SystemTestPage::HistoryEntry> SystemTestPage::readHistory() const
-{
-    QList<HistoryEntry> entries;
-    const QDir root(m_controller->config().reportRoot);
-    const auto directories = root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot,
-                                                QDir::Name);
-    for (const QFileInfo &directory : directories) {
-        const QString summaryPath = QDir(directory.absoluteFilePath()).filePath(QStringLiteral("summary.json"));
-        QFile file(summaryPath);
-        if (!file.open(QIODevice::ReadOnly))
-            continue;
-        const QJsonDocument document = QJsonDocument::fromJson(file.readAll());
-        if (!document.isObject())
-            continue;
-        QJsonObject summary = document.object();
-        if (summary.value(QStringLiteral("final")).isObject())
-            summary = summary.value(QStringLiteral("final")).toObject();
-        HistoryEntry entry;
-        entry.directory = directory.absoluteFilePath();
-        entry.target = static_cast<qint64>(summary.value(QStringLiteral("target")).toDouble());
-        const QJsonObject result = summary.value(QStringLiteral("result")).toObject();
-        entry.conclusion = result.value(QStringLiteral("status")).toString();
-        if (entry.conclusion.isEmpty())
-            entry.conclusion = summary.value(QStringLiteral("status")).toString();
-        if (entry.conclusion.isEmpty())
-            entry.conclusion = summary.value(QStringLiteral("conclusion")).toString();
-        entry.reason = summary.value(QStringLiteral("reason")).toString();
-        if (entry.reason.isEmpty())
-            entry.reason = result.value(QStringLiteral("reason")).toString();
-        entry.html = summary.value(QStringLiteral("html")).toString();
-        if (entry.html.isEmpty())
-            entry.html = QDir(directory.absoluteFilePath()).filePath(QStringLiteral("report.html"));
-        else if (QDir::isRelativePath(entry.html))
-            entry.html = QDir(directory.absoluteFilePath()).filePath(entry.html);
-
-        const QStringList timeKeys{QStringLiteral("started_at"), QStringLiteral("timestamp"),
-            QStringLiteral("created_at"), QStringLiteral("finished_at"), QStringLiteral("time")};
-        for (const QString &key : timeKeys) {
-            const QJsonValue value = summary.value(key);
-            if (value.isString()) {
-                entry.timestamp = QDateTime::fromString(value.toString(), Qt::ISODateWithMs);
-                if (!entry.timestamp.isValid())
-                    entry.timestamp = QDateTime::fromString(value.toString(), Qt::ISODate);
-            } else if (value.isDouble()) {
-                const qint64 raw = static_cast<qint64>(value.toDouble());
-                entry.timestamp = raw > 100000000000LL
-                    ? QDateTime::fromMSecsSinceEpoch(raw) : QDateTime::fromSecsSinceEpoch(raw);
-            }
-            if (entry.timestamp.isValid())
-                break;
-        }
-        if (!entry.timestamp.isValid())
-            entry.timestamp = QFileInfo(summaryPath).lastModified();
-        entries.append(entry);
-    }
-    std::sort(entries.begin(), entries.end(), [](const HistoryEntry &left, const HistoryEntry &right) {
-        if (left.timestamp != right.timestamp)
-            return left.timestamp > right.timestamp;
-        return left.directory > right.directory;
-    });
-    return entries;
+    return StressAssessment::bottleneckAdvice(m_lastProgress, m_lastFinal, m_conclusion->text());
 }
 
 void SystemTestPage::refreshHistory()
@@ -585,7 +498,7 @@ void SystemTestPage::refreshHistory()
     if (!m_history)
         return;
     m_history->clear();
-    const auto entries = readHistory();
+    const auto entries = StressReportRepository(m_controller->config().reportRoot).readHistory();
     for (const auto &entry : entries) {
         auto *item = new QTreeWidgetItem(m_history);
         item->setText(0, entry.timestamp.toLocalTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));

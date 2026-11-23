@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"secure-im/backend/internal/httpx"
+	"secure-im/backend/internal/apperror"
 )
 
 type fakeRepo struct {
@@ -71,9 +71,9 @@ func TestDeleteFailureIsRetryableAndPreservesAccount(t *testing.T) {
 		revokeTickets: func(string) { revoked = true },
 	}
 	err := service.Delete(context.Background(), "user")
-	var apiErr *httpx.APIError
-	if !errors.As(err, &apiErr) || apiErr.Status != 503 || apiErr.Code != "account_deletion_failed" {
-		t.Fatalf("error = %#v, want retryable 503", err)
+	var business *apperror.Error
+	if !errors.As(err, &business) || business.Kind != apperror.KindServiceUnavailable || business.Code != "account_deletion_failed" {
+		t.Fatalf("error = %#v, want retryable business error", err)
 	}
 	if repo.deleteCall != 0 || closed || revoked {
 		t.Fatal("account or sessions were removed after file deletion failed")

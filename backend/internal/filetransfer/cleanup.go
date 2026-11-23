@@ -4,10 +4,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net/http"
 	"time"
 
-	"secure-im/backend/internal/httpx"
+	"secure-im/backend/internal/apperror"
 )
 
 const (
@@ -37,14 +36,21 @@ type cleanupCandidate struct {
 	status  string
 }
 
+// cleanupService 明确 Sweeper 所需的候选查询与删除能力，禁止直接访问 Service 数据库。
+type cleanupService interface {
+	Delete(context.Context, string, string) error
+	CleanupCandidates(context.Context, time.Time, time.Time, int) ([]cleanupCandidate, error)
+	DeleteCleanupCandidate(context.Context, string, string, string, time.Time) error
+}
+
 type Sweeper struct {
-	files  *Service
+	files  cleanupService
 	log    *slog.Logger
 	config CleanupConfig
 	now    func() time.Time
 }
 
-func NewSweeper(files *Service, log *slog.Logger, config CleanupConfig) *Sweeper {
+func NewSweeper(files cleanupService, log *slog.Logger, config CleanupConfig) *Sweeper {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -95,7 +101,7 @@ func (s *Sweeper) RunOnce(ctx context.Context) CleanupStats {
 		if candidate.status == "deleting" {
 			cutoff = now.Add(-s.config.DeletingRetryAfter)
 		}
-		err := s.files.delete(roundCtx, candidate.id, candidate.ownerID, true, candidate.status, cutoff)
+		err := s.files.DeleteCleanupCandidate(roundCtx, candidate.id, candidate.ownerID, candidate.status, cutoff)
 		switch {
 		case err == nil:
 			stats.Succeeded++
@@ -116,26 +122,10 @@ func (s *Sweeper) RunOnce(ctx context.Context) CleanupStats {
 func (s *Sweeper) candidates(ctx context.Context, now time.Time) ([]cleanupCandidate, error) {
 	uploadCutoff := now.Add(-s.config.UploadIdleTTL)
 	deletingCutoff := now.Add(-s.config.DeletingRetryAfter)
-	rows, err := s.files.db.QueryContext(ctx, `SELECT f.id,f.owner_id,c.status FROM files f JOIN file_contents c ON c.id=f.content_id WHERE (c.status='uploading' AND f.status='active' AND c.updated_at<=?) OR (c.status='deleting' AND f.status='deleting' AND c.ref_count=0 AND c.updated_at<=?) ORDER BY c.updated_at,f.id LIMIT ?`, uploadCutoff, deletingCutoff, cleanupBatchSize)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	candidates := make([]cleanupCandidate, 0)
-	for rows.Next() {
-		var candidate cleanupCandidate
-		if err := rows.Scan(&candidate.id, &candidate.ownerID, &candidate.status); err != nil {
-			return nil, err
-		}
-		candidates = append(candidates, candidate)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return candidates, nil
+	return s.files.CleanupCandidates(ctx, uploadCutoff, deletingCutoff, cleanupBatchSize)
 }
 
 func isNotFound(err error) bool {
-	var apiErr *httpx.APIError
-	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+	var business *apperror.Error
+	return errors.As(err, &business) && business.Kind == apperror.KindNotFound
 }

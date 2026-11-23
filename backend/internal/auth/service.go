@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
-	"secure-im/backend/internal/httpx"
+	"secure-im/backend/internal/apperror"
 )
 
 type User struct {
@@ -30,7 +30,7 @@ type Result struct {
 	Tokens Tokens `json:"tokens"`
 }
 type Service struct {
-	db        *sql.DB
+	repo      repository
 	tokens    *TokenManager
 	dummyHash string
 }
@@ -41,17 +41,17 @@ func normalizeUsername(username string) string { return strings.ToUpper(username
 
 func NewService(db *sql.DB, tokens *TokenManager) *Service {
 	dummy, _ := HashPassword("not-a-real-user-password", DefaultArgonParams)
-	return &Service{db: db, tokens: tokens, dummyHash: dummy}
+	return &Service{repo: &sqlRepository{db: db}, tokens: tokens, dummyHash: dummy}
 }
 func validateRegistration(username, displayName, password string) error {
 	if !usernamePattern.MatchString(username) {
-		return httpx.Error(400, "invalid_username", "username must be 3-32 characters using letters, numbers, dot, underscore or dash")
+		return apperror.New(apperror.KindBadRequest, "invalid_username", "username must be 3-32 characters using letters, numbers, dot, underscore or dash")
 	}
 	if strings.TrimSpace(displayName) == "" || len(displayName) > 64 {
-		return httpx.Error(400, "invalid_display_name", "display name is required and must not exceed 64 bytes")
+		return apperror.New(apperror.KindBadRequest, "invalid_display_name", "display name is required and must not exceed 64 bytes")
 	}
 	if len(password) < 6 || len(password) > 128 {
-		return httpx.Error(400, "invalid_password", "password must be 6 to 128 bytes")
+		return apperror.New(apperror.KindBadRequest, "invalid_password", "password must be 6 to 128 bytes")
 	}
 	return nil
 }
@@ -65,10 +65,10 @@ func (s *Service) Register(ctx context.Context, username, displayName, password 
 		return Result{}, err
 	}
 	user := User{ID: uuid.NewString(), Username: username, DisplayName: strings.TrimSpace(displayName), CreatedAt: time.Now().UTC()}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO users(id,username,display_name,password_hash,created_at) VALUES(?,?,?,?,?)`, user.ID, user.Username, user.DisplayName, hash, user.CreatedAt)
+	err = s.repo.CreateUser(ctx, user, hash)
 	var mysqlErr *mysql.MySQLError
 	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
-		return Result{}, httpx.Error(409, "username_taken", "username is already registered")
+		return Result{}, apperror.New(apperror.KindConflict, "username_taken", "username is already registered")
 	}
 	if err != nil {
 		return Result{}, err
@@ -78,14 +78,12 @@ func (s *Service) Register(ctx context.Context, username, displayName, password 
 func (s *Service) Login(ctx context.Context, username, password string) (Result, error) {
 	username = normalizeUsername(username)
 	if len(password) > 128 {
-		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
+		return Result{}, apperror.New(apperror.KindUnauthorized, "invalid_credentials", "invalid username or password")
 	}
-	var user User
-	var hash string
-	err := s.db.QueryRowContext(ctx, `SELECT id,username,display_name,password_hash,created_at FROM users WHERE username=?`, username).Scan(&user.ID, &user.Username, &user.DisplayName, &hash, &user.CreatedAt)
+	user, hash, err := s.repo.LoginUser(ctx, username)
 	if errors.Is(err, sql.ErrNoRows) {
 		_, _ = VerifyPassword(s.dummyHash, password)
-		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
+		return Result{}, apperror.New(apperror.KindUnauthorized, "invalid_credentials", "invalid username or password")
 	}
 	if err != nil {
 		return Result{}, err
@@ -93,7 +91,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (Result,
 	user.Username = normalizeUsername(user.Username)
 	valid, verifyErr := VerifyPassword(hash, password)
 	if verifyErr != nil || !valid {
-		return Result{}, httpx.Error(401, "invalid_credentials", "invalid username or password")
+		return Result{}, apperror.New(apperror.KindUnauthorized, "invalid_credentials", "invalid username or password")
 	}
 	return s.result(ctx, user)
 }
@@ -106,7 +104,7 @@ func (s *Service) result(ctx context.Context, user User) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO refresh_tokens(id,user_id,token_hash,expires_at) VALUES(?,?,?,?)`, uuid.NewString(), user.ID, hash, expires); err != nil {
+	if err := s.repo.CreateRefreshToken(ctx, uuid.NewString(), user.ID, hash, expires); err != nil {
 		return Result{}, err
 	}
 	return Result{User: user, Tokens: Tokens{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer", ExpiresIn: int64(s.tokens.accessTTL.Seconds())}}, nil

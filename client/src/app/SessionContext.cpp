@@ -1,7 +1,5 @@
 #include "SessionContext.h"
 
-#include "SessionPage.h"
-
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -305,8 +303,6 @@ void SessionContext::shutdown()
     if (m_closing)
         return;
     m_closing = true;
-    if (m_page)
-        m_page->shutdown();
     m_api->shutdown();
     closeUser();
     if (m_mode == StorageMode::Direct) {

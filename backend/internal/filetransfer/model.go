@@ -10,7 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	"secure-im/backend/internal/httpx"
+	"secure-im/backend/internal/apperror"
 )
 
 // File 是独立的逻辑文件引用，包含参与者与显示状态；底层内容通过 ContentID 与其他引用共享。
@@ -49,13 +49,13 @@ func Authorize(file File, userID string, ownerOnly bool) error {
 	if !ownerOnly && (file.OwnerID == userID || file.RecipientID == userID) {
 		return nil
 	}
-	return httpx.Error(403, "file_forbidden", "you are not a participant in this file transfer")
+	return apperror.New(apperror.KindForbidden, "file_forbidden", "you are not a participant in this file transfer")
 }
 
 // expectedChunkSize 计算指定分块的字节数，最后一块按文件剩余大小处理，拒绝越界序号。
 func expectedChunkSize(file File, index int) (int64, error) {
 	if index < 0 || index >= file.ChunkCount {
-		return 0, httpx.Error(400, "invalid_chunk_index", "chunk index is out of range")
+		return 0, apperror.New(apperror.KindBadRequest, "invalid_chunk_index", "chunk index is out of range")
 	}
 	if index < file.ChunkCount-1 {
 		return file.ChunkSize, nil
@@ -84,11 +84,11 @@ func scanFile(scanner interface{ Scan(...any) error }) (File, error) {
 }
 func (s *Service) getFile(ctx context.Context, id string) (File, error) {
 	if _, err := uuid.Parse(id); err != nil {
-		return File{}, httpx.Error(404, "file_not_found", "file not found")
+		return File{}, apperror.New(apperror.KindNotFound, "file_not_found", "file not found")
 	}
-	f, err := scanFile(s.db.QueryRowContext(ctx, selectFile+`WHERE f.id=?`, id))
+	f, err := s.repo.File(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return File{}, httpx.Error(404, "file_not_found", "file not found")
+		return File{}, apperror.New(apperror.KindNotFound, "file_not_found", "file not found")
 	}
 	return f, err
 }

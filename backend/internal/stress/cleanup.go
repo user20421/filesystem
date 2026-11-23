@@ -21,8 +21,7 @@ func Cleanup(ctx context.Context, db *sql.DB, objects *minio.Client, bucket, run
 		return fmt.Errorf("database/object client unavailable")
 	}
 	store := filetransfer.NewMinIOStoreFromClient(objects, bucket)
-	// Only deletion is used here; upload limits and memory settings are irrelevant.
-	files := filetransfer.NewService(db, store, 0, 0, 0, 1)
+	files := filetransfer.NewDeletionService(db, store)
 	if err := cleanupFiles(ctx, db, files, runID); err != nil {
 		return err
 	}

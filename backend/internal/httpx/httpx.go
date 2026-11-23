@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"secure-im/backend/internal/apperror"
 )
 
 type contextKey int
@@ -43,13 +44,44 @@ func Data(c *gin.Context, status int, value any) {
 	JSON(c, status, map[string]any{"data": value})
 }
 
-// Fail 将 APIError 转为稳定错误响应，其他内部错误统一隐藏为 500，并携带请求 ID 便于排查。
+// Fail 是业务错误到 HTTP 的唯一映射边界；未知类别和内部错误统一隐藏为 500。
 func Fail(c *gin.Context, err error) {
 	var api *APIError
 	if !errors.As(err, &api) {
-		api = Error(http.StatusInternalServerError, "internal_error", "internal server error")
+		var business *apperror.Error
+		if errors.As(err, &business) {
+			status := businessStatus(business.Kind)
+			if status == http.StatusInternalServerError {
+				api = Error(status, "internal_error", "internal server error")
+			} else {
+				api = Error(status, business.Code, business.Message)
+			}
+		} else {
+			api = Error(http.StatusInternalServerError, "internal_error", "internal server error")
+		}
 	}
 	JSON(c, api.Status, map[string]any{"error": map[string]string{"code": api.Code, "message": api.Message, "request_id": RequestID(c.Request.Context())}})
+}
+
+func businessStatus(kind apperror.Kind) int {
+	switch kind {
+	case apperror.KindBadRequest:
+		return http.StatusBadRequest
+	case apperror.KindUnauthorized:
+		return http.StatusUnauthorized
+	case apperror.KindForbidden:
+		return http.StatusForbidden
+	case apperror.KindNotFound:
+		return http.StatusNotFound
+	case apperror.KindConflict:
+		return http.StatusConflict
+	case apperror.KindTooManyRequests:
+		return http.StatusTooManyRequests
+	case apperror.KindServiceUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // Decode 限制请求体为 1 MiB、拒绝未知字段，并确保请求只包含一个 JSON 值。

@@ -24,13 +24,20 @@ const (
 type Envelope_Type int32
 
 const (
+	// 未指定类型，不属于合法业务帧。
 	Envelope_TYPE_UNSPECIFIED Envelope_Type = 0
-	Envelope_MESSAGE          Envelope_Type = 1
-	Envelope_ACK              Envelope_Type = 2
-	Envelope_ERROR            Envelope_Type = 3
-	Envelope_PING             Envelope_Type = 4
-	Envelope_PONG             Envelope_Type = 5
-	Envelope_READ             Envelope_Type = 6
+	// 聊天消息，payload 为 MessagePayload。
+	Envelope_MESSAGE Envelope_Type = 1
+	// 服务端保存确认，payload 为 AckPayload，不表示对方已读。
+	Envelope_ACK Envelope_Type = 2
+	// 错误帧，payload 为 ErrorPayload。
+	Envelope_ERROR Envelope_Type = 3
+	// 应用层心跳请求，payload 为空。
+	Envelope_PING Envelope_Type = 4
+	// 心跳响应，payload 为空。
+	Envelope_PONG Envelope_Type = 5
+	// 已读状态同步，使用 cursor 和 read_at 表示阅读进度。
+	Envelope_READ Envelope_Type = 6
 )
 
 // Enum value maps for Envelope_Type.
@@ -82,7 +89,10 @@ func (Envelope_Type) EnumDescriptor() ([]byte, []int) {
 	return file_proto_im_v1_envelope_proto_rawDescGZIP(), []int{0, 0}
 }
 
-// Envelope is the only binary WebSocket frame accepted by the server.
+// Envelope 是服务端唯一接受的 WebSocket 二进制外层帧。
+// version 标识协议版本；type 决定 payload 的解码方式，MESSAGE/ACK/ERROR 使用对应业务 Payload，PING/PONG/READ 的 payload 为空。
+// message_id 用于消息幂等与 ACK 关联，conversation_id 用于会话路由，sender_id/recipient_id 标识方向，device_id 区分多设备。
+// timestamp 和 read_at 均为 Unix 毫秒，read_at 为 0 表示未读；cursor 是服务端确认的同步游标。
 type Envelope struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	Version        uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`

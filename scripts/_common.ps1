@@ -153,6 +153,24 @@ function Test-MinioBucket {
     }
 }
 
+# 从显式指定的 env 文件读取一个键；只返回目标值，不打印或改写其他配置。
+function Get-DotEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [AllowEmptyString()][string]$DefaultValue = ''
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        foreach ($line in [System.IO.File]::ReadLines($Path)) {
+            if ($line -match ('^\s*' + [regex]::Escape($Name) + '=(.*)$')) {
+                return $matches[1].Trim()
+            }
+        }
+    }
+    return $DefaultValue
+}
+
 # 从所选 env 文件读取指定值，文件或键不存在时返回默认值。
 function Get-EnvironmentValue {
     param(
@@ -162,11 +180,7 @@ function Get-EnvironmentValue {
 
     $envFile = Get-EnvironmentFile
     if ($envFile) {
-        foreach ($line in [System.IO.File]::ReadLines($envFile)) {
-            if ($line -match ('^\s*' + [regex]::Escape($Name) + '=(.*)$')) {
-                return $matches[1].Trim()
-            }
-        }
+        return Get-DotEnvValue -Path $envFile -Name $Name -DefaultValue $DefaultValue
     }
     return $DefaultValue
 }
@@ -198,15 +212,7 @@ function Get-StressEnvironmentValue {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DefaultValue
     )
-    $envFile = Get-StressEnvironmentFile
-    if (Test-Path -LiteralPath $envFile -PathType Leaf) {
-        foreach ($line in [System.IO.File]::ReadLines($envFile)) {
-            if ($line -match ('^\s*' + [regex]::Escape($Name) + '=(.*)$')) {
-                return $matches[1].Trim()
-            }
-        }
-    }
-    return $DefaultValue
+    return Get-DotEnvValue -Path (Get-StressEnvironmentFile) -Name $Name -DefaultValue $DefaultValue
 }
 
 # 按基础 env、压测 env 的顺序组装双环境 Compose 参数。

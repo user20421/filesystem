@@ -42,14 +42,17 @@ secure-im-client / secure-im-simulator / secure-im-stress-runner
 
 | 路径 | 内容 |
 |---|---|
-| `backend/cmd/` | `server` 与 `stress-runner` 入口 |
-| `backend/internal/` | 认证、聊天、文件传输、存储、配置和压测实现 |
+| `backend/cmd/` | `server` 的应用装配、路由、健康检查、日志与 `stress-runner` 入口 |
+| `backend/internal/` | 认证、聊天、文件传输、存储、配置和压测；各业务包拥有窄 repository，HTTP 错误只在边界映射 |
 | `backend/start-local.ps1` | 读取本地环境、构建并启动正常后端 |
-| `client/src/` | Qt 核心网络/传输/本地存储、UI 和程序入口 |
-| `client/tests/` | QtTest 单元及可选真实后端集成测试 |
-| `proto/im/v1/` | Protobuf v2 协议源文件 |
+| `client/src/core/` | 协议、HTTP/WS、消息、传输、本地存储及 JSON 适配 |
+| `client/src/app/` | 用户会话、目录迁移、ROOT 流程、压测进程、报告和评估；不依赖 Widgets |
+| `client/src/ui/` | Qt Widgets 页面、展示组件、主题和交互协调 |
+| `client/src/apps/` | 正式客户端和 simulator 的薄入口 |
+| `client/tests/` | QtTest 契约、单元及可选真实后端集成测试 |
+| `proto/im/v1/` | Protobuf v2 协议源文件，是 Go/Qt 两端共同源真相 |
 | `deploy/` | 正常及独立压测 Compose 配置、本地环境文件 |
-| `scripts/` | 环境检查、启动和停止脚本 |
+| `scripts/` | 环境检查、启动停止、协议生成和统一测试脚本 |
 | `runtime/` | 本地用户目录和压测报告，均为运行期数据 |
 
 ## 快速启动
@@ -153,6 +156,20 @@ runtime/stress-reports/YYYYMMDDTHHMMSSZ-xxxxxx/
 | 可重建缓存与产物 | `backend/.cache/`、`backend/docker/secure-im-server`、`client/build/` | 可通过 Go/CMake 构建或启动脚本重新生成。清理后首次重建可能仍需网络取得 Go 模块、工具或镜像，离线时不要误删其依赖资产。 |
 
 `stress-up.ps1` 在需要启动或重建时使用宿主机 Go 构建 Linux 后端，再通过 `Dockerfile.offline` 和已缓存的 MinIO 基础镜像制作压测镜像；已就绪快速路径不执行这些构建步骤。
+
+### REF 源码参照
+
+`backups/REF/` 保存重构前提交 `5cb97b7` 的 180 个受控源码与配置文件，未压缩且设为只读；`backups/REF.sha256.txt` 用于逐文件完整性核对。REF 不包含 `.git`、运行数据、真实 env、缓存、构建产物或工具二进制，也不是灾难恢复备份。后续开发不修改 REF；`backups/REF.safety.sha256.txt` 另行记录真实 env 和旧 ZIP 的防误改哈希。
+
+### 协议再生成
+
+修改 `proto/im/v1/*.proto` 后，使用仓内离线工具重新生成 Go 代码：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\generate-proto.ps1
+```
+
+脚本只更新 `backend/internal/proto/impb/` 中受版本控制的生成文件，不联网安装工具。Qt Protobuf 代码仍由 CMake 生成到 `client/build/`，不要手工编辑任何生成文件。
 
 ## 测试
 

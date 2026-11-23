@@ -3,8 +3,6 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QProcess>
 #include <QTimer>
 
@@ -29,21 +27,6 @@ QString discoverProjectRoot()
     return QDir::currentPath();
 }
 
-qint64 integer(const QJsonObject &object, const char *key)
-{
-    return static_cast<qint64>(object.value(QLatin1String(key)).toDouble());
-}
-
-double number(const QJsonObject &object, const char *key)
-{
-    return object.value(QLatin1String(key)).toDouble();
-}
-
-QJsonObject payload(const QJsonObject &line, const char *type)
-{
-    const QJsonValue nested = line.value(QLatin1String(type));
-    return nested.isObject() ? nested.toObject() : line;
-}
 } // namespace
 
 StressRunConfig StressRunConfig::forProject(const QString &projectRoot)
@@ -274,58 +257,21 @@ void StressRunController::consumeBuffer(bool drainFinalLine)
 // consumeLine 逐行解析 NDJSON，容忍跨 read 的粘包、CRLF 和末尾半行；非法行只记录诊断，不能误当成最终报告。
 void StressRunController::consumeLine(QByteArray line)
 {
-    line = line.trimmed();
-    if (line.isEmpty())
-        return;
-    QJsonParseError parseError{};
-    const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        emit diagnostic(QStringLiteral("忽略一行非法 NDJSON：%1").arg(parseError.errorString()));
-        return;
-    }
-
-    const QJsonObject root = document.object();
-    const QString type = root.value(QStringLiteral("type")).toString();
-    if (type == QLatin1String("progress")) {
-        const QJsonObject value = payload(root, "progress");
-        StressProgress progress;
-        progress.phase = value.value(QStringLiteral("phase")).toString();
-        progress.target = integer(value, "target");
-        progress.online = integer(value, "online");
-        progress.messagesSent = integer(value, "messages_sent");
-        progress.messagesDelivered = integer(value, "messages_delivered");
-        progress.ackP95Ms = number(value, "ack_p95_ms");
-        progress.ackP99Ms = number(value, "ack_p99_ms");
-        progress.filesQueued = integer(value, "files_queued");
-        progress.filesActive = integer(value, "files_active");
-        progress.filesCompleted = integer(value, "files_completed");
-        progress.filesFailed = integer(value, "files_failed");
-        progress.bytesCompleted = integer(value, "bytes_completed");
-        progress.fileMibPerSec = number(value, "file_mib_per_sec");
-        progress.backendRssMib = number(value, "backend_rss_mib");
-        progress.backendCpuPercent = number(value, "backend_cpu_percent");
-        progress.goHeapMib = number(value, "go_heap_mib");
-        progress.goroutines = integer(value, "goroutines");
-        progress.fileBudgetUsedMib = number(value, "file_budget_used_mib");
-        progress.fileBudgetLimitMib = number(value, "file_budget_limit_mib");
-        const QJsonValue slotsUsed = value.value(QStringLiteral("file_chunk_slots_used"));
-        const QJsonValue slotsLimit = value.value(QStringLiteral("file_chunk_slots_limit"));
-        progress.fileChunkSlotsKnown = slotsUsed.isDouble() && slotsLimit.isDouble();
-        if (progress.fileChunkSlotsKnown) {
-            progress.fileChunkSlotsUsed = static_cast<qint64>(slotsUsed.toDouble());
-            progress.fileChunkSlotsLimit = static_cast<qint64>(slotsLimit.toDouble());
-        }
-        emit progressReceived(progress);
-    } else if (type == QLatin1String("final")) {
-        const QJsonObject value = payload(root, "final");
-        m_final.status = value.value(QStringLiteral("status")).toString();
-        m_final.conclusion = value.value(QStringLiteral("conclusion")).toString();
-        m_final.reportDir = value.value(QStringLiteral("report_dir")).toString();
-        m_final.html = value.value(QStringLiteral("html")).toString();
-        m_final.target = integer(value, "target");
-        m_final.reason = value.value(QStringLiteral("reason")).toString();
+    const StressNdjsonCodec::Event event = StressNdjsonCodec::decodeLine(std::move(line));
+    switch (event.type) {
+    case StressNdjsonCodec::EventType::Invalid:
+        emit diagnostic(QStringLiteral("忽略一行非法 NDJSON：%1").arg(event.error));
+        break;
+    case StressNdjsonCodec::EventType::Progress:
+        emit progressReceived(event.progress);
+        break;
+    case StressNdjsonCodec::EventType::Final:
+        m_final = event.final;
         m_hasFinal = true;
         emit finalReceived(m_final);
+        break;
+    case StressNdjsonCodec::EventType::Ignored:
+        break;
     }
 }
 

@@ -2,14 +2,13 @@ package chat
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 
 	"github.com/google/uuid"
-	"secure-im/backend/internal/httpx"
+	"secure-im/backend/internal/apperror"
 )
 
-// ReadReceipt describes the incoming messages newly acknowledged by a reader.
+// ReadReceipt 描述读取方新确认的一段传入消息。
 type ReadReceipt struct {
 	ConversationID string `json:"conversation_id"`
 	PeerID         string `json:"peer_id"`
@@ -18,54 +17,18 @@ type ReadReceipt struct {
 	Updated        int64  `json:"updated"`
 }
 
-// MarkRead marks all incoming messages through cursor as read exactly once.
-// A cursor is usable only for a message sent by peer to the authenticated reader.
+// MarkRead 将游标之前所有传入消息标记为已读；缺失和越权游标使用同一错误。
 func (s *Service) MarkRead(ctx context.Context, readerID, peerID string, cursor uint64) (ReadReceipt, error) {
 	if _, err := uuid.Parse(peerID); err != nil || peerID == readerID {
-		return ReadReceipt{}, httpx.Error(400, "invalid_peer", "peer_id must be another user ID")
+		return ReadReceipt{}, apperror.New(apperror.KindBadRequest, "invalid_peer", "peer_id must be another user ID")
 	}
 	if cursor == 0 {
-		return ReadReceipt{}, httpx.Error(400, "invalid_cursor", "cursor must be greater than zero")
+		return ReadReceipt{}, apperror.New(apperror.KindBadRequest, "invalid_cursor", "cursor must be greater than zero")
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ReadReceipt{}, err
+	receipt, err := s.repo.MarkRead(ctx, readerID, peerID, cursor)
+	var notFound *readCursorNotFoundError
+	if errors.As(err, &notFound) {
+		return ReadReceipt{}, apperror.New(apperror.KindForbidden, "read_forbidden", "message cannot be marked as read")
 	}
-	defer tx.Rollback()
-
-	var conversationID string
-	var readAt sql.NullTime
-	err = tx.QueryRowContext(ctx, `SELECT conversation_id,read_at FROM messages WHERE id=? AND sender_id=? AND recipient_id=? FOR UPDATE`, cursor, peerID, readerID).Scan(&conversationID, &readAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		// Use the same response for missing, unrelated and foreign cursors.
-		return ReadReceipt{}, httpx.Error(403, "read_forbidden", "message cannot be marked as read")
-	}
-	if err != nil {
-		return ReadReceipt{}, err
-	}
-
-	result, err := tx.ExecContext(ctx, `UPDATE messages SET read_at=NOW(6) WHERE conversation_id=? AND sender_id=? AND recipient_id=? AND id<=? AND read_at IS NULL`, conversationID, peerID, readerID, cursor)
-	if err != nil {
-		return ReadReceipt{}, err
-	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return ReadReceipt{}, err
-	}
-	if !readAt.Valid {
-		if err := tx.QueryRowContext(ctx, `SELECT read_at FROM messages WHERE id=?`, cursor).Scan(&readAt); err != nil {
-			return ReadReceipt{}, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return ReadReceipt{}, err
-	}
-	return ReadReceipt{
-		ConversationID: conversationID,
-		PeerID:         peerID,
-		Cursor:         cursor,
-		ReadAt:         readAt.Time.UnixMilli(),
-		Updated:        updated,
-	}, nil
+	return receipt, err
 }

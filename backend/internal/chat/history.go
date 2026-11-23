@@ -2,17 +2,14 @@ package chat
 
 import (
 	"context"
-	"database/sql"
 	"encoding/base64"
-	"time"
 
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
-	"secure-im/backend/internal/httpx"
-	"secure-im/backend/internal/proto/impb"
+	"secure-im/backend/internal/apperror"
 )
 
-// HistoryItem 表示一条有序历史消息，Envelope 是 base64 编码的 Protobuf 二进制帧，cursor 用于增量同步。
+// HistoryItem 表示一条有序历史消息，Envelope 是 base64 编码的 Protobuf 二进制帧。
 type HistoryItem struct {
 	Cursor   uint64 `json:"cursor"`
 	Envelope string `json:"envelope"`
@@ -20,32 +17,24 @@ type HistoryItem struct {
 
 func (s *Service) History(ctx context.Context, userID, peer string, after uint64, limit int) ([]HistoryItem, error) {
 	if _, err := uuid.Parse(peer); err != nil || peer == userID {
-		return nil, httpx.Error(400, "invalid_peer", "peer_id must be another user ID")
+		return nil, apperror.New(apperror.KindBadRequest, "invalid_peer", "peer_id must be another user ID")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,message_id,conversation_id,sender_id,recipient_id,device_id,payload,created_at,read_at FROM messages WHERE ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)) AND id>? ORDER BY id ASC LIMIT ?`, userID, peer, peer, userID, after, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	items := make([]HistoryItem, 0)
-	for rows.Next() {
-		var item HistoryItem
-		var created time.Time
-		var readAt sql.NullTime
-		e := &impb.Envelope{Version: protocolVersion, Type: impb.Envelope_MESSAGE}
-		if err := rows.Scan(&item.Cursor, &e.MessageId, &e.ConversationId, &e.SenderId, &e.RecipientId, &e.DeviceId, &e.Payload, &created, &readAt); err != nil {
-			return nil, err
-		}
-		e.Timestamp = created.UnixMilli()
-		if readAt.Valid {
-			e.ReadAt = readAt.Time.UnixMilli()
+	err := s.repo.History(ctx, userID, peer, after, limit, func(record historyRecord) error {
+		e := record.envelope
+		e.Timestamp = record.created.UnixMilli()
+		if record.readAt.Valid {
+			e.ReadAt = record.readAt.Time.UnixMilli()
 		}
 		binary, err := proto.Marshal(e)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		item.Envelope = base64.StdEncoding.EncodeToString(binary)
-		items = append(items, item)
+		items = append(items, HistoryItem{Cursor: record.cursor, Envelope: base64.StdEncoding.EncodeToString(binary)})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return items, rows.Err()
+	return items, nil
 }

@@ -29,15 +29,6 @@ public:
     static void setReportOpenerForTests(ReportOpener opener);
 
 private:
-    struct HistoryEntry {
-        QDateTime timestamp;
-        QString directory;
-        QString html;
-        qint64 target = 0;
-        QString conclusion;
-        QString reason;
-    };
-
     void buildUi();
     void updateDistribution();
     void updateCountdown();
@@ -47,7 +38,6 @@ private:
     void setRunning(bool running);
     void openSelectedHtml();
     void openSelectedDirectory();
-    QList<HistoryEntry> readHistory() const;
     QString bottleneckAdvice() const;
     static bool openReportUrl(const QUrl &url);
 
