@@ -216,7 +216,7 @@ void SystemTestPage::buildUi()
     m_distribution->setObjectName(QStringLiteral("stressDistributionLabel"));
     configLayout->addWidget(m_distribution);
     auto *resources = new QLabel(QStringLiteral(
-        "固定资源：后端 6 CPU / 3 GiB ｜ 文件预算 500 MiB ｜ 分块 5 MiB ｜ "
+        "固定资源：后端 4 CPU / 3 GiB ｜ 文件预算 500 MiB ｜ 分块 5 MiB ｜ "
         "400 个文件任务 ｜ 96 个分块通道 ｜ 单文件 100 MiB ｜ 稳定运行 5 分钟"), configuration);
     resources->setObjectName(QStringLiteral("stressResourceLabel"));
     resources->setWordWrap(true);

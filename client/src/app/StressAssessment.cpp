@@ -19,7 +19,7 @@ QString bottleneckAdvice(const StressProgress &progress, const StressFinal &fina
     if (progress.ackP99Ms >= 2000.0)
         return QStringLiteral("瓶颈建议：ACK P99 偏高，检查后端 CPU、Go 堆和协程数是否持续增长。");
     if (progress.backendCpuPercent >= 85.0 || progress.backendRssMib >= 3584.0)
-        return QStringLiteral("瓶颈建议：后端资源接近 6 CPU / 3 GiB 边界，降低人数并对比资源峰值。");
+        return QStringLiteral("瓶颈建议：后端资源接近 4 CPU / 3 GiB 边界，降低人数并对比资源峰值。");
     if (progress.messagesDelivered < progress.messagesSent)
         return QStringLiteral("瓶颈建议：消息存在未送达，检查 WebSocket 稳定性、ACK 延迟和错误日志。");
     if (displayedConclusion == QStringLiteral("波动"))
