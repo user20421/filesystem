@@ -16,6 +16,7 @@ type Metrics struct {
 	filesQueued, filesActive, filesCompleted, filesFailed, bytesCompleted int64
 	healthFailures, stableSamples, stableOnlineSum, stableOnlineMin       int64
 	ackLatency, deliveryLatency, fileQueueLatency                         []float64
+	fileCompletionLatency                                                 []float64
 	pendingAck, pendingDelivery                                           map[string]time.Time
 	delivered                                                             map[string]struct{}
 	backendBudgetUsedMiB, backendBudgetHighMiB, backendBudgetLimitMiB     *float64
@@ -98,6 +99,24 @@ func (m *Metrics) FileQueueWait(d time.Duration) {
 	m.mu.Lock()
 	m.fileQueueLatency = append(m.fileQueueLatency, ms(d))
 	m.mu.Unlock()
+}
+
+// FileCompletion 记录单文件端到端完成耗时：从任务入队到下载 SHA-256 校验通过，包含排队等待。
+func (m *Metrics) FileCompletion(d time.Duration) {
+	m.mu.Lock()
+	m.fileCompletionLatency = append(m.fileCompletionLatency, ms(d))
+	m.mu.Unlock()
+}
+
+func mean(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sum := float64(0)
+	for _, v := range values {
+		sum += v
+	}
+	return sum / float64(len(values))
 }
 func (m *Metrics) HealthFailed() { m.mu.Lock(); m.healthFailures++; m.mu.Unlock() }
 func (m *Metrics) BackendRuntime(heapMiB *float64, goroutines *int) {
@@ -208,6 +227,7 @@ type Totals struct {
 	AckP95MS, AckP99MS, DeliveryP95MS                               float64
 	FilesCompleted, FilesFailed, BytesCompleted                     int64
 	FileQueueP95MS                                                  float64
+	FileQueueAvgMS, FileCompletionAvgMS                             float64
 	ConnectionFailed, Reconnects, HealthFailures                    int64
 	StableSamples, StableOnlineMin                                  int64
 	StableOnlineAverage                                             float64
@@ -252,6 +272,7 @@ func (m *Metrics) Totals() Totals {
 	return Totals{MessagesSent: m.messagesSent, MessagesDelivered: m.messagesDelivered, MessageDuplicates: m.messageDuplicates, MessageLost: lost,
 		AckP95MS: Percentile(m.ackLatency, .95), AckP99MS: Percentile(m.ackLatency, .99), DeliveryP95MS: Percentile(m.deliveryLatency, .95),
 		FilesCompleted: m.filesCompleted, FilesFailed: m.filesFailed, BytesCompleted: m.bytesCompleted, FileQueueP95MS: Percentile(m.fileQueueLatency, .95),
+		FileQueueAvgMS: mean(m.fileQueueLatency), FileCompletionAvgMS: mean(m.fileCompletionLatency),
 		ConnectionFailed: m.connectionFailed, Reconnects: m.reconnects, HealthFailures: m.healthFailures, StableSamples: m.stableSamples,
 		StableOnlineMin: m.stableOnlineMin, StableOnlineAverage: average, FileBudgetHighMiB: value(m.backendBudgetHighMiB), FileBudgetLimitMiB: budgetLimit, FileBudgetKnown: m.backendBudgetHighMiB != nil}
 }

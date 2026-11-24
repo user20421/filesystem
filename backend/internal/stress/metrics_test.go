@@ -59,6 +59,21 @@ func TestPercentileAndMessageMetrics(t *testing.T) {
 	}
 }
 
+func TestTotalsFileWaitAndCompletionAverages(t *testing.T) {
+	m := NewMetrics("file-averages", 500)
+	if totals := m.Totals(); totals.FileQueueAvgMS != 0 || totals.FileCompletionAvgMS != 0 {
+		t.Fatalf("empty file averages = %+v", totals)
+	}
+	m.FileQueueWait(100 * time.Millisecond)
+	m.FileQueueWait(300 * time.Millisecond)
+	m.FileCompletion(1 * time.Second)
+	m.FileCompletion(3 * time.Second)
+	totals := m.Totals()
+	if totals.FileQueueAvgMS != 200 || totals.FileCompletionAvgMS != 2000 {
+		t.Fatalf("file averages = %+v, want wait 200ms completion 2000ms", totals)
+	}
+}
+
 func TestTotalsUseConfiguredFileBudgetWhenReportedLimitIsZero(t *testing.T) {
 	metrics := NewMetrics("budget", 500)
 	used, zero := int64(10<<20), int64(0)

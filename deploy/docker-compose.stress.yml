@@ -1,7 +1,7 @@
 name: secure-im-stress
 
 # 独立压测后端：复用正常环境的 MySQL/MinIO 容器，但使用独立数据库和 Bucket，物理资源仍共享。
-# Dockerfile.offline 使用宿主机预构建的 Linux 二进制；后端限制 6 CPU、3 GiB，文件分块内存预算为 500 MiB。
+# Dockerfile.offline 使用宿主机预构建的 Linux 二进制；后端限制 4 CPU、3 GiB，文件分块内存预算为 500 MiB。
 services:
   backend:
     container_name: secure-im-stress-backend
@@ -10,7 +10,7 @@ services:
       context: ../backend
       dockerfile: Dockerfile.offline
     restart: unless-stopped
-    cpus: 6
+    cpus: 4
     mem_limit: 3g
     environment:
       LISTEN_ADDR: 0.0.0.0:8080
@@ -35,7 +35,7 @@ services:
       # 批量准备压测账号时关闭认证限流，仅限本地隔离压测环境。
       AUTH_REGISTER_RATE_LIMIT: 0
       AUTH_LOGIN_RATE_LIMIT: 0
-      GOMAXPROCS: 6
+      GOMAXPROCS: 4
       # Go 内存软限制使用整数字节，约为 2.4 GiB。
       GOMEMLIMIT: 2576980378
       TZ: ${TZ:-Asia/Shanghai}

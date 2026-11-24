@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestUploadChunkRetriesTransientServerError(t *testing.T) {
@@ -78,5 +79,26 @@ func TestTransferInstantSkipsUploadAndComplete(t *testing.T) {
 	}
 	if got := unexpected.Load(); got != 0 {
 		t.Fatalf("instant transfer made %d upload/complete requests", got)
+	}
+}
+
+func TestDownloadWaitsForBudgetBeforeOpeningRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+	}))
+	defer server.Close()
+	pool := NewFilePool(DefaultConfig(), NewAPIClient(server.URL), NewMetrics("download-budget", 500), 1, func(error) {}, nil)
+	if err := pool.budget.Acquire(context.Background(), pool.cfg.FileBudgetMiB<<20); err != nil {
+		t.Fatal(err)
+	}
+	// 预算已满时下载必须在 Acquire 处等待；若先建立请求，服务端会向无人读取的 socket 写数据直至超时。
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := pool.downloadHash(ctx, "token", "file-id"); err == nil {
+		t.Fatal("expected budget wait to end with context error")
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("download opened %d requests while the buffer budget was full", got)
 	}
 }

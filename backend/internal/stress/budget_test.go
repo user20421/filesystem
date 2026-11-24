@@ -137,6 +137,12 @@ func TestFilePoolFiniteProductionAndDrain(t *testing.T) {
 	if progress.FilesCompleted != 2 || progress.FilesFailed != 0 || progress.FilesQueued != 0 || progress.FilesActive != 0 {
 		t.Fatalf("unexpected finite drain metrics %+v", progress)
 	}
+	metrics.mu.Lock()
+	waits, completions := len(metrics.fileQueueLatency), len(metrics.fileCompletionLatency)
+	metrics.mu.Unlock()
+	if waits != 2 || completions != 2 {
+		t.Fatalf("file timing samples = waits %d completions %d, want 2 each", waits, completions)
+	}
 	select {
 	case _, ok := <-pool.queue:
 		if ok {

@@ -99,6 +99,7 @@ func (p *FilePool) worker(ctx context.Context) {
 				p.failure(fmt.Errorf("file %s sender %s: %w", job.id, job.sender.Username, err))
 			}
 		} else {
+			p.metrics.FileCompletion(time.Since(job.queuedAt))
 			p.metrics.FileCompleted(p.cfg.FileSize)
 		}
 		p.metrics.FileActive(-1)
@@ -223,6 +224,12 @@ func (p *FilePool) uploadChunkOnce(ctx context.Context, token, id string, index 
 }
 
 func (p *FilePool) downloadHash(ctx context.Context, token, id string) (string, error) {
+	// 先拿缓冲预算再发起请求：若先建立下载再排队等预算，响应期间无人读取 socket，
+	// 服务端会因写空闲超时中断下载（download interrupted: i/o timeout）。
+	if err := p.budget.Acquire(ctx, p.cfg.ChunkSize); err != nil {
+		return "", err
+	}
+	defer p.budget.Release(p.cfg.ChunkSize)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.api.Base+"/api/v1/files/"+id+"/download", nil)
 	if err != nil {
 		return "", err
@@ -237,10 +244,6 @@ func (p *FilePool) downloadHash(ctx context.Context, token, id string) (string, 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("download: HTTP %d: %s", resp.StatusCode, string(body))
 	}
-	if err = p.budget.Acquire(ctx, p.cfg.ChunkSize); err != nil {
-		return "", err
-	}
-	defer p.budget.Release(p.cfg.ChunkSize)
 	buffer := make([]byte, int(p.cfg.ChunkSize))
 	hash := sha256.New()
 	count, err := io.CopyBuffer(hash, resp.Body, buffer)

@@ -62,6 +62,7 @@ func TestReportArtifacts(t *testing.T) {
 	if err = report.AddProgress(progress); err != nil {
 		t.Fatal(err)
 	}
+	totals.FileQueueAvgMS, totals.FileCompletionAvgMS = 120.5, 3456.75
 	result := Evaluate(cfg, totals, facts)
 	summary, err := report.Finalize(cfg, Allocation{Idle: 8, Chat: 2}, totals, facts, result)
 	if err != nil {
@@ -85,6 +86,9 @@ func TestReportArtifacts(t *testing.T) {
 	}
 	if decoded.Status != "success" || decoded.Result.Status != "success" || !strings.Contains(decoded.Result.Conclusion, "状态=成功") {
 		t.Fatalf("summary must keep machine statuses in English and localize conclusions: %s", body)
+	}
+	if decoded.Totals.FileQueueAvgMS != 120.5 || decoded.Totals.FileCompletionAvgMS != 3456.75 {
+		t.Fatalf("file timing averages missing from summary.json: %s", body)
 	}
 	conclusion, err := os.ReadFile(filepath.Join(report.Dir, "conclusion.txt"))
 	if err != nil || !strings.Contains(string(conclusion), "状态=成功") {
@@ -120,6 +124,7 @@ func TestReportArtifacts(t *testing.T) {
 		"IMFT", "运行编号：", "<h2 class=\"status success\">成功</h2>",
 		"稳定时长完整且未中断", "<td>通过</td>", "文件工作线程/内存预算",
 		"条/秒/用户", "分块通道已用/上限（最后有效采样）", "<td colspan=\"3\">7 / 96</td>",
+		"平均文件等待时间（毫秒）", "平均文件完成时间（毫秒，含等待与下载校验）", "<td>120.500</td>", "<td>3456.750</td>",
 	} {
 		if !strings.Contains(htmlText, text) {
 			t.Errorf("localized HTML report missing %q: %s", text, html)

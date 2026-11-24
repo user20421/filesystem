@@ -71,6 +71,7 @@ a{color:inherit;text-decoration:none}
 <tr><th>消息发送/送达/丢失/重复</th><td colspan="3">{{.Summary.Totals.MessagesSent}} / {{.Summary.Totals.MessagesDelivered}} / {{.Summary.Totals.MessageLost}} / {{.Summary.Totals.MessageDuplicates}}</td></tr>
 <tr><th>ACK P95/P99（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.AckP95MS}} / {{printf "%.3f" .Summary.Totals.AckP99MS}}</td><th>投递P95（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.DeliveryP95MS}}</td></tr>
 <tr><th>文件完成/失败/字节数</th><td>{{.Summary.Totals.FilesCompleted}} / {{.Summary.Totals.FilesFailed}} / {{.Summary.Totals.BytesCompleted}}</td><th>文件排队P95（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.FileQueueP95MS}}</td></tr>
+<tr><th>平均文件等待时间（毫秒）</th><td>{{printf "%.3f" .Summary.Totals.FileQueueAvgMS}}</td><th>平均文件完成时间（毫秒，含等待与下载校验）</th><td>{{printf "%.3f" .Summary.Totals.FileCompletionAvgMS}}</td></tr>
 <tr><th>后端RSS峰值（MiB）/CPU峰值（%）</th><td>{{optional .Summary.BackendRSSMaxMiB}} / {{optional .Summary.BackendCPUMax}}</td><th>文件预算峰值/上限（MiB）</th><td>{{if .Summary.Totals.FileBudgetKnown}}{{printf "%.3f" .Summary.Totals.FileBudgetHighMiB}} / {{printf "%.3f" .Summary.Totals.FileBudgetLimitMiB}}{{else}}未知{{end}}</td></tr>
 <tr><th>稳定在线平均/最低</th><td>{{printf "%.2f" .Summary.Totals.StableOnlineAverage}} / {{.Summary.Totals.StableOnlineMin}}</td><th>重连/连接失败/健康检查失败</th><td>{{.Summary.Totals.Reconnects}} / {{.Summary.Totals.ConnectionFailed}} / {{.Summary.Totals.HealthFailures}}</td></tr>
 <tr><th>分块通道已用/上限（最后有效采样）</th><td colspan="3">{{optionalInt64 .ChunkSlotsUsed}} / {{optionalInt64 .ChunkSlotsLimit}}</td></tr>
